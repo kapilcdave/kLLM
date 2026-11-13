@@ -18,5 +18,11 @@ cargo run -- plan \
 
 Run the tests with `cargo test`.
 
+Inspect a GGUF file without loading its tensor data:
+
+```sh
+cargo run -- inspect model.gguf
+```
+
 See [SPEC.md](SPEC.md) for the product and implementation specification.
 

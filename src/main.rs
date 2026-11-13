@@ -1,5 +1,6 @@
 use std::{env, process::ExitCode};
 
+use kllm::gguf::inspect_file;
 use kllm::planner::{PlanInput, bytes_from_gib, gib, plan};
 
 const DEFAULT_WORKSPACE_GIB: f64 = 0.25;
@@ -17,10 +18,14 @@ fn main() -> ExitCode {
 }
 
 fn run(args: Vec<String>) -> Result<(), String> {
-    if args.first().map(String::as_str) != Some("plan") {
-        return Err("the first milestone currently supports only `plan`".into());
+    match args.first().map(String::as_str) {
+        Some("plan") => run_plan(&args),
+        Some("inspect") => run_inspect(&args),
+        _ => Err("expected `plan` or `inspect`".into()),
     }
+}
 
+fn run_plan(args: &[String]) -> Result<(), String> {
     let model_gib = flag_f64(&args, "--model-gib")?;
     let layers = flag_u64(&args, "--layers")?;
     let vram_gib = flag_f64(&args, "--vram-gib")?;
@@ -77,6 +82,28 @@ fn run(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+fn run_inspect(args: &[String]) -> Result<(), String> {
+    let path = args.get(1).ok_or_else(|| "missing GGUF path".to_string())?;
+    let info = inspect_file(path).map_err(|error| error.to_string())?;
+    println!("KLLM GGUF inspection");
+    println!("  version:          {}", info.version);
+    println!(
+        "  architecture:     {}",
+        info.architecture.as_deref().unwrap_or("unknown")
+    );
+    println!("  metadata entries: {}", info.metadata_count);
+    println!("  tensors:          {}", info.tensor_count);
+    println!("  alignment:        {} bytes", info.alignment);
+    println!("  data offset:      {} bytes", info.data_offset);
+    for tensor in &info.tensors {
+        println!(
+            "  - {} {:?} type={} offset={}",
+            tensor.name, tensor.dimensions, tensor.ggml_type, tensor.relative_offset
+        );
+    }
+    Ok(())
+}
+
 fn value_after<'a>(args: &'a [String], flag: &str) -> Result<&'a str, String> {
     let index = args
         .iter()
@@ -108,5 +135,5 @@ fn flag_u64(args: &[String], flag: &str) -> Result<u64, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: kllm plan --model-gib N --layers N --vram-gib N --context N \\\n+       --kv-bytes-per-token N [--workspace-gib N] [--safety-gib N]"
+    "usage:\n  kllm inspect MODEL.gguf\n  kllm plan --model-gib N --layers N --vram-gib N --context N \\\n       --kv-bytes-per-token N [--workspace-gib N] [--safety-gib N]"
 }
