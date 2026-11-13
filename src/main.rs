@@ -1,0 +1,112 @@
+use std::{env, process::ExitCode};
+
+use kllm::planner::{PlanInput, bytes_from_gib, gib, plan};
+
+const DEFAULT_WORKSPACE_GIB: f64 = 0.25;
+const DEFAULT_SAFETY_GIB: f64 = 0.25;
+
+fn main() -> ExitCode {
+    match run(env::args().skip(1).collect()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("error: {message}");
+            eprintln!("\n{}", usage());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(args: Vec<String>) -> Result<(), String> {
+    if args.first().map(String::as_str) != Some("plan") {
+        return Err("the first milestone currently supports only `plan`".into());
+    }
+
+    let model_gib = flag_f64(&args, "--model-gib")?;
+    let layers = flag_u64(&args, "--layers")?;
+    let vram_gib = flag_f64(&args, "--vram-gib")?;
+    let context = flag_u64(&args, "--context")?;
+    let kv_bytes_per_token = flag_u64(&args, "--kv-bytes-per-token")?;
+    let workspace_gib =
+        optional_flag_f64(&args, "--workspace-gib")?.unwrap_or(DEFAULT_WORKSPACE_GIB);
+    let safety_gib = optional_flag_f64(&args, "--safety-gib")?.unwrap_or(DEFAULT_SAFETY_GIB);
+    let layer_count = u32::try_from(layers).map_err(|_| "--layers exceeds u32".to_string())?;
+
+    let input = PlanInput {
+        model_bytes: bytes_from_gib(model_gib).map_err(str::to_string)?,
+        layer_count,
+        vram_bytes: bytes_from_gib(vram_gib).map_err(str::to_string)?,
+        context_tokens: context,
+        kv_bytes_per_token,
+        workspace_bytes: bytes_from_gib(workspace_gib).map_err(str::to_string)?,
+        safety_bytes: bytes_from_gib(safety_gib).map_err(str::to_string)?,
+    };
+    let result = plan(input).map_err(|error| error.to_string())?;
+
+    println!("KLLM memory plan");
+    println!("  model weights:    {:>6.2} GiB", gib(input.model_bytes));
+    println!("  VRAM limit:       {:>6.2} GiB", gib(input.vram_bytes));
+    println!(
+        "  GPU layers:       {:>6} / {}",
+        result.gpu_layers, input.layer_count
+    );
+    println!(
+        "  CPU layers:       {:>6} / {}",
+        result.cpu_layers, input.layer_count
+    );
+    println!(
+        "  GPU weights:      {:>6.2} GiB",
+        gib(result.gpu_weight_bytes)
+    );
+    println!(
+        "  CPU weights:      {:>6.2} GiB",
+        gib(result.cpu_weight_bytes)
+    );
+    println!(
+        "  KV cache:         {:>6.2} GiB",
+        gib(result.kv_cache_bytes)
+    );
+    println!(
+        "  workspace:        {:>6.2} GiB",
+        gib(result.workspace_bytes)
+    );
+    println!("  safety reserve:   {:>6.2} GiB", gib(result.safety_bytes));
+    println!(
+        "  unused VRAM:      {:>6.2} GiB",
+        gib(result.unused_vram_bytes)
+    );
+    Ok(())
+}
+
+fn value_after<'a>(args: &'a [String], flag: &str) -> Result<&'a str, String> {
+    let index = args
+        .iter()
+        .position(|arg| arg == flag)
+        .ok_or_else(|| format!("missing {flag}"))?;
+    args.get(index + 1)
+        .map(String::as_str)
+        .ok_or_else(|| format!("missing value after {flag}"))
+}
+
+fn flag_f64(args: &[String], flag: &str) -> Result<f64, String> {
+    value_after(args, flag)?
+        .parse()
+        .map_err(|_| format!("invalid value for {flag}"))
+}
+
+fn optional_flag_f64(args: &[String], flag: &str) -> Result<Option<f64>, String> {
+    if args.iter().any(|arg| arg == flag) {
+        flag_f64(args, flag).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn flag_u64(args: &[String], flag: &str) -> Result<u64, String> {
+    value_after(args, flag)?
+        .parse()
+        .map_err(|_| format!("invalid value for {flag}"))
+}
+
+fn usage() -> &'static str {
+    "usage: kllm plan --model-gib N --layers N --vram-gib N --context N \\\n+       --kv-bytes-per-token N [--workspace-gib N] [--safety-gib N]"
+}

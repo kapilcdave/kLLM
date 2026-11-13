@@ -1,0 +1,5 @@
+/target/
+*.gguf
+*.safetensors
+.DS_Store
+
