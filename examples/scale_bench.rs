@@ -56,4 +56,33 @@ fn main() {
             baseline / s
         );
     }
+
+    // Dispatch latency: what a parallel region costs before any work is
+    // done. Decode issues a few hundred of these per token, so this is a
+    // floor on per-token time.
+    println!();
+    for threads in 1..=max {
+        let pool = kllm::pool::Pool::new(threads);
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let reps = 20_000;
+        // Warm the workers so they are spinning, not parked.
+        for _ in 0..1000 {
+            pool.for_each(threads, |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+        let t = Instant::now();
+        for _ in 0..reps {
+            pool.for_each(threads, |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+        println!(
+            "{threads} thread(s): {:6.2} us per empty for_each ({} per token would cost {:.2} ms)",
+            t.elapsed().as_secs_f64() / reps as f64 * 1e6,
+            150,
+            t.elapsed().as_secs_f64() / reps as f64 * 150.0 * 1e3,
+        );
+        std::hint::black_box(counter.load(std::sync::atomic::Ordering::Relaxed));
+    }
 }

@@ -69,6 +69,23 @@ fn half(bytes: &[u8], at: usize) -> f32 {
 
 pub fn quantize_q8_0(x: &[f32]) -> Vec<BlockQ8_0> {
     debug_assert_eq!(x.len() % 32, 0);
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        let mut out = Vec::with_capacity(x.len() / 32);
+        // SAFETY: features detected; `x` is a whole number of 32-float
+        // blocks and `out` has room for every block.
+        unsafe {
+            avx2::quantize_q8_0_into(x, out.spare_capacity_mut());
+            out.set_len(x.len() / 32);
+        }
+        return out;
+    }
+    quantize_q8_0_scalar(x)
+}
+
+/// The portable reference the SIMD path must match value for value.
+pub fn quantize_q8_0_scalar(x: &[f32]) -> Vec<BlockQ8_0> {
+    debug_assert_eq!(x.len() % 32, 0);
     x.chunks_exact(32)
         .map(|chunk| {
             let amax = chunk.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
@@ -92,6 +109,23 @@ pub fn quantize_q8_0(x: &[f32]) -> Vec<BlockQ8_0> {
 }
 
 pub fn quantize_q8k(x: &[f32]) -> Vec<BlockQ8K> {
+    debug_assert_eq!(x.len() % QK_K, 0);
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        let mut out = Vec::with_capacity(x.len() / QK_K);
+        // SAFETY: features detected; `x` is a whole number of QK_K blocks
+        // and `out` has room for every block.
+        unsafe {
+            avx2::quantize_q8k_into(x, out.spare_capacity_mut());
+            out.set_len(x.len() / QK_K);
+        }
+        return out;
+    }
+    quantize_q8k_scalar(x)
+}
+
+/// The portable reference the SIMD path must match value for value.
+pub fn quantize_q8k_scalar(x: &[f32]) -> Vec<BlockQ8K> {
     debug_assert_eq!(x.len() % QK_K, 0);
     x.chunks_exact(QK_K)
         .map(|chunk| {
@@ -836,6 +870,150 @@ mod avx2 {
             out[j] = sum;
         }
         out
+    }
+
+    /// Quantize whole 32-float blocks into `out`, matching
+    /// [`super::quantize_q8_0_scalar`] exactly for finite inputs.
+    ///
+    /// `vcvtps2dq` rounds with MXCSR, which is round-to-nearest-even by
+    /// default and so is already the scalar's `round_ties_even`; no explicit
+    /// rounding step is needed. The block sum is taken from the i32 vectors
+    /// before they are packed, where it cannot overflow (32 values of at
+    /// most 127).
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn quantize_q8_0_into(
+        x: &[f32],
+        out: &mut [std::mem::MaybeUninit<super::BlockQ8_0>],
+    ) {
+        let blocks = x.len() / 32;
+        debug_assert!(out.len() >= blocks);
+        let sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+        // Restores lane order after the two packing steps.
+        let order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        for b in 0..blocks {
+            let p = x.as_ptr().add(b * 32);
+            let v: [__m256; 4] = std::array::from_fn(|i| _mm256_loadu_ps(p.add(8 * i)));
+            // amax over the block. The scalar fold starts at 0.0 and uses
+            // f32::max, which agrees with vmaxps on finite inputs.
+            let mut m = _mm256_and_ps(v[0], sign_mask);
+            for part in &v[1..] {
+                m = _mm256_max_ps(m, _mm256_and_ps(*part, sign_mask));
+            }
+            let half = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
+            let half = _mm_max_ps(half, _mm_movehl_ps(half, half));
+            let amax = _mm_cvtss_f32(_mm_max_ss(half, _mm_shuffle_ps(half, half, 1)));
+
+            let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
+            let scale = _mm256_set1_ps(id);
+            let i32s: [__m256i; 4] =
+                std::array::from_fn(|i| _mm256_cvtps_epi32(_mm256_mul_ps(v[i], scale)));
+
+            let mut total = _mm256_add_epi32(
+                _mm256_add_epi32(i32s[0], i32s[1]),
+                _mm256_add_epi32(i32s[2], i32s[3]),
+            );
+            total = _mm256_hadd_epi32(total, total);
+            total = _mm256_hadd_epi32(total, total);
+            let sum = _mm256_extract_epi32(total, 0) + _mm256_extract_epi32(total, 4);
+
+            // i32 -> i16 -> i8, then undo the lane interleave.
+            let lo = _mm256_packs_epi32(i32s[0], i32s[1]);
+            let hi = _mm256_packs_epi32(i32s[2], i32s[3]);
+            let packed = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(lo, hi), order);
+
+            let d = super::f16_to_f32(crate::quant::f32_to_f16(amax / 127.0));
+            let slot = out.get_unchecked_mut(b).as_mut_ptr();
+            (*slot).d = d;
+            (*slot).s = d * sum as f32;
+            _mm256_storeu_si256((*slot).qs.as_mut_ptr() as *mut __m256i, packed);
+        }
+    }
+
+    /// Quantize whole 256-float blocks into `out`, matching
+    /// [`super::quantize_q8k_scalar`] exactly for finite inputs.
+    ///
+    /// Two details decide correctness. The scale's sign comes from the
+    /// *first* value attaining the largest magnitude, so after finding the
+    /// magnitude the blocks are rescanned in order for it. And the scalar
+    /// rounds with `f32::round`, half away from zero, which `vcvtps2dq`
+    /// does not do; `trunc(t + copysign(0.5, t))` does, exactly, for the
+    /// |t| <= 127 this produces.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn quantize_q8k_into(x: &[f32], out: &mut [std::mem::MaybeUninit<super::BlockQ8K>]) {
+        const K: usize = crate::quant::QK_K;
+        let blocks = x.len() / K;
+        debug_assert!(out.len() >= blocks);
+        let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+        let sign_bit = _mm256_castsi256_ps(_mm256_set1_epi32(-0x8000_0000));
+        let half = _mm256_set1_ps(0.5);
+        let cap = _mm256_set1_epi32(127);
+        let order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        for b in 0..blocks {
+            let p = x.as_ptr().add(b * K);
+            let slot = out.get_unchecked_mut(b).as_mut_ptr();
+
+            let mut m = _mm256_setzero_ps();
+            for i in 0..K / 8 {
+                m = _mm256_max_ps(m, _mm256_and_ps(_mm256_loadu_ps(p.add(8 * i)), abs_mask));
+            }
+            let lo = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
+            let lo = _mm_max_ps(lo, _mm_movehl_ps(lo, lo));
+            let amax = _mm_cvtss_f32(_mm_max_ss(lo, _mm_shuffle_ps(lo, lo, 1)));
+
+            if amax == 0.0 {
+                (*slot).d = 0.0;
+                (*slot).qs = [0; K];
+                (*slot).bsums = [0; 16];
+                continue;
+            }
+            // The first value whose magnitude equals amax fixes the sign.
+            let target = _mm256_set1_ps(amax);
+            let mut max = 0.0_f32;
+            for i in 0..K / 8 {
+                let v = _mm256_loadu_ps(p.add(8 * i));
+                let hit = _mm256_movemask_ps(_mm256_cmp_ps::<_CMP_EQ_OQ>(
+                    _mm256_and_ps(v, abs_mask),
+                    target,
+                ));
+                if hit != 0 {
+                    max = *p.add(8 * i + hit.trailing_zeros() as usize);
+                    break;
+                }
+            }
+            let iscale = -127.0 / max;
+            let scale = _mm256_set1_ps(iscale);
+
+            let mut packed = [_mm256_setzero_si256(); K / 32];
+            let mut group_sums = [0_i32; 16];
+            for q in 0..K / 32 {
+                // 32 values -> four i32 vectors -> one packed i8 vector.
+                let mut parts = [_mm256_setzero_si256(); 4];
+                for (j, part) in parts.iter_mut().enumerate() {
+                    let t = _mm256_mul_ps(_mm256_loadu_ps(p.add(32 * q + 8 * j)), scale);
+                    let bump = _mm256_or_ps(_mm256_and_ps(t, sign_bit), half);
+                    let r = _mm256_cvttps_epi32(_mm256_add_ps(t, bump));
+                    *part = _mm256_min_epi32(r, cap);
+                }
+                // bsums covers groups of 16 values, two per 32-value chunk.
+                for g in 0..2 {
+                    let pair = _mm256_add_epi32(parts[2 * g], parts[2 * g + 1]);
+                    let folded = _mm256_hadd_epi32(pair, pair);
+                    let folded = _mm256_hadd_epi32(folded, folded);
+                    group_sums[2 * q + g] =
+                        _mm256_extract_epi32(folded, 0) + _mm256_extract_epi32(folded, 4);
+                }
+                let a = _mm256_packs_epi32(parts[0], parts[1]);
+                let c = _mm256_packs_epi32(parts[2], parts[3]);
+                packed[q] = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(a, c), order);
+            }
+            for (q, value) in packed.iter().enumerate() {
+                _mm256_storeu_si256((*slot).qs.as_mut_ptr().add(32 * q) as *mut __m256i, *value);
+            }
+            for (sum, value) in (*slot).bsums.iter_mut().zip(&group_sums) {
+                *sum = *value as i16;
+            }
+            (*slot).d = 1.0 / iscale;
+        }
     }
 
     #[target_feature(enable = "avx2,fma,f16c")]
@@ -1784,6 +1962,90 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The SIMD activation quantizer must agree with the scalar reference
+    /// bit for bit: these values feed every dot product, so a one-step
+    /// difference here would show up as a perplexity difference that looks
+    /// like a kernel bug.
+    #[test]
+    fn simd_q8_0_quantization_matches_scalar() {
+        let mut seed = 12345_u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let mut x: Vec<f32> = Vec::new();
+        // A spread of magnitudes, exact ties (0.5 steps, where
+        // round-half-to-even differs from round-half-away), zeros, and
+        // negatives.
+        for _ in 0..64 {
+            x.push((next() % 2001) as f32 / 1000.0 - 1.0);
+        }
+        for i in 0..32 {
+            x.push((i as f32 - 16.0) * 0.5);
+        }
+        x.extend([0.0; 32]);
+        for i in 0..32 {
+            x.push(if i % 2 == 0 { 1e-30 } else { -1e-30 });
+        }
+        for i in 0..32 {
+            x.push(if i == 7 { -65504.0 } else { 1.0 });
+        }
+        let fast = quantize_q8_0(&x);
+        let reference = quantize_q8_0_scalar(&x);
+        assert_eq!(fast.len(), reference.len());
+        for (b, (a, e)) in fast.iter().zip(&reference).enumerate() {
+            assert_eq!(a.d.to_bits(), e.d.to_bits(), "block {b} scale");
+            assert_eq!(a.s.to_bits(), e.s.to_bits(), "block {b} sum");
+            assert_eq!(a.qs, e.qs, "block {b} quants");
+        }
+    }
+
+    /// Same contract for the K-quant activation format, including the cases
+    /// its two awkward details turn on: ties under round-half-away-from-zero,
+    /// and which value attains the maximum magnitude first (it sets the
+    /// scale's sign).
+    #[test]
+    fn simd_q8k_quantization_matches_scalar() {
+        let mut seed = 777_u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let mut x: Vec<f32> = Vec::new();
+        for _ in 0..crate::quant::QK_K {
+            x.push((next() % 4001) as f32 / 1000.0 - 2.0);
+        }
+        // Positive maximum first, then an equal negative one.
+        let mut block = vec![0.5_f32; crate::quant::QK_K];
+        block[10] = 3.0;
+        block[200] = -3.0;
+        x.extend(&block);
+        // Negative maximum first: the scale's sign flips.
+        block[10] = -3.0;
+        block[200] = 3.0;
+        x.extend(&block);
+        // All zeros, which takes the early-out path.
+        x.extend(vec![0.0_f32; crate::quant::QK_K]);
+        // Values that land exactly on .5 after scaling.
+        let mut ties = vec![0.0_f32; crate::quant::QK_K];
+        for (i, v) in ties.iter_mut().enumerate() {
+            *v = (i as f32 - 128.0) / 254.0;
+        }
+        x.extend(&ties);
+        let fast = quantize_q8k(&x);
+        let reference = quantize_q8k_scalar(&x);
+        assert_eq!(fast.len(), reference.len());
+        for (b, (a, e)) in fast.iter().zip(&reference).enumerate() {
+            assert_eq!(a.d.to_bits(), e.d.to_bits(), "block {b} scale");
+            assert_eq!(a.qs, e.qs, "block {b} quants");
+            assert_eq!(a.bsums, e.bsums, "block {b} group sums");
         }
     }
 
