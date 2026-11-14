@@ -17,6 +17,18 @@ and execute Llama-family models without exceeding a configured budget.
 
 ## Immediate work queue
 
+0. **Disk tier: done.** Models larger than the RAM budget keep the head and a
+   block prefix resident and stream the rest, with read-ahead and immediate
+   release (README, "Models bigger than RAM"). It is 1.45x llama.cpp on
+   Qwen3-14B Q4_K_M in a 6 GiB cgroup, running at 95% of disk bandwidth. Next
+   on this line: Mixture-of-Experts, where a token reads only its active
+   experts, so streaming cold experts from disk while caching hot ones costs
+   a fraction of a dense model's traffic. kLLM does not run any MoE
+   architecture yet (Qwen3-MoE would be the first). An open question: near
+   the edge (a model barely over MemAvailable), streaming loses to plain
+   mmap because the kernel can reclaim other caches. Deciding that at run
+   time, from observed major faults, would beat a static budget.
+
 1. **Decode bandwidth.** Decode is now parity or better on most types
    (Q8_0 1.18x, Q6_K 1.14x, Q4_0 1.05x) but trails on the K-quants that
    matter most: Qwen3-0.6B Q4_K_M at 0.88x and Q5_K_M at 0.94x. It is

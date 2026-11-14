@@ -61,6 +61,34 @@ $ kllm plan-model Qwen3.5-9B-Q4_K_M.gguf --vram-gib 3.7 --context 8192
   ...
 ```
 
+## Models bigger than RAM
+
+kLLM has a third weight tier below VRAM and RAM: the file itself. When a
+model does not fit the RAM budget, it keeps the output head and a prefix of
+blocks resident and streams the rest from disk every token. Each streamed
+block is read ahead two blocks early (`MADV_WILLNEED`) and dropped from the
+page cache right after use, so the stream never evicts the resident set,
+which is what plain least-recently-used caching does on a pass larger
+than RAM. Streamed blocks stay in their original row-major form, so they
+take no heap memory. The budget defaults to what is available now, including
+any cgroup limit, minus the session and a 1 GiB margin. Set it with
+`--ram-gib N`, or turn streaming off with `--ram-gib all`.
+
+Qwen3-14B Q4_K_M (9.0 GB) in a 6 GiB memory cgroup, cold page cache, 4
+threads, on a 1.4 GB/s NVMe:
+
+| Engine | Decode |
+|---|---|
+| llama.cpp b12099, default | killed: its CPU repack needs the whole model in heap |
+| llama.cpp `--repack 0` (mmap) | 4.35 s/token |
+| kLLM, mmap only (`KLLM_NO_REPACK=1 --ram-gib all`) | 4.58 s/token |
+| kLLM, streaming (`--ram-gib 4.5`) | **3.00 s/token** |
+
+Streaming is bounded by the disk: 3.98 GB streamed per token at 1.4 GB/s is
+2.84 s. It only helps when the model really does not fit. Near the edge, the
+kernel can often free enough other cache to hold the whole model, and
+`--ram-gib all` is then faster.
+
 ## Correctness
 
 The test-suite compares kLLM with llama.cpp (build 12099) on recorded

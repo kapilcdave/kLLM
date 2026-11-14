@@ -387,11 +387,41 @@ fn cmd_plan_model(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Memory this process can still use: the system's MemAvailable, capped by
+/// the headroom of every enclosing cgroup-v2 limit (`memory.max` minus
+/// `memory.current`). MemAvailable alone ignores a container's or systemd
+/// scope's limit, and a model sized to it gets OOM-killed there.
 fn mem_available() -> Option<u64> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
     let line = text.lines().find(|l| l.starts_with("MemAvailable:"))?;
     let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kib * 1024)
+    let mut available = kib * 1024;
+    if let Some(headroom) = cgroup_headroom() {
+        available = available.min(headroom);
+    }
+    Some(available)
+}
+
+fn cgroup_headroom() -> Option<u64> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = own.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    let mut dir = std::path::PathBuf::from("/sys/fs/cgroup").join(path.trim_start_matches('/'));
+    let mut best: Option<u64> = None;
+    loop {
+        let read = |f: &str| std::fs::read_to_string(dir.join(f)).ok();
+        if let (Some(max), Some(current)) = (read("memory.max"), read("memory.current")) {
+            if let (Ok(max), Ok(current)) =
+                (max.trim().parse::<u64>(), current.trim().parse::<u64>())
+            {
+                let headroom = max.saturating_sub(current);
+                best = Some(best.map_or(headroom, |b| b.min(headroom)));
+            }
+        }
+        if dir == std::path::Path::new("/sys/fs/cgroup") || !dir.pop() {
+            break;
+        }
+    }
+    best
 }
 
 fn cpu_name() -> String {
