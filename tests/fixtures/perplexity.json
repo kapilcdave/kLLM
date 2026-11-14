@@ -1,34 +1,69 @@
 {
- "llama_cpp": "build 12099 (bee23322f), CPU, -t 4",
+ "llama_cpp": "version: 0.8.0-dev (build 12099, commit bee23322f)",
  "context": 256,
  "chunks": 8,
  "text": "wiki.test.head.txt",
  "note": "ppl_fa_on is llama.cpp's default (flash attention on). The on/off spread is llama.cpp's own implementation noise.",
  "models": {
-  "SmolLM2-135M-Instruct-f16.gguf": {
-   "ppl_fa_on": 24.5468,
-   "stderr": 2.48416,
-   "ppl_fa_off": 24.5438
-  },
-  "SmolLM2-135M-Instruct-Q8_0.gguf": {
-   "ppl_fa_on": 24.7445,
-   "stderr": 2.5078,
-   "ppl_fa_off": 24.7698
-  },
-  "SmolLM2-135M-Instruct-Q4_0.gguf": {
-   "ppl_fa_on": 28.4352,
-   "stderr": 2.8518,
-   "ppl_fa_off": 28.3689
-  },
   "Qwen3-0.6B-Q4_K_M.gguf": {
    "ppl_fa_on": 32.4193,
-   "stderr": 3.68674,
+   "stderr": 3.68735,
    "ppl_fa_off": 32.3499
   },
   "Qwen3-0.6B-Q8_0.gguf": {
    "ppl_fa_on": 30.0273,
-   "stderr": 3.35724,
+   "stderr": 3.36796,
    "ppl_fa_off": 29.9143
+  },
+  "SmolLM2-135M-Instruct-BF16.gguf": {
+   "ppl_fa_on": 24.5364,
+   "stderr": 2.48255,
+   "ppl_fa_off": 24.5509
+  },
+  "SmolLM2-135M-Instruct-Q2_K.gguf": {
+   "ppl_fa_on": 227.9245,
+   "stderr": 28.28442,
+   "ppl_fa_off": 226.6568
+  },
+  "SmolLM2-135M-Instruct-Q4_0.gguf": {
+   "ppl_fa_on": 28.4352,
+   "stderr": 2.85947,
+   "ppl_fa_off": 28.3689
+  },
+  "SmolLM2-135M-Instruct-Q4_1.gguf": {
+   "ppl_fa_on": 32.1723,
+   "stderr": 3.42299,
+   "ppl_fa_off": 32.142
+  },
+  "SmolLM2-135M-Instruct-Q5_0.gguf": {
+   "ppl_fa_on": 26.5701,
+   "stderr": 2.6972,
+   "ppl_fa_off": 26.6281
+  },
+  "SmolLM2-135M-Instruct-Q5_1.gguf": {
+   "ppl_fa_on": 25.8252,
+   "stderr": 2.64042,
+   "ppl_fa_off": 25.847
+  },
+  "SmolLM2-135M-Instruct-Q5_K_M.gguf": {
+   "ppl_fa_on": 25.9888,
+   "stderr": 2.63703,
+   "ppl_fa_off": 25.9788
+  },
+  "SmolLM2-135M-Instruct-Q6_K.gguf": {
+   "ppl_fa_on": 24.9358,
+   "stderr": 2.53978,
+   "ppl_fa_off": 24.8645
+  },
+  "SmolLM2-135M-Instruct-Q8_0.gguf": {
+   "ppl_fa_on": 24.7445,
+   "stderr": 2.5022,
+   "ppl_fa_off": 24.7698
+  },
+  "SmolLM2-135M-Instruct-f16.gguf": {
+   "ppl_fa_on": 24.5468,
+   "stderr": 2.48449,
+   "ppl_fa_off": 24.5438
   }
  }
 }

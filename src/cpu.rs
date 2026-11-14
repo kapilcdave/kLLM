@@ -15,6 +15,12 @@ const MIN_TASK_BYTES: usize = 48 * 1024;
 /// Activation columns processed together by one pass over a task's rows.
 const COLUMN_TILE: usize = 8;
 
+/// Tasks aimed at each thread. Several per thread let the dynamic claiming in
+/// [`crate::pool::Pool::for_each`] even out threads that run at different
+/// speeds; sweeping this between 1 and 24 moved nothing measurably, so the
+/// GEMM is not limited by how the rows are carved up.
+const TASKS_PER_THREAD: usize = 3;
+
 /// Raw output pointer shared across tasks that write disjoint rows.
 #[derive(Clone, Copy)]
 struct OutPtr(*mut f32);
@@ -32,6 +38,54 @@ struct Task {
     rows: usize,
 }
 
+/// Write pointer to an uninitialised `Vec<Prepared>`, shared by the tasks
+/// that fill its disjoint slots.
+struct ColumnsPtr<'a>(*mut Prepared<'a>);
+// SAFETY: task `i` writes only slot `i`, and no task reads any slot.
+unsafe impl Send for ColumnsPtr<'_> {}
+unsafe impl Sync for ColumnsPtr<'_> {}
+
+impl<'a> ColumnsPtr<'a> {
+    /// A method, not field access, so a closure captures the `Sync` wrapper
+    /// rather than the bare pointer inside it.
+    fn slot(&self, index: usize) -> *mut Prepared<'a> {
+        // SAFETY: callers stay within the allocation's capacity.
+        unsafe { self.0.add(index) }
+    }
+}
+
+/// Below this many activation values, preparing on the calling thread beats
+/// paying for a parallel dispatch (decode prepares one narrow column).
+const PARALLEL_PREPARE_VALUES: usize = 16 * 1024;
+
+/// Quantize each of `batch` activation columns of `cols` values for `kind`.
+fn prepare_columns<'a>(
+    kind: crate::quant::GgmlType,
+    inputs: &'a [f32],
+    cols: usize,
+    batch: usize,
+) -> Vec<Prepared<'a>> {
+    let pool = crate::pool::global();
+    if batch < 2 || pool.threads() < 2 || cols * batch < PARALLEL_PREPARE_VALUES {
+        return inputs
+            .chunks_exact(cols)
+            .map(|x| kernels::prepare(kind, x))
+            .collect();
+    }
+    let mut columns: Vec<Prepared<'a>> = Vec::with_capacity(batch);
+    let slots = ColumnsPtr(columns.as_mut_ptr());
+    pool.for_each(batch, |i| {
+        let column = kernels::prepare(kind, &inputs[i * cols..(i + 1) * cols]);
+        // SAFETY: `columns` has capacity for `batch` slots, this task owns
+        // slot `i` alone, and the slot is uninitialised so nothing is
+        // dropped by overwriting it.
+        unsafe { slots.slot(i).write(column) };
+    });
+    // SAFETY: every slot in 0..batch was written above.
+    unsafe { columns.set_len(batch) };
+    columns
+}
+
 impl CpuBackend {
     /// Compute every job: `outputs[b * rows + r] = matrix.row(r) · inputs[b]`.
     fn run_jobs(
@@ -45,21 +99,24 @@ impl CpuBackend {
             require_len("matmul outputs", job.matrix.rows * batch, job.output.len())?;
         }
         // Prepare the inputs once per distinct activation format.
+        //
+        // This quantizes every activation column, and it used to run on the
+        // calling thread while the workers idled. That is Amdahl's law with a
+        // large constant: for a 1536-wide input it was 71% of the whole
+        // matmul call, which is why the wide-input projections scaled worst.
+        // It parallelises perfectly -- the columns are independent.
         let mut prepared: Vec<(kernels::DotInput, Vec<Prepared<'_>>)> = Vec::new();
         for job in jobs.iter() {
             let format = kernels::dot_input(job.matrix.kind);
             if !prepared.iter().any(|(f, _)| *f == format) {
                 let cols = job.matrix.cols;
-                let columns = inputs
-                    .chunks_exact(cols)
-                    .map(|x| kernels::prepare(job.matrix.kind, x))
-                    .collect();
-                prepared.push((format, columns));
+                let kind = job.matrix.kind;
+                prepared.push((format, prepare_columns(kind, inputs, cols, batch)));
             }
         }
         let threads = crate::pool::global().threads();
         let total_bytes: usize = jobs.iter().map(|j| j.matrix.data.len()).sum::<usize>() * batch;
-        let target = (total_bytes / (threads * 3)).max(MIN_TASK_BYTES);
+        let target = (total_bytes / (threads * TASKS_PER_THREAD)).max(MIN_TASK_BYTES);
         let mut tasks = Vec::new();
         for (index, job) in jobs.iter().enumerate() {
             let row_cost = (job.matrix.row_bytes() * batch).max(1);

@@ -1,0 +1,129 @@
+{
+ "llama_cpp": "version: 0.8.0-dev (build 12099, commit bee23322f)",
+ "context": 512,
+ "chunks": 4,
+ "text": "wiki.test.head.txt",
+ "note": "llama-perplexity --kl-divergence against the family's reference model, flash attention at its default (on). KL divergence is in nats; top1_agree is a percentage.",
+ "models": {
+  "SmolLM2-135M-Instruct-BF16.gguf": {
+   "kl_mean": 8.1e-05,
+   "kl_mean_stderr": 3e-06,
+   "kl_median": 5.3e-05,
+   "kl_p99": 0.000533,
+   "kl_max": 0.001094,
+   "top1_agree": 99.608,
+   "top1_agree_stderr": 0.196,
+   "ppl_test": 17.571251,
+   "ppl_reference": 17.536147,
+   "reference": "SmolLM2-135M-Instruct-f16.gguf"
+  },
+  "SmolLM2-135M-Instruct-Q2_K.gguf": {
+   "kl_mean": 2.130084,
+   "kl_mean_stderr": 0.056008,
+   "kl_median": 1.707713,
+   "kl_p99": 9.873775,
+   "kl_max": 13.319751,
+   "top1_agree": 30.686,
+   "top1_agree_stderr": 1.445,
+   "ppl_test": 148.095199,
+   "ppl_reference": 17.536147,
+   "reference": "SmolLM2-135M-Instruct-f16.gguf"
+  },
+  "SmolLM2-135M-Instruct-Q4_0.gguf": {
+   "kl_mean": 0.148069,
+   "kl_mean_stderr": 0.006255,
+   "kl_median": 0.103696,
+   "kl_p99": 0.899173,
+   "kl_max": 3.812388,
+   "top1_agree": 81.078,
+   "top1_agree_stderr": 1.227,
+   "ppl_test": 20.161365,
+   "ppl_reference": 17.536147,
+   "reference": "SmolLM2-135M-Instruct-f16.gguf"
+  },
+  "SmolLM2-135M-Instruct-Q4_1.gguf": {
+   "kl_mean": 0.271327,
+   "kl_mean_stderr": 0.009532,
+   "kl_median": 0.212583,
+   "kl_p99": 1.488196,
+   "kl_max": 4.994579,
+   "top1_agree": 74.118,
+   "top1_agree_stderr": 1.372,
+   "ppl_test": 23.262627,
+   "ppl_reference": 17.536147,
+   "reference": "SmolLM2-135M-Instruct-f16.gguf"
+  },
+  "SmolLM2-135M-Instruct-Q5_0.gguf": {
+   "kl_mean": 0.08825,
+   "kl_mean_stderr": 0.00433,
+   "kl_median": 0.07283,
+   "kl_p99": 0.400351,
+   "kl_max": 3.747006,
+   "top1_agree": 82.451,
+   "top1_agree_stderr": 1.192,
+   "ppl_test": 18.826898,
+   "ppl_reference": 17.536147,
+   "reference": "SmolLM2-135M-Instruct-f16.gguf"
+  },
+  "SmolLM2-135M-Instruct-Q5_1.gguf": {
+   "kl_mean": 0.069482,
+   "kl_mean_stderr": 0.006831,
+   "kl_median": 0.050431,
+   "kl_p99": 0.397401,
+   "kl_max": 6.63904,
+   "top1_agree": 85.686,
+   "top1_agree_stderr": 1.097,
+   "ppl_test": 18.824802,
+   "ppl_reference": 17.536147,
+   "reference": "SmolLM2-135M-Instruct-f16.gguf"
+  },
+  "SmolLM2-135M-Instruct-Q5_K_M.gguf": {
+   "kl_mean": 0.063889,
+   "kl_mean_stderr": 0.002704,
+   "kl_median": 0.049156,
+   "kl_p99": 0.347949,
+   "kl_max": 1.804286,
+   "top1_agree": 85.392,
+   "top1_agree_stderr": 1.106,
+   "ppl_test": 18.638399,
+   "ppl_reference": 17.536147,
+   "reference": "SmolLM2-135M-Instruct-f16.gguf"
+  },
+  "SmolLM2-135M-Instruct-Q6_K.gguf": {
+   "kl_mean": 0.00889,
+   "kl_mean_stderr": 0.000372,
+   "kl_median": 0.006329,
+   "kl_p99": 0.04745,
+   "kl_max": 0.255111,
+   "top1_agree": 94.118,
+   "top1_agree_stderr": 0.737,
+   "ppl_test": 17.722774,
+   "ppl_reference": 17.536147,
+   "reference": "SmolLM2-135M-Instruct-f16.gguf"
+  },
+  "SmolLM2-135M-Instruct-Q8_0.gguf": {
+   "kl_mean": 0.003777,
+   "kl_mean_stderr": 0.000136,
+   "kl_median": 0.002897,
+   "kl_p99": 0.019031,
+   "kl_max": 0.069628,
+   "top1_agree": 96.569,
+   "top1_agree_stderr": 0.57,
+   "ppl_test": 17.653991,
+   "ppl_reference": 17.536147,
+   "reference": "SmolLM2-135M-Instruct-f16.gguf"
+  },
+  "Qwen3-0.6B-Q4_K_M.gguf": {
+   "kl_mean": 0.076557,
+   "kl_mean_stderr": 0.004246,
+   "kl_median": 0.04432,
+   "kl_p99": 0.527627,
+   "kl_max": 3.040663,
+   "top1_agree": 86.765,
+   "top1_agree_stderr": 1.062,
+   "ppl_test": 19.804035,
+   "ppl_reference": 18.495318,
+   "reference": "Qwen3-0.6B-Q8_0.gguf"
+  }
+ }
+}

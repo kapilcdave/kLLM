@@ -664,6 +664,7 @@ impl<'m> Session<'m> {
         let scale = 1.0 / (hd as f32).sqrt();
         let group = c.n_head / c.n_head_kv;
         let layer_stride = self.context * kvd;
+        let query_block = query_block(c, n, crate::pool::global().threads());
 
         for (li, layer) in model.layers.iter().enumerate() {
             // --- attention ---
@@ -722,37 +723,96 @@ impl<'m> Session<'m> {
 
             self.profiler.lap(2);
             // Causal attention: token i sees positions 0..=start+i.
+            //
+            // Blocked over query tokens: one task owns a block of query
+            // tokens and one KV head, so each cache row is read once and
+            // reused by every query in the block and every query head in the
+            // group. A row-per-(token, head) loop instead re-reads the whole
+            // cache n_head times per token, which is the dominant cost of
+            // prefill attention. The arithmetic per (token, head) is
+            // unchanged, so results are bit-identical either way.
             let k_layer = &self.k_cache[li * layer_stride..(li + 1) * layer_stride];
             let v_layer = &self.v_cache[li * layer_stride..(li + 1) * layer_stride];
             let q_all = &self.q[..n * qd];
             let context = self.context;
             let attn = OutPtr(self.attn.as_mut_ptr());
             let scores_base = OutPtr(self.scores.as_mut_ptr());
-            crate::pool::global().for_each(n * c.n_head, |task| {
-                // SAFETY: task `t` owns attn[t*hd..(t+1)*hd] and
-                // scores[t*context..(t+1)*context]; tasks are disjoint and
-                // both buffers hold n * n_head of them.
-                let out = unsafe { std::slice::from_raw_parts_mut(attn.at(task * hd), hd) };
-                let scores = unsafe {
-                    std::slice::from_raw_parts_mut(scores_base.at(task * context), context)
+            let blocks = n.div_ceil(query_block);
+            crate::pool::global().for_each(blocks * c.n_head_kv, |task| {
+                let (block, kv_head) = (task / c.n_head_kv, task % c.n_head_kv);
+                let i0 = block * query_block;
+                let i1 = (i0 + query_block).min(n);
+                let kv_off = kv_head * hd;
+                let heads = kv_head * group..(kv_head + 1) * group;
+                // SAFETY: this task owns attn[(i * n_head + h) * hd ..] and
+                // scores[(i * n_head + h) * context ..] for its own query
+                // tokens i and query heads h, which no other task touches.
+                let out = |i: usize, h: usize| unsafe {
+                    std::slice::from_raw_parts_mut(attn.at(i * qd + h * hd), hd)
                 };
-                let (i, h) = (task / c.n_head, task % c.n_head);
-                let q = &q_all[i * qd + h * hd..i * qd + (h + 1) * hd];
-                let kv_off = (h / group) * hd;
-                let len = start + i + 1;
-                let scores = &mut scores[..len];
-                let mut max = f32::NEG_INFINITY;
-                for (t, s) in scores.iter_mut().enumerate() {
+                let row = |i: usize, h: usize| unsafe {
+                    std::slice::from_raw_parts_mut(
+                        scores_base.at((i * c.n_head + h) * context),
+                        context,
+                    )
+                };
+                // Scores: read each key once and dot it against the queries
+                // that attend to it, a tile at a time so one widened key
+                // serves several queries and each has its own accumulators.
+                const Q_TILE: usize = 4;
+                for t in 0..start + i1 {
                     let key = &k_layer[t * kvd + kv_off..t * kvd + kv_off + hd];
-                    *s = kernels::dot_f16_f32(key, q) * scale;
-                    max = max.max(*s);
+                    // Query token i attends to position t only once
+                    // t <= start + i, so the earliest query that sees t is
+                    // t - start.
+                    let first = i0.max(t.saturating_sub(start));
+                    let pairs = (i1 - first) * group;
+                    // Pair p is query token first + p / group, query head
+                    // kv_head * group + p % group.
+                    let pair = |p: usize| (first + p / group, kv_head * group + p % group);
+                    let query = |p: usize| {
+                        let (i, h) = pair(p);
+                        &q_all[i * qd + h * hd..i * qd + (h + 1) * hd]
+                    };
+                    let mut p = 0;
+                    while p + Q_TILE <= pairs {
+                        let got = kernels::dot_f16_f32_many(
+                            key,
+                            std::array::from_fn::<_, Q_TILE, _>(|o| query(p + o)),
+                        );
+                        for (o, value) in got.iter().enumerate() {
+                            let (i, h) = pair(p + o);
+                            row(i, h)[t] = value * scale;
+                        }
+                        p += Q_TILE;
+                    }
+                    while p < pairs {
+                        let (i, h) = pair(p);
+                        row(i, h)[t] = kernels::dot_f16_f32_many(key, [query(p)])[0] * scale;
+                        p += 1;
+                    }
                 }
-                let sum = kernels::exp_shifted_sum(scores, max);
-                out.fill(0.0);
-                let inv = 1.0 / sum;
-                for (t, s) in scores.iter().enumerate() {
+                // Softmax each (token, head) row over the positions it sees.
+                for i in i0..i1 {
+                    for h in heads.clone() {
+                        let scores = &mut row(i, h)[..start + i + 1];
+                        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let inv = 1.0 / kernels::exp_shifted_sum(scores, max);
+                        for s in scores.iter_mut() {
+                            *s *= inv;
+                        }
+                        out(i, h).fill(0.0);
+                    }
+                }
+                // Values: read each value row once and accumulate it into
+                // every output that weights it.
+                for t in 0..start + i1 {
                     let value = &v_layer[t * kvd + kv_off..t * kvd + kv_off + hd];
-                    kernels::axpy_f16(out, s * inv, value);
+                    for i in i0.max(t.saturating_sub(start))..i1 {
+                        for h in heads.clone() {
+                            kernels::axpy_f16(out(i, h), row(i, h)[t], value);
+                        }
+                    }
                 }
             });
             self.profiler.lap(3);
@@ -848,6 +908,33 @@ impl OutPtr {
         // SAFETY: callers stay within the buffer the pointer came from.
         unsafe { self.0.add(offset) }
     }
+}
+
+/// Query tokens per attention task.
+///
+/// A block reads each KV-cache row once and shares it across every query in
+/// the block and every query head in the group, so a larger block means less
+/// cache traffic. But the block's queries are re-read for every position it
+/// attends to, so once they stop fitting in L1 the saved key traffic comes
+/// straight back as query traffic -- that is a real regression, not a
+/// diminishing return (it cost 7% on a 128-wide head before this bound).
+/// So: the largest block whose queries and output accumulators fit in half of
+/// a 32 KiB L1, and never more than leaves about two tasks per thread.
+fn query_block(config: &Config, tokens: usize, threads: usize) -> usize {
+    if let Some(forced) = std::env::var("KLLM_QUERY_BLOCK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+    {
+        return forced.min(tokens.max(1));
+    }
+    let group = config.n_head / config.n_head_kv;
+    // Each query in the block needs one query vector and one output
+    // accumulator per query head in the group, both f32.
+    let per_query = 2 * group * config.head_dim * 4;
+    let by_cache = (16 * 1024 / per_query.max(1)).max(1);
+    let by_threads = (tokens * config.n_head_kv / (2 * threads.max(1))).max(1);
+    by_cache.min(by_threads).min(tokens.max(1))
 }
 
 fn add_bias(values: &mut [f32], bias: Option<&[f32]>) {

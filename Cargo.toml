@@ -20,12 +20,18 @@ strip = true
 
 [dependencies]
 fancy-regex = "0.20.2"
+libloading = { version = "0.9.1", optional = true }
 memmap2 = "0.9.12"
 
 [dev-dependencies]
 serde_json = "1.0.154"
 
-
 # The test-suite runs real models; unoptimised kernels would take minutes.
 [profile.test]
 opt-level = 3
+
+[features]
+default = ["cuda"]
+# CUDA backend. Needs no CUDA toolkit to build: the driver (libcuda.so) is
+# loaded at run time and JIT-compiles the bundled PTX.
+cuda = ["dep:libloading"]

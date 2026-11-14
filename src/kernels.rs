@@ -42,7 +42,7 @@ pub fn dot_input(kind: GgmlType) -> DotInput {
         GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 => {
             DotInput::Q8_0
         }
-        GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => DotInput::Q8K,
+        GgmlType::Q2K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => DotInput::Q8K,
         _ => DotInput::F32,
     }
 }
@@ -69,6 +69,23 @@ fn half(bytes: &[u8], at: usize) -> f32 {
 
 pub fn quantize_q8_0(x: &[f32]) -> Vec<BlockQ8_0> {
     debug_assert_eq!(x.len() % 32, 0);
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        let mut out = Vec::with_capacity(x.len() / 32);
+        // SAFETY: features detected; `x` is a whole number of 32-float
+        // blocks and `out` has room for every block.
+        unsafe {
+            avx2::quantize_q8_0_into(x, out.spare_capacity_mut());
+            out.set_len(x.len() / 32);
+        }
+        return out;
+    }
+    quantize_q8_0_scalar(x)
+}
+
+/// The portable reference the SIMD path must match value for value.
+pub fn quantize_q8_0_scalar(x: &[f32]) -> Vec<BlockQ8_0> {
+    debug_assert_eq!(x.len() % 32, 0);
     x.chunks_exact(32)
         .map(|chunk| {
             let amax = chunk.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
@@ -92,6 +109,23 @@ pub fn quantize_q8_0(x: &[f32]) -> Vec<BlockQ8_0> {
 }
 
 pub fn quantize_q8k(x: &[f32]) -> Vec<BlockQ8K> {
+    debug_assert_eq!(x.len() % QK_K, 0);
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        let mut out = Vec::with_capacity(x.len() / QK_K);
+        // SAFETY: features detected; `x` is a whole number of QK_K blocks
+        // and `out` has room for every block.
+        unsafe {
+            avx2::quantize_q8k_into(x, out.spare_capacity_mut());
+            out.set_len(x.len() / QK_K);
+        }
+        return out;
+    }
+    quantize_q8k_scalar(x)
+}
+
+/// The portable reference the SIMD path must match value for value.
+pub fn quantize_q8k_scalar(x: &[f32]) -> Vec<BlockQ8K> {
     debug_assert_eq!(x.len() % QK_K, 0);
     x.chunks_exact(QK_K)
         .map(|chunk| {
@@ -154,11 +188,13 @@ pub fn dot(kind: GgmlType, row: &[u8], x: &Prepared<'_>) -> f32 {
             match (kind, x) {
                 (GgmlType::F32, Prepared::F32(x)) => return avx2::dot_f32(row, x),
                 (GgmlType::F16, Prepared::F32(x)) => return avx2::dot_f16(row, x),
+                (GgmlType::BF16, Prepared::F32(x)) => return avx2::dot_bf16(row, x),
                 (GgmlType::Q4_0, Prepared::Q8_0(x)) => return avx2::q4_0_n(row, [x])[0],
                 (GgmlType::Q8_0, Prepared::Q8_0(x)) => return avx2::q8_0_n(row, [x])[0],
                 (GgmlType::Q4_1, Prepared::Q8_0(x)) => return avx2::q4_1_n(row, [x])[0],
                 (GgmlType::Q5_0, Prepared::Q8_0(x)) => return avx2::q5_0_n(row, [x])[0],
                 (GgmlType::Q5_1, Prepared::Q8_0(x)) => return avx2::q5_1_n(row, [x])[0],
+                (GgmlType::Q2K, Prepared::Q8K(x)) => return avx2::q2k_n(row, [x])[0],
                 (GgmlType::Q4K, Prepared::Q8K(x)) => return avx2::q4k_n(row, [x])[0],
                 (GgmlType::Q5K, Prepared::Q8K(x)) => return avx2::dot_q5k(row, x),
                 (GgmlType::Q6K, Prepared::Q8K(x)) => return avx2::q6k_n(row, [x])[0],
@@ -185,7 +221,13 @@ pub fn dot_multi(
         // SAFETY: features detected; every prepared column matches `kind`
         // (checked by the pattern match) and has one block per weight block.
         unsafe {
-            if dot_input(kind) == DotInput::F32 && xs.len() == 1 {
+            // One column is cheapest through `dot` directly -- but only for
+            // the types `dot` has a SIMD kernel for. Anything else (Q2_K
+            // today) is better off being dequantized once into `scratch` and
+            // reduced with the f32 kernel below, even for a single column:
+            // taking the shortcut there means a fully scalar reduction, which
+            // cost Q2_K decode a factor of five.
+            if xs.len() == 1 && matches!(kind, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
                 out[0] = dot(kind, row, &xs[0]);
                 return;
             }
@@ -195,10 +237,10 @@ pub fn dot_multi(
                     _ => 0,
                 });
                 scratch.resize(cols, 0.0);
-                if kind == GgmlType::F16 {
-                    load_f16(row, scratch);
-                } else {
-                    crate::quant::dequantize_row(kind, row, scratch);
+                match kind {
+                    GgmlType::F16 => load_f16(row, scratch),
+                    GgmlType::BF16 => load_bf16(row, scratch),
+                    _ => crate::quant::dequantize_row(kind, row, scratch),
                 }
                 for (o, x) in out.iter_mut().zip(xs) {
                     let Prepared::F32(x) = x else { unreachable!() };
@@ -249,6 +291,7 @@ pub fn dot_multi(
                 GgmlType::Q4_1 => groups!(Q8_0, q4_1_n),
                 GgmlType::Q5_0 => groups!(Q8_0, q5_0_n),
                 GgmlType::Q5_1 => groups!(Q8_0, q5_1_n),
+                GgmlType::Q2K => groups!(Q8K, q2k_n),
                 GgmlType::Q4K => groups!(Q8K, q4k_n),
                 GgmlType::Q6K => groups!(Q8K, q6k_n),
                 _ => {}
@@ -342,6 +385,30 @@ pub fn dot_scalar(kind: GgmlType, row: &[u8], x: &Prepared<'_>) -> f32 {
                 sum as f32 * half(w, 0) * a.d
             })
             .sum(),
+        // Q2_K: sixteen sub-blocks of sixteen values, each with a 4-bit
+        // scale and a 4-bit minimum packed into one byte. Sub-block j takes
+        // its quants from byte 16 + 32*(j/8) + 16*(j%2) of the block, shifted
+        // right by 2*((j%8)/2). The minimum term needs only the activation
+        // sums, which Q8_K already carries as `bsums`.
+        (GgmlType::Q2K, Prepared::Q8K(x)) => row
+            .chunks_exact(84)
+            .zip(x)
+            .map(|(w, a)| {
+                let (mut main, mut mins) = (0_i32, 0_i32);
+                for j in 0..16 {
+                    let packed = w[j];
+                    let q = &w[16 + 32 * (j / 8) + 16 * (j % 2)..][..16];
+                    let shift = 2 * ((j % 8) / 2);
+                    let mut dot = 0_i32;
+                    for l in 0..16 {
+                        dot += ((q[l] >> shift) & 3) as i32 * a.qs[j * 16 + l] as i32;
+                    }
+                    main += (packed & 15) as i32 * dot;
+                    mins += (packed >> 4) as i32 * a.bsums[j] as i32;
+                }
+                a.d * (half(w, 80) * main as f32 - half(w, 82) * mins as f32)
+            })
+            .sum(),
         (GgmlType::Q4K, Prepared::Q8K(x)) => row
             .chunks_exact(144)
             .zip(x)
@@ -429,6 +496,36 @@ pub fn dot_f16_f32(k: &[u16], q: &[f32]) -> f32 {
         return unsafe { avx2::dot_f16_bits(k, q) };
     }
     k.iter().zip(q).map(|(&a, b)| f16_to_f32(a) * b).sum()
+}
+
+/// `out[j] = sum(k[i] * qs[j][i])` for several query vectors against one
+/// f16 row (a key from the KV cache).
+///
+/// Two things make this much faster than calling [`dot_f16_f32`] per query.
+/// Each query gets two accumulators, so a 64-wide head is two chains of four
+/// FMAs rather than one chain of eight -- the single-accumulator form is
+/// latency-bound, not throughput-bound. And the key is widened from f16 once
+/// and reused by every query, which is the whole point of reading it once.
+///
+/// Each query's accumulation order is fixed, so a result does not depend on
+/// how many queries happened to share the call.
+pub fn dot_f16_f32_many<const N: usize>(k: &[u16], qs: [&[f32]; N]) -> [f32; N] {
+    debug_assert!(qs.iter().all(|q| q.len() == k.len()));
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        // SAFETY: features detected; every query is as long as `k`.
+        return unsafe { avx2::dot_f16_bits_many(k, qs) };
+    }
+    std::array::from_fn(|j| {
+        let (mut a, mut b) = (0.0_f32, 0.0_f32);
+        for (c, chunk) in k.chunks(8).enumerate() {
+            let acc = if c % 2 == 0 { &mut a } else { &mut b };
+            for (i, &bits) in chunk.iter().enumerate() {
+                *acc += f16_to_f32(bits) * qs[j][c * 8 + i];
+            }
+        }
+        a + b
+    })
 }
 
 /// `out[i] += a * v[i]` where `v` holds f16 bits.
@@ -661,6 +758,20 @@ pub fn load_f16(src: &[u8], dst: &mut [f32]) {
     }
 }
 
+/// Widen bf16 bits to f32 in bulk.
+pub fn load_bf16(src: &[u8], dst: &mut [f32]) {
+    debug_assert_eq!(src.len(), dst.len() * 2);
+    let mut done = 0;
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        // SAFETY: features detected; only whole 8-lane chunks are touched.
+        done = unsafe { avx2::load_bf16(src, dst) };
+    }
+    for (d, b) in dst[done..].iter_mut().zip(src[done * 2..].chunks_exact(2)) {
+        *d = bf16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+    }
+}
+
 /// Convert f32 values to f16 bits (round to nearest even).
 pub fn store_f16(src: &[f32], dst: &mut [u16]) {
     debug_assert_eq!(src.len(), dst.len());
@@ -770,6 +881,186 @@ mod avx2 {
             i += 8;
         }
         hsum(acc)
+    }
+
+    /// `N` query vectors against one f16 key row. Two accumulators per query
+    /// break the FMA dependency chain; the widened key is shared.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn dot_f16_bits_many<const N: usize>(k: &[u16], qs: [&[f32]; N]) -> [f32; N] {
+        let n = k.len();
+        let mut acc = [[_mm256_setzero_ps(); 2]; N];
+        let kp = k.as_ptr();
+        let mut i = 0;
+        while i + 16 <= n {
+            let k0 = _mm256_cvtph_ps(_mm_loadu_si128(kp.add(i) as *const __m128i));
+            let k1 = _mm256_cvtph_ps(_mm_loadu_si128(kp.add(i + 8) as *const __m128i));
+            for j in 0..N {
+                let q = qs[j].as_ptr().add(i);
+                acc[j][0] = _mm256_fmadd_ps(k0, _mm256_loadu_ps(q), acc[j][0]);
+                acc[j][1] = _mm256_fmadd_ps(k1, _mm256_loadu_ps(q.add(8)), acc[j][1]);
+            }
+            i += 16;
+        }
+        if i + 8 <= n {
+            let k0 = _mm256_cvtph_ps(_mm_loadu_si128(kp.add(i) as *const __m128i));
+            for j in 0..N {
+                acc[j][0] = _mm256_fmadd_ps(k0, _mm256_loadu_ps(qs[j].as_ptr().add(i)), acc[j][0]);
+            }
+            i += 8;
+        }
+        let mut out = [0.0_f32; N];
+        for (j, pair) in acc.iter().enumerate() {
+            let mut sum = hsum(_mm256_add_ps(pair[0], pair[1]));
+            for (bits, value) in k[i..n].iter().zip(&qs[j][i..n]) {
+                sum += crate::quant::f16_to_f32(*bits) * value;
+            }
+            out[j] = sum;
+        }
+        out
+    }
+
+    /// Quantize whole 32-float blocks into `out`, matching
+    /// [`super::quantize_q8_0_scalar`] exactly for finite inputs.
+    ///
+    /// `vcvtps2dq` rounds with MXCSR, which is round-to-nearest-even by
+    /// default and so is already the scalar's `round_ties_even`; no explicit
+    /// rounding step is needed. The block sum is taken from the i32 vectors
+    /// before they are packed, where it cannot overflow (32 values of at
+    /// most 127).
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn quantize_q8_0_into(
+        x: &[f32],
+        out: &mut [std::mem::MaybeUninit<super::BlockQ8_0>],
+    ) {
+        let blocks = x.len() / 32;
+        debug_assert!(out.len() >= blocks);
+        let sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+        // Restores lane order after the two packing steps.
+        let order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        for b in 0..blocks {
+            let p = x.as_ptr().add(b * 32);
+            let v: [__m256; 4] = std::array::from_fn(|i| _mm256_loadu_ps(p.add(8 * i)));
+            // amax over the block. The scalar fold starts at 0.0 and uses
+            // f32::max, which agrees with vmaxps on finite inputs.
+            let mut m = _mm256_and_ps(v[0], sign_mask);
+            for part in &v[1..] {
+                m = _mm256_max_ps(m, _mm256_and_ps(*part, sign_mask));
+            }
+            let half = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
+            let half = _mm_max_ps(half, _mm_movehl_ps(half, half));
+            let amax = _mm_cvtss_f32(_mm_max_ss(half, _mm_shuffle_ps(half, half, 1)));
+
+            let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
+            let scale = _mm256_set1_ps(id);
+            let i32s: [__m256i; 4] =
+                std::array::from_fn(|i| _mm256_cvtps_epi32(_mm256_mul_ps(v[i], scale)));
+
+            let mut total = _mm256_add_epi32(
+                _mm256_add_epi32(i32s[0], i32s[1]),
+                _mm256_add_epi32(i32s[2], i32s[3]),
+            );
+            total = _mm256_hadd_epi32(total, total);
+            total = _mm256_hadd_epi32(total, total);
+            let sum = _mm256_extract_epi32(total, 0) + _mm256_extract_epi32(total, 4);
+
+            // i32 -> i16 -> i8, then undo the lane interleave.
+            let lo = _mm256_packs_epi32(i32s[0], i32s[1]);
+            let hi = _mm256_packs_epi32(i32s[2], i32s[3]);
+            let packed = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(lo, hi), order);
+
+            let d = super::f16_to_f32(crate::quant::f32_to_f16(amax / 127.0));
+            let slot = out.get_unchecked_mut(b).as_mut_ptr();
+            (*slot).d = d;
+            (*slot).s = d * sum as f32;
+            _mm256_storeu_si256((*slot).qs.as_mut_ptr() as *mut __m256i, packed);
+        }
+    }
+
+    /// Quantize whole 256-float blocks into `out`, matching
+    /// [`super::quantize_q8k_scalar`] exactly for finite inputs.
+    ///
+    /// Two details decide correctness. The scale's sign comes from the
+    /// *first* value attaining the largest magnitude, so after finding the
+    /// magnitude the blocks are rescanned in order for it. And the scalar
+    /// rounds with `f32::round`, half away from zero, which `vcvtps2dq`
+    /// does not do; `trunc(t + copysign(0.5, t))` does, exactly, for the
+    /// |t| <= 127 this produces.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn quantize_q8k_into(x: &[f32], out: &mut [std::mem::MaybeUninit<super::BlockQ8K>]) {
+        const K: usize = crate::quant::QK_K;
+        let blocks = x.len() / K;
+        debug_assert!(out.len() >= blocks);
+        let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+        let sign_bit = _mm256_castsi256_ps(_mm256_set1_epi32(-0x8000_0000));
+        let half = _mm256_set1_ps(0.5);
+        let cap = _mm256_set1_epi32(127);
+        let order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        for b in 0..blocks {
+            let p = x.as_ptr().add(b * K);
+            let slot = out.get_unchecked_mut(b).as_mut_ptr();
+
+            let mut m = _mm256_setzero_ps();
+            for i in 0..K / 8 {
+                m = _mm256_max_ps(m, _mm256_and_ps(_mm256_loadu_ps(p.add(8 * i)), abs_mask));
+            }
+            let lo = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
+            let lo = _mm_max_ps(lo, _mm_movehl_ps(lo, lo));
+            let amax = _mm_cvtss_f32(_mm_max_ss(lo, _mm_shuffle_ps(lo, lo, 1)));
+
+            if amax == 0.0 {
+                (*slot).d = 0.0;
+                (*slot).qs = [0; K];
+                (*slot).bsums = [0; 16];
+                continue;
+            }
+            // The first value whose magnitude equals amax fixes the sign.
+            let target = _mm256_set1_ps(amax);
+            let mut max = 0.0_f32;
+            for i in 0..K / 8 {
+                let v = _mm256_loadu_ps(p.add(8 * i));
+                let hit = _mm256_movemask_ps(_mm256_cmp_ps::<_CMP_EQ_OQ>(
+                    _mm256_and_ps(v, abs_mask),
+                    target,
+                ));
+                if hit != 0 {
+                    max = *p.add(8 * i + hit.trailing_zeros() as usize);
+                    break;
+                }
+            }
+            let iscale = -127.0 / max;
+            let scale = _mm256_set1_ps(iscale);
+
+            let mut packed = [_mm256_setzero_si256(); K / 32];
+            let mut group_sums = [0_i32; 16];
+            for q in 0..K / 32 {
+                // 32 values -> four i32 vectors -> one packed i8 vector.
+                let mut parts = [_mm256_setzero_si256(); 4];
+                for (j, part) in parts.iter_mut().enumerate() {
+                    let t = _mm256_mul_ps(_mm256_loadu_ps(p.add(32 * q + 8 * j)), scale);
+                    let bump = _mm256_or_ps(_mm256_and_ps(t, sign_bit), half);
+                    let r = _mm256_cvttps_epi32(_mm256_add_ps(t, bump));
+                    *part = _mm256_min_epi32(r, cap);
+                }
+                // bsums covers groups of 16 values, two per 32-value chunk.
+                for g in 0..2 {
+                    let pair = _mm256_add_epi32(parts[2 * g], parts[2 * g + 1]);
+                    let folded = _mm256_hadd_epi32(pair, pair);
+                    let folded = _mm256_hadd_epi32(folded, folded);
+                    group_sums[2 * q + g] =
+                        _mm256_extract_epi32(folded, 0) + _mm256_extract_epi32(folded, 4);
+                }
+                let a = _mm256_packs_epi32(parts[0], parts[1]);
+                let c = _mm256_packs_epi32(parts[2], parts[3]);
+                packed[q] = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(a, c), order);
+            }
+            for (q, value) in packed.iter().enumerate() {
+                _mm256_storeu_si256((*slot).qs.as_mut_ptr().add(32 * q) as *mut __m256i, *value);
+            }
+            for (sum, value) in (*slot).bsums.iter_mut().zip(&group_sums) {
+                *sum = *value as i16;
+            }
+            (*slot).d = 1.0 / iscale;
+        }
     }
 
     #[target_feature(enable = "avx2,fma,f16c")]
@@ -910,6 +1201,82 @@ mod avx2 {
             }
         }
         acc.map(|a| hsum(a))
+    }
+
+    /// Q2_K against Q8_K activations.
+    ///
+    /// Two sub-blocks share one 32-byte quant load, so the block is walked as
+    /// eight (half, shift) passes. Shifting with `vpsrlw` lets bits cross the
+    /// byte boundary, but only into positions the 2-bit mask then discards,
+    /// so no per-byte shift is needed. The minimum term reduces to
+    /// `sum(min_j * bsums_j)`, which Q8_K already has the sums for.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn q2k_n<const N: usize>(row: &[u8], xs: [&[BlockQ8K]; N]) -> [f32; N] {
+        let m3 = _mm256_set1_epi8(3);
+        let nibble = _mm_set1_epi8(0x0f);
+        let mut acc = [_mm256_setzero_ps(); N];
+        let mut acc_m = [_mm256_setzero_ps(); N];
+        let w = row.as_ptr();
+        for b in 0..row.len() / 84 {
+            let block = w.add(b * 84);
+            let qs = block.add(16);
+            let packed = _mm_loadu_si128(block as *const __m128i);
+            // The sixteen 4-bit minimums, widened for `vpmaddwd` against bsums.
+            let mins = _mm256_cvtepu8_epi16(_mm_and_si128(_mm_srli_epi16(packed, 4), nibble));
+            let scale = |j: usize| (*block.add(j) & 15) as i16;
+
+            let mut sumi = [_mm256_setzero_si256(); N];
+            macro_rules! pass {
+                ($half:expr, $shift:literal) => {{
+                    // Sub-blocks j and j + 1, whose activations are adjacent.
+                    let j = $half * 8 + $shift;
+                    let q = _mm256_loadu_si256(qs.add(32 * $half) as *const __m256i);
+                    let v = _mm256_and_si256(_mm256_srli_epi16::<$shift>(q), m3);
+                    // Low lane carries sub-block j, high lane j + 1.
+                    let s = _mm256_inserti128_si256::<1>(
+                        _mm256_castsi128_si256(_mm_set1_epi16(scale(j))),
+                        _mm_set1_epi16(scale(j + 1)),
+                    );
+                    for c in 0..N {
+                        let a = xs[c].get_unchecked(b);
+                        let y = _mm256_loadu_si256(a.qs.as_ptr().add(j * 16) as *const __m256i);
+                        // maddubs stays in range: 2 * 3 * 127 = 762.
+                        let p = _mm256_maddubs_epi16(v, y);
+                        sumi[c] = _mm256_add_epi32(sumi[c], _mm256_madd_epi16(p, s));
+                    }
+                }};
+            }
+            pass!(0, 0);
+            pass!(0, 2);
+            pass!(0, 4);
+            pass!(0, 6);
+            pass!(1, 0);
+            pass!(1, 2);
+            pass!(1, 4);
+            pass!(1, 6);
+
+            let d = half8(block.add(80));
+            let dmin = half8(block.add(82));
+            for c in 0..N {
+                let a = xs[c].get_unchecked(b);
+                let ad = _mm256_set1_ps(a.d);
+                acc[c] = _mm256_fmadd_ps(_mm256_mul_ps(ad, d), _mm256_cvtepi32_ps(sumi[c]), acc[c]);
+                let bsums = _mm256_loadu_si256(a.bsums.as_ptr() as *const __m256i);
+                let folded = _mm256_madd_epi16(mins, bsums);
+                let folded = _mm256_hadd_epi32(folded, folded);
+                let folded = _mm256_hadd_epi32(folded, folded);
+                let total =
+                    (_mm256_extract_epi32(folded, 0) + _mm256_extract_epi32(folded, 4)) as f32;
+                acc_m[c] =
+                    _mm256_fmadd_ps(_mm256_mul_ps(ad, dmin), _mm256_set1_ps(total), acc_m[c]);
+            }
+        }
+        let mut out = [0.0_f32; N];
+        for c in 0..N {
+            // acc_m holds the minimum correction in every lane; take one.
+            out[c] = hsum(acc[c]) - _mm256_cvtss_f32(acc_m[c]);
+        }
+        out
     }
 
     #[target_feature(enable = "avx2,fma,f16c")]
@@ -1470,6 +1837,52 @@ mod avx2 {
         n
     }
 
+    /// bf16 is the top half of an f32, so widening is a shift, not a
+    /// conversion -- no f16c needed and exact by construction.
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c")]
+    unsafe fn bf16x8(p: *const u8) -> __m256 {
+        let bits = _mm256_cvtepu16_epi32(_mm_loadu_si128(p as *const __m128i));
+        _mm256_castsi256_ps(_mm256_slli_epi32(bits, 16))
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn load_bf16(src: &[u8], dst: &mut [f32]) -> usize {
+        let n = dst.len() / 8 * 8;
+        for i in (0..n).step_by(8) {
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i), bf16x8(src.as_ptr().add(2 * i)));
+        }
+        n
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn dot_bf16(row: &[u8], x: &[f32]) -> f32 {
+        let n = x.len();
+        let w = row.as_ptr();
+        let mut acc = [_mm256_setzero_ps(); 4];
+        let mut i = 0;
+        while i + 32 <= n {
+            for (k, a) in acc.iter_mut().enumerate() {
+                *a = _mm256_fmadd_ps(
+                    bf16x8(w.add(2 * (i + 8 * k))),
+                    _mm256_loadu_ps(x.as_ptr().add(i + 8 * k)),
+                    *a,
+                );
+            }
+            i += 32;
+        }
+        let mut sum = hsum(_mm256_add_ps(
+            _mm256_add_ps(acc[0], acc[1]),
+            _mm256_add_ps(acc[2], acc[3]),
+        ));
+        while i < n {
+            sum += crate::quant::bf16_to_f32(std::ptr::read_unaligned(w.add(2 * i) as *const u16))
+                * x[i];
+            i += 1;
+        }
+        sum
+    }
+
     /// f32 · f32 (used after dequantizing a row once for several columns).
     #[target_feature(enable = "avx2,fma,f16c")]
     pub unsafe fn dot_f32_f32(a: &[f32], x: &[f32]) -> f32 {
@@ -1520,6 +1933,8 @@ mod tests {
             GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q4_1 | GgmlType::Q5_1 => &[0, 2],
             GgmlType::Q5_0 => &[0],
             GgmlType::Q6K => &[208],
+            // Q2_K keeps its scale and minimum at the end of the block.
+            GgmlType::Q2K => &[80, 82],
             _ => &[],
         };
         for &at in scale_offsets {
@@ -1530,7 +1945,8 @@ mod tests {
     }
 
     /// Types whose blocks can be filled with random bytes (finite scales).
-    const RANDOM_TYPES: [GgmlType; 6] = [
+    const RANDOM_TYPES: [GgmlType; 7] = [
+        GgmlType::Q2K,
         GgmlType::Q4K,
         GgmlType::Q5K,
         GgmlType::Q6K,
@@ -1718,6 +2134,90 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The SIMD activation quantizer must agree with the scalar reference
+    /// bit for bit: these values feed every dot product, so a one-step
+    /// difference here would show up as a perplexity difference that looks
+    /// like a kernel bug.
+    #[test]
+    fn simd_q8_0_quantization_matches_scalar() {
+        let mut seed = 12345_u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let mut x: Vec<f32> = Vec::new();
+        // A spread of magnitudes, exact ties (0.5 steps, where
+        // round-half-to-even differs from round-half-away), zeros, and
+        // negatives.
+        for _ in 0..64 {
+            x.push((next() % 2001) as f32 / 1000.0 - 1.0);
+        }
+        for i in 0..32 {
+            x.push((i as f32 - 16.0) * 0.5);
+        }
+        x.extend([0.0; 32]);
+        for i in 0..32 {
+            x.push(if i % 2 == 0 { 1e-30 } else { -1e-30 });
+        }
+        for i in 0..32 {
+            x.push(if i == 7 { -65504.0 } else { 1.0 });
+        }
+        let fast = quantize_q8_0(&x);
+        let reference = quantize_q8_0_scalar(&x);
+        assert_eq!(fast.len(), reference.len());
+        for (b, (a, e)) in fast.iter().zip(&reference).enumerate() {
+            assert_eq!(a.d.to_bits(), e.d.to_bits(), "block {b} scale");
+            assert_eq!(a.s.to_bits(), e.s.to_bits(), "block {b} sum");
+            assert_eq!(a.qs, e.qs, "block {b} quants");
+        }
+    }
+
+    /// Same contract for the K-quant activation format, including the cases
+    /// its two awkward details turn on: ties under round-half-away-from-zero,
+    /// and which value attains the maximum magnitude first (it sets the
+    /// scale's sign).
+    #[test]
+    fn simd_q8k_quantization_matches_scalar() {
+        let mut seed = 777_u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let mut x: Vec<f32> = Vec::new();
+        for _ in 0..crate::quant::QK_K {
+            x.push((next() % 4001) as f32 / 1000.0 - 2.0);
+        }
+        // Positive maximum first, then an equal negative one.
+        let mut block = vec![0.5_f32; crate::quant::QK_K];
+        block[10] = 3.0;
+        block[200] = -3.0;
+        x.extend(&block);
+        // Negative maximum first: the scale's sign flips.
+        block[10] = -3.0;
+        block[200] = 3.0;
+        x.extend(&block);
+        // All zeros, which takes the early-out path.
+        x.extend(vec![0.0_f32; crate::quant::QK_K]);
+        // Values that land exactly on .5 after scaling.
+        let mut ties = vec![0.0_f32; crate::quant::QK_K];
+        for (i, v) in ties.iter_mut().enumerate() {
+            *v = (i as f32 - 128.0) / 254.0;
+        }
+        x.extend(&ties);
+        let fast = quantize_q8k(&x);
+        let reference = quantize_q8k_scalar(&x);
+        assert_eq!(fast.len(), reference.len());
+        for (b, (a, e)) in fast.iter().zip(&reference).enumerate() {
+            assert_eq!(a.d.to_bits(), e.d.to_bits(), "block {b} scale");
+            assert_eq!(a.qs, e.qs, "block {b} quants");
+            assert_eq!(a.bsums, e.bsums, "block {b} group sums");
         }
     }
 
