@@ -63,7 +63,11 @@ impl CpuBackend {
         let mut tasks = Vec::new();
         for (index, job) in jobs.iter().enumerate() {
             let row_cost = (job.matrix.row_bytes() * batch).max(1);
-            let rows_per_task = target.div_ceil(row_cost).clamp(1, job.matrix.rows);
+            let mut rows_per_task = target.div_ceil(row_cost).clamp(1, job.matrix.rows);
+            if job.matrix.packed.is_some() {
+                // Packed matrices are processed in whole groups of eight rows.
+                rows_per_task = rows_per_task.next_multiple_of(8);
+            }
             let mut first_row = 0;
             while first_row < job.matrix.rows {
                 let rows = rows_per_task.min(job.matrix.rows - first_row);
@@ -90,6 +94,28 @@ impl CpuBackend {
             // weight rows stream from L2 (wide inputs, e.g. ffn_down with
             // 128 columns, otherwise overflow L2). Float types dequantize the
             // row first, so they take every column per row instead.
+            if let Some(packed) = matrix.packed {
+                let group_bytes = 8 * matrix.row_bytes();
+                let mut values = [0.0_f32; 8 * COLUMN_TILE];
+                for (tile, chunk) in columns.chunks(COLUMN_TILE).enumerate() {
+                    let start = tile * COLUMN_TILE;
+                    let values = &mut values[..8 * chunk.len()];
+                    for g in (task.first_row..task.first_row + task.rows).step_by(8) {
+                        let group = &packed[(g / 8) * group_bytes..][..group_bytes];
+                        kernels::dot_x8(matrix.kind, group, chunk, values);
+                        for c in 0..chunk.len() {
+                            for r in 0..8 {
+                                // SAFETY: rows g..g+8 belong to this task alone.
+                                unsafe {
+                                    *out.0.add((start + c) * matrix.rows + g + r) =
+                                        values[c * 8 + r]
+                                };
+                            }
+                        }
+                    }
+                }
+                return;
+            }
             let tile = if format == kernels::DotInput::F32 {
                 batch
             } else {

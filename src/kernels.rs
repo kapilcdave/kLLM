@@ -444,6 +444,107 @@ pub fn axpy_f16(out: &mut [f32], a: f32, v: &[u16]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// x8 packing: eight weight rows interleaved so that each 32-bit SIMD lane
+// holds one row. A single vector op then applies all eight row scales and the
+// eight results store directly, with no horizontal sums. This is the layout
+// trick behind llama.cpp's repacked CPU kernels.
+//
+// Q4_0x8 block (144 bytes, same as 8 x 18): the eight f16 row scales, then
+// for m in 0..4 the bytes qs[4m..4m+4] of rows 0..7 in turn. A Q4_0 byte
+// qs[j] holds element j (low nibble) and element j + 16 (high nibble), so
+// lane r of chunk m carries elements 4m..4m+4 and 16+4m..16+4m+4 of row r.
+
+/// Whether `kind` has an x8 layout and `rows` allows it.
+pub fn packable(kind: GgmlType, rows: usize) -> bool {
+    kind == GgmlType::Q4_0 && rows.is_multiple_of(8)
+}
+
+/// Packed size for `len` bytes of `kind` weights.
+pub fn packed_len(kind: GgmlType, len: usize) -> usize {
+    match kind {
+        GgmlType::Q4_0 => len,
+        _ => 0,
+    }
+}
+
+/// Repack a row-major matrix eight rows at a time, or `None` if the type or
+/// shape has no x8 layout.
+pub fn repack_x8(kind: GgmlType, data: &[u8], rows: usize, cols: usize) -> Option<Vec<u8>> {
+    if !packable(kind, rows) {
+        return None;
+    }
+    let row_bytes = kind.row_bytes(cols)?;
+    let blocks = row_bytes / 18;
+    let mut out = vec![0_u8; data.len()];
+    for group in 0..rows / 8 {
+        for b in 0..blocks {
+            let dst = &mut out[(group * blocks + b) * 144..][..144];
+            for r in 0..8 {
+                let src = &data[(group * 8 + r) * row_bytes + b * 18..][..18];
+                dst[2 * r..2 * r + 2].copy_from_slice(&src[0..2]);
+                for m in 0..4 {
+                    dst[16 + 32 * m + 4 * r..][..4].copy_from_slice(&src[2 + 4 * m..][..4]);
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Eight rows (one packed group) against `xs.len()` columns:
+/// `out[c * 8 + r] = row_r · xs[c]`.
+pub fn dot_x8(kind: GgmlType, group: &[u8], xs: &[Prepared<'_>], out: &mut [f32]) {
+    debug_assert_eq!(kind, GgmlType::Q4_0);
+    debug_assert_eq!(out.len(), xs.len() * 8);
+    let col = |j: usize| match &xs[j] {
+        Prepared::Q8_0(v) => v.as_slice(),
+        _ => unreachable!("activation prepared for the wrong weight type"),
+    };
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        // SAFETY: features detected; every column has one block per weight
+        // block (shapes validated by the backend).
+        unsafe {
+            let mut j = 0;
+            while j + 4 <= xs.len() {
+                let r = avx2::q4_0x8::<4>(group, [col(j), col(j + 1), col(j + 2), col(j + 3)]);
+                for (c, v) in r.iter().enumerate() {
+                    out[(j + c) * 8..(j + c + 1) * 8].copy_from_slice(v);
+                }
+                j += 4;
+            }
+            while j < xs.len() {
+                let r = avx2::q4_0x8::<1>(group, [col(j)]);
+                out[j * 8..(j + 1) * 8].copy_from_slice(&r[0]);
+                j += 1;
+            }
+            return;
+        }
+    }
+    for j in 0..xs.len() {
+        q4_0x8_scalar(group, col(j), &mut out[j * 8..(j + 1) * 8]);
+    }
+}
+
+fn q4_0x8_scalar(group: &[u8], x: &[BlockQ8_0], out: &mut [f32]) {
+    out.fill(0.0);
+    for (b, a) in x.iter().enumerate() {
+        let block = &group[b * 144..][..144];
+        for (r, o) in out.iter_mut().enumerate() {
+            let mut sum = 0_i32;
+            for m in 0..4 {
+                for t in 0..4 {
+                    let byte = block[16 + 32 * m + 4 * r + t];
+                    sum += ((byte & 0x0f) as i32 - 8) * a.qs[4 * m + t] as i32;
+                    sum += ((byte >> 4) as i32 - 8) * a.qs[16 + 4 * m + t] as i32;
+                }
+            }
+            *o += sum as f32 * half(block, 2 * r) * a.d;
+        }
+    }
+}
+
 /// `gate[i] = silu(gate[i]) * up[i]` (the SwiGLU activation), vectorized.
 pub fn swiglu_in_place(gate: &mut [f32], up: &[f32]) {
     debug_assert_eq!(gate.len(), up.len());
@@ -972,6 +1073,51 @@ mod avx2 {
         out
     }
 
+    /// Q4_0x8 against C columns; result `[c][r]`.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn q4_0x8<const C: usize>(group: &[u8], xs: [&[BlockQ8_0]; C]) -> [[f32; 8]; C] {
+        let mask = _mm256_set1_epi8(0x0f);
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = [_mm256_setzero_ps(); C];
+        let g = group.as_ptr();
+        for b in 0..group.len() / 144 {
+            let block = g.add(b * 144);
+            let d = _mm256_cvtph_ps(_mm_loadu_si128(block as *const __m128i));
+            // Unsigned nibbles 0..15 feed maddubs directly; the -8 offset is
+            // applied once per block below via the activation sum. Eight
+            // maddubs results stay within i16: 8 * 2 * 15 * 127 = 30480.
+            let mut sum16 = [_mm256_setzero_si256(); C];
+            for m in 0..4 {
+                let w = _mm256_loadu_si256(block.add(16 + 32 * m) as *const __m256i);
+                let lo = _mm256_and_si256(w, mask);
+                let hi = _mm256_and_si256(_mm256_srli_epi16(w, 4), mask);
+                for c in 0..C {
+                    let a = xs[c].get_unchecked(b);
+                    let ylo = _mm256_set1_epi32(std::ptr::read_unaligned(
+                        a.qs.as_ptr().add(4 * m) as *const i32
+                    ));
+                    let yhi = _mm256_set1_epi32(std::ptr::read_unaligned(
+                        a.qs.as_ptr().add(16 + 4 * m) as *const i32,
+                    ));
+                    sum16[c] = _mm256_add_epi16(sum16[c], _mm256_maddubs_epi16(lo, ylo));
+                    sum16[c] = _mm256_add_epi16(sum16[c], _mm256_maddubs_epi16(hi, yhi));
+                }
+            }
+            for c in 0..C {
+                let a = xs[c].get_unchecked(b);
+                let p = _mm256_cvtepi32_ps(_mm256_madd_epi16(sum16[c], ones));
+                acc[c] = _mm256_fmadd_ps(_mm256_mul_ps(d, _mm256_set1_ps(a.d)), p, acc[c]);
+                // sum((q - 8) * y) = sum(q * y) - 8 * sum(y); a.s = a.d * sum(y).
+                acc[c] = _mm256_fmadd_ps(d, _mm256_set1_ps(-8.0 * a.s), acc[c]);
+            }
+        }
+        let mut out = [[0.0_f32; 8]; C];
+        for c in 0..C {
+            _mm256_storeu_ps(out[c].as_mut_ptr(), acc[c]);
+        }
+        out
+    }
+
     /// exp(x) for 8 lanes: Cephes-style range reduction and degree-5
     /// polynomial, max relative error ~2 ulp on [-87, 88]; inputs below the
     /// range flush to 0, above saturate to f32::MAX.
@@ -1235,6 +1381,47 @@ mod tests {
         swiglu_in_place(&mut gate, &up);
         for (g, e) in gate.iter().zip(&expected) {
             assert!((g - e).abs() <= 1e-6 * e.abs().max(1.0), "{g} vs {e}");
+        }
+    }
+
+    #[test]
+    fn packed_x8_matches_row_major() {
+        let mut seed = 5;
+        let (rows, cols) = (24, 1024);
+        let values = input(rows * cols, &mut seed);
+        let data = quantize_q4_0(&values);
+        let packed = repack_x8(GgmlType::Q4_0, &data, rows, cols).unwrap();
+        assert_eq!(packed.len(), data.len());
+        let row_bytes = data.len() / rows;
+        for columns in [1, 3, 4, 6] {
+            let inputs: Vec<Vec<f32>> = (0..columns).map(|_| input(cols, &mut seed)).collect();
+            let prepared: Vec<Prepared> =
+                inputs.iter().map(|x| prepare(GgmlType::Q4_0, x)).collect();
+            for group in 0..rows / 8 {
+                let g = &packed[group * 8 * row_bytes..(group + 1) * 8 * row_bytes];
+                let mut out = vec![0.0; columns * 8];
+                dot_x8(GgmlType::Q4_0, g, &prepared, &mut out);
+                let mut scalar = vec![0.0; 8];
+                for (c, p) in prepared.iter().enumerate() {
+                    let Prepared::Q8_0(x) = p else { unreachable!() };
+                    q4_0x8_scalar(g, x, &mut scalar);
+                    for r in 0..8 {
+                        let row = &data[(group * 8 + r) * row_bytes..][..row_bytes];
+                        let reference = dot_scalar(GgmlType::Q4_0, row, p);
+                        let tol = 1e-4 * reference.abs().max(1.0);
+                        assert!(
+                            (out[c * 8 + r] - reference).abs() <= tol,
+                            "simd {} vs {reference}",
+                            out[c * 8 + r]
+                        );
+                        assert!(
+                            (scalar[r] - reference).abs() <= tol,
+                            "scalar {} vs {reference}",
+                            scalar[r]
+                        );
+                    }
+                }
+            }
         }
     }
 
