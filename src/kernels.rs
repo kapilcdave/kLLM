@@ -431,6 +431,36 @@ pub fn dot_f16_f32(k: &[u16], q: &[f32]) -> f32 {
     k.iter().zip(q).map(|(&a, b)| f16_to_f32(a) * b).sum()
 }
 
+/// `out[j] = sum(k[i] * qs[j][i])` for several query vectors against one
+/// f16 row (a key from the KV cache).
+///
+/// Two things make this much faster than calling [`dot_f16_f32`] per query.
+/// Each query gets two accumulators, so a 64-wide head is two chains of four
+/// FMAs rather than one chain of eight -- the single-accumulator form is
+/// latency-bound, not throughput-bound. And the key is widened from f16 once
+/// and reused by every query, which is the whole point of reading it once.
+///
+/// Each query's accumulation order is fixed, so a result does not depend on
+/// how many queries happened to share the call.
+pub fn dot_f16_f32_many<const N: usize>(k: &[u16], qs: [&[f32]; N]) -> [f32; N] {
+    debug_assert!(qs.iter().all(|q| q.len() == k.len()));
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        // SAFETY: features detected; every query is as long as `k`.
+        return unsafe { avx2::dot_f16_bits_many(k, qs) };
+    }
+    std::array::from_fn(|j| {
+        let (mut a, mut b) = (0.0_f32, 0.0_f32);
+        for (c, chunk) in k.chunks(8).enumerate() {
+            let acc = if c % 2 == 0 { &mut a } else { &mut b };
+            for (i, &bits) in chunk.iter().enumerate() {
+                *acc += f16_to_f32(bits) * qs[j][c * 8 + i];
+            }
+        }
+        a + b
+    })
+}
+
 /// `out[i] += a * v[i]` where `v` holds f16 bits.
 pub fn axpy_f16(out: &mut [f32], a: f32, v: &[u16]) {
     debug_assert_eq!(out.len(), v.len());
@@ -770,6 +800,42 @@ mod avx2 {
             i += 8;
         }
         hsum(acc)
+    }
+
+    /// `N` query vectors against one f16 key row. Two accumulators per query
+    /// break the FMA dependency chain; the widened key is shared.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn dot_f16_bits_many<const N: usize>(k: &[u16], qs: [&[f32]; N]) -> [f32; N] {
+        let n = k.len();
+        let mut acc = [[_mm256_setzero_ps(); 2]; N];
+        let kp = k.as_ptr();
+        let mut i = 0;
+        while i + 16 <= n {
+            let k0 = _mm256_cvtph_ps(_mm_loadu_si128(kp.add(i) as *const __m128i));
+            let k1 = _mm256_cvtph_ps(_mm_loadu_si128(kp.add(i + 8) as *const __m128i));
+            for j in 0..N {
+                let q = qs[j].as_ptr().add(i);
+                acc[j][0] = _mm256_fmadd_ps(k0, _mm256_loadu_ps(q), acc[j][0]);
+                acc[j][1] = _mm256_fmadd_ps(k1, _mm256_loadu_ps(q.add(8)), acc[j][1]);
+            }
+            i += 16;
+        }
+        if i + 8 <= n {
+            let k0 = _mm256_cvtph_ps(_mm_loadu_si128(kp.add(i) as *const __m128i));
+            for j in 0..N {
+                acc[j][0] = _mm256_fmadd_ps(k0, _mm256_loadu_ps(qs[j].as_ptr().add(i)), acc[j][0]);
+            }
+            i += 8;
+        }
+        let mut out = [0.0_f32; N];
+        for (j, pair) in acc.iter().enumerate() {
+            let mut sum = hsum(_mm256_add_ps(pair[0], pair[1]));
+            for (bits, value) in k[i..n].iter().zip(&qs[j][i..n]) {
+                sum += crate::quant::f16_to_f32(*bits) * value;
+            }
+            out[j] = sum;
+        }
+        out
     }
 
     #[target_feature(enable = "avx2,fma,f16c")]
