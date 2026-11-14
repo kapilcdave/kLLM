@@ -63,7 +63,11 @@ impl CpuBackend {
         let mut tasks = Vec::new();
         for (index, job) in jobs.iter().enumerate() {
             let row_cost = (job.matrix.row_bytes() * batch).max(1);
-            let rows_per_task = target.div_ceil(row_cost).clamp(1, job.matrix.rows);
+            let mut rows_per_task = target.div_ceil(row_cost).clamp(1, job.matrix.rows);
+            if job.matrix.packed.is_some() {
+                // Packed matrices are processed in whole groups of eight rows.
+                rows_per_task = rows_per_task.next_multiple_of(8);
+            }
             let mut first_row = 0;
             while first_row < job.matrix.rows {
                 let rows = rows_per_task.min(job.matrix.rows - first_row);
@@ -90,6 +94,29 @@ impl CpuBackend {
             // weight rows stream from L2 (wide inputs, e.g. ffn_down with
             // 128 columns, otherwise overflow L2). Float types dequantize the
             // row first, so they take every column per row instead.
+            if let Some(packed) = matrix.packed {
+                // Packed layouts may differ in size from row-major (Q4_K x8 does).
+                let group_bytes = kernels::packed_len(matrix.kind, 8 * matrix.row_bytes());
+                let mut values = [0.0_f32; 8 * COLUMN_TILE];
+                for (tile, chunk) in columns.chunks(COLUMN_TILE).enumerate() {
+                    let start = tile * COLUMN_TILE;
+                    let values = &mut values[..8 * chunk.len()];
+                    for g in (task.first_row..task.first_row + task.rows).step_by(8) {
+                        let group = &packed[(g / 8) * group_bytes..][..group_bytes];
+                        kernels::dot_x8(matrix.kind, group, chunk, values);
+                        for c in 0..chunk.len() {
+                            for r in 0..8 {
+                                // SAFETY: rows g..g+8 belong to this task alone.
+                                unsafe {
+                                    *out.0.add((start + c) * matrix.rows + g + r) =
+                                        values[c * 8 + r]
+                                };
+                            }
+                        }
+                    }
+                }
+                return;
+            }
             let tile = if format == kernels::DotInput::F32 {
                 batch
             } else {
@@ -258,6 +285,72 @@ mod tests {
                 .matvec(m, &inputs[b * 64..(b + 1) * 64], &mut single)
                 .unwrap();
             close(&batched[b * 96..(b + 1) * 96], &single, 0.0);
+        }
+    }
+
+    #[test]
+    fn packed_matmul_equals_row_major_matmul() {
+        use crate::kernels::{packable, repack_x8};
+        let (rows, cols) = (32, 512);
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i * 7919 % 1013) as f32 - 506.0) / 300.0)
+            .collect();
+        let mut seed = 99_u64;
+        let mut random = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (seed >> 33) as u8
+                })
+                .collect()
+        };
+        let mut k_block = |kind: GgmlType| -> Vec<u8> {
+            let mut out = Vec::new();
+            for _ in 0..rows * cols / 256 {
+                let mut b = random(kind.block_bytes());
+                let at = if kind == GgmlType::Q6K {
+                    vec![208]
+                } else {
+                    vec![0, 2]
+                };
+                for a in at {
+                    b[a..a + 2].copy_from_slice(&crate::quant::f32_to_f16(0.01).to_le_bytes());
+                }
+                out.extend(b);
+            }
+            out
+        };
+        let cases = vec![
+            (GgmlType::Q4_0, crate::quant::quantize_q4_0(&values)),
+            (GgmlType::Q8_0, quantize_q8_0(&values)),
+            (GgmlType::Q4K, k_block(GgmlType::Q4K)),
+            (GgmlType::Q6K, k_block(GgmlType::Q6K)),
+        ];
+        for (kind, data) in cases {
+            if !packable(kind, rows) {
+                continue;
+            }
+            let packed = repack_x8(kind, &data, rows, cols).unwrap();
+            let plain = Matrix::new(kind, rows, cols, &data).unwrap();
+            let fast = plain.with_packed(&packed).unwrap();
+            for batch in [1, 5, 16] {
+                let inputs: Vec<f32> = (0..cols * batch)
+                    .map(|i| (i as f32 * 0.013).sin())
+                    .collect();
+                let mut a = vec![0.0; rows * batch];
+                let mut b = vec![0.0; rows * batch];
+                CpuBackend.matmul(plain, &inputs, &mut a, batch).unwrap();
+                CpuBackend.matmul(fast, &inputs, &mut b, batch).unwrap();
+                for (x, y) in a.iter().zip(&b) {
+                    assert!(
+                        (x - y).abs() <= 1e-3 * x.abs().max(1.0),
+                        "{}: {x} vs {y}",
+                        kind.name()
+                    );
+                }
+            }
         }
     }
 

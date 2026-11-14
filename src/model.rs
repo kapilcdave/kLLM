@@ -199,6 +199,8 @@ struct Weight {
     cols: usize,
     offset: usize,
     len: usize,
+    /// Index into `Model::packed` of an x8-repacked copy, if one was made.
+    packed: Option<usize>,
 }
 
 struct Layer {
@@ -226,6 +228,8 @@ pub struct Model {
     output: Weight,
     layers: Vec<Layer>,
     rope_freq_factors: Option<Vec<f32>>,
+    /// x8-repacked weight copies (see `kernels::repack_x8`).
+    packed: Vec<Vec<u8>>,
     backend: CpuBackend,
 }
 
@@ -234,7 +238,11 @@ impl Model {
         let file = GgufFile::open(path)?;
         let config = Config::from_gguf(&file.info)?;
         let c = &config;
-        let loader = Loader { file: &file };
+        let loader = Loader {
+            file: &file,
+            packed: std::cell::RefCell::new(Vec::new()),
+            repack: std::env::var_os("KLLM_NO_REPACK").is_none(),
+        };
         let token_embd = loader.matrix("token_embd.weight", c.n_vocab, c.n_embd)?;
         let output = match file.info.tensor("output.weight") {
             Some(_) => loader.matrix("output.weight", c.n_vocab, c.n_embd)?,
@@ -272,6 +280,7 @@ impl Model {
             });
         }
         file.advise_willneed();
+        let packed = loader.packed.into_inner();
         Ok(Self {
             file,
             config,
@@ -280,6 +289,7 @@ impl Model {
             output,
             layers,
             rope_freq_factors,
+            packed,
             backend: CpuBackend,
         })
     }
@@ -294,6 +304,7 @@ impl Model {
             rows: w.rows,
             cols: w.cols,
             data: &self.file.mapped()[w.offset..w.offset + w.len],
+            packed: w.packed.map(|i| self.packed[i].as_slice()),
         }
     }
 
@@ -322,6 +333,11 @@ impl Model {
             .collect()
     }
 
+    /// Bytes of heap memory held by x8-repacked weight copies.
+    pub fn packed_bytes(&self) -> u64 {
+        self.packed.iter().map(|p| p.len() as u64).sum()
+    }
+
     /// Distinct weight types used by the matrices, for reporting.
     pub fn weight_types(&self) -> Vec<&'static str> {
         let mut kinds: Vec<&'static str> = std::iter::once(self.output)
@@ -345,6 +361,8 @@ impl Model {
 
 struct Loader<'f> {
     file: &'f GgufFile,
+    packed: std::cell::RefCell<Vec<Vec<u8>>>,
+    repack: bool,
 }
 
 impl Loader<'_> {
@@ -369,12 +387,22 @@ impl Loader<'_> {
         }
         let bytes = self.file.tensor_bytes(t)?;
         let offset = bytes.as_ptr() as usize - self.file.mapped().as_ptr() as usize;
+        let packed = if self.repack {
+            kernels::repack_x8(kind, bytes, rows, cols).map(|copy| {
+                let mut packed = self.packed.borrow_mut();
+                packed.push(copy);
+                packed.len() - 1
+            })
+        } else {
+            None
+        };
         Ok(Weight {
             kind,
             rows,
             cols,
             offset,
             len: bytes.len(),
+            packed,
         })
     }
 

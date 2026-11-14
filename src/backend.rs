@@ -49,6 +49,10 @@ pub struct Matrix<'a> {
     pub rows: usize,
     pub cols: usize,
     pub data: &'a [u8],
+    /// The same weights repacked eight rows at a time (see
+    /// [`crate::kernels::repack_x8`]); backends that understand the layout
+    /// use it, others ignore it.
+    pub packed: Option<&'a [u8]>,
 }
 
 impl<'a> Matrix<'a> {
@@ -73,7 +77,22 @@ impl<'a> Matrix<'a> {
             rows,
             cols,
             data,
+            packed: None,
         })
+    }
+
+    /// Attach an x8-packed copy of the same weights.
+    pub fn with_packed(mut self, packed: &'a [u8]) -> Result<Self, BackendError> {
+        if !crate::kernels::packable(self.kind, self.rows) {
+            return Err(BackendError::InvalidParameter("matrix cannot be x8-packed"));
+        }
+        require_len(
+            "packed matrix bytes",
+            crate::kernels::packed_len(self.kind, self.data.len()),
+            packed.len(),
+        )?;
+        self.packed = Some(packed);
+        Ok(self)
     }
 
     pub fn row_bytes(&self) -> usize {
