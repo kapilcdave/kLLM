@@ -8,6 +8,8 @@ compile_error!("kLLM reads GGUF tensors in place and requires a little-endian ta
 
 pub mod backend;
 pub mod cpu;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 pub mod eval;
 pub mod gguf;
 pub mod kernels;

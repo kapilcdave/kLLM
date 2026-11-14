@@ -39,6 +39,7 @@ usage:
            [--temp T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R]
            [--seed S] [--threads N] [--batch N] [--ignore-eos]
   kllm perplexity MODEL.gguf --file TEXT [--context 512] [--chunks N] [--threads N]
+  kllm devices
   kllm bench MODEL.gguf [-p 128] [-n 64] [--threads N] [--repeat 3] [--profile]";
 
 struct Args(Vec<String>);
@@ -101,6 +102,7 @@ fn run(args: &Args) -> Result<(), String> {
         Some("run") => cmd_run(args),
         Some("perplexity") => cmd_perplexity(args),
         Some("bench") => cmd_bench(args),
+        Some("devices") => cmd_devices(),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             Ok(())
@@ -595,6 +597,30 @@ fn cmd_perplexity(args: &Args) -> Result<(), String> {
         result.chunks,
         (result.chunks * n_ctx) as f64 / elapsed
     );
+    Ok(())
+}
+
+fn cmd_devices() -> Result<(), String> {
+    out!("CPU: {} | kernels {}", cpu_name(), kernels::kernel_name());
+    #[cfg(feature = "cuda")]
+    match kllm::cuda::default_gpu() {
+        Ok(gpu) => {
+            let (free, total) = gpu.memory_info().map_err(|e| e.to_string())?;
+            out!(
+                "GPU 0: {} | compute {}.{} | {} SMs @ {} MHz max | {:.0} MiB free of {:.0} MiB",
+                gpu.name,
+                gpu.compute_capability.0,
+                gpu.compute_capability.1,
+                gpu.multiprocessors,
+                gpu.clock_mhz,
+                free as f64 / MIB,
+                total as f64 / MIB
+            );
+        }
+        Err(e) => out!("GPU: none ({e})"),
+    }
+    #[cfg(not(feature = "cuda"))]
+    out!("GPU: support not compiled in (build with --features cuda)");
     Ok(())
 }
 
