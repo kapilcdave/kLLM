@@ -9,16 +9,13 @@
 //! llama.cpp's own implementation noise, so kLLM is held to 1% of both. F16
 //! has no activation quantization and is held to 0.1%.
 //!
-//! The bound also never tightens below five times llama.cpp's own on/off
-//! spread for that model, because that spread measures how unstable this
-//! corpus's perplexity is for that model. It matters for one case: pure Q2_K
-//! of a 135M model is wrecked (perplexity 228 against f16's 24.5), and a
-//! wrecked model's perplexity amplifies any difference in summation -- there
-//! llama.cpp disagrees with itself by 0.56% where it manages 0.1-0.4%
-//! elsewhere. kLLM lands 2.3% from llama.cpp on it while agreeing to 0.5% on
-//! the measure that is actually meaningful for a quantization,
-//! KL divergence (`tests/divergence.rs`: 2.1188 against 2.1301, top-1 within
-//! 0.4 points).
+//! Resist widening these bounds. Q2_K once sat 2.3% out and looked like the
+//! hypersensitivity of a wrecked model (pure Q2_K of a 135M model perplexes
+//! at 228 against f16's 24.5, and llama.cpp disagreed with itself by 0.56%
+//! there against 0.1-0.4% elsewhere). It was a real defect: Q2_K had no
+//! kernel against quantized activations, so it ran on exact f32 activations
+//! where llama.cpp quantizes them to Q8_K. Giving it one moved perplexity
+//! from 222.65 to 226.24 and the gap from 2.31% to 0.74%.
 
 mod common;
 
@@ -45,10 +42,6 @@ fn check(model_file: &str, tolerance: f64) {
     let tokens = tokenizer.encode(&text, true, false);
     let result = perplexity(&model, &tokenizer, &tokens, n_ctx, Some(chunks), |_, _| {}).unwrap();
     assert_eq!(result.chunks, chunks);
-    // Never hold kLLM tighter than five times the spread llama.cpp shows
-    // against itself on this model (see the module comment).
-    let own_spread = (expected[0] - expected[1]).abs() / expected[0];
-    let tolerance = tolerance.max(5.0 * own_spread);
     for (label, reference) in ["fa on", "fa off"].iter().zip(expected) {
         let relative = (result.ppl - reference).abs() / reference;
         eprintln!(

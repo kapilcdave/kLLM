@@ -42,7 +42,7 @@ pub fn dot_input(kind: GgmlType) -> DotInput {
         GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 => {
             DotInput::Q8_0
         }
-        GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => DotInput::Q8K,
+        GgmlType::Q2K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => DotInput::Q8K,
         _ => DotInput::F32,
     }
 }
@@ -194,6 +194,7 @@ pub fn dot(kind: GgmlType, row: &[u8], x: &Prepared<'_>) -> f32 {
                 (GgmlType::Q4_1, Prepared::Q8_0(x)) => return avx2::q4_1_n(row, [x])[0],
                 (GgmlType::Q5_0, Prepared::Q8_0(x)) => return avx2::q5_0_n(row, [x])[0],
                 (GgmlType::Q5_1, Prepared::Q8_0(x)) => return avx2::q5_1_n(row, [x])[0],
+                (GgmlType::Q2K, Prepared::Q8K(x)) => return avx2::q2k_n(row, [x])[0],
                 (GgmlType::Q4K, Prepared::Q8K(x)) => return avx2::q4k_n(row, [x])[0],
                 (GgmlType::Q5K, Prepared::Q8K(x)) => return avx2::dot_q5k(row, x),
                 (GgmlType::Q6K, Prepared::Q8K(x)) => return avx2::q6k_n(row, [x])[0],
@@ -220,7 +221,13 @@ pub fn dot_multi(
         // SAFETY: features detected; every prepared column matches `kind`
         // (checked by the pattern match) and has one block per weight block.
         unsafe {
-            if dot_input(kind) == DotInput::F32 && xs.len() == 1 {
+            // One column is cheapest through `dot` directly -- but only for
+            // the types `dot` has a SIMD kernel for. Anything else (Q2_K
+            // today) is better off being dequantized once into `scratch` and
+            // reduced with the f32 kernel below, even for a single column:
+            // taking the shortcut there means a fully scalar reduction, which
+            // cost Q2_K decode a factor of five.
+            if xs.len() == 1 && matches!(kind, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
                 out[0] = dot(kind, row, &xs[0]);
                 return;
             }
@@ -284,6 +291,7 @@ pub fn dot_multi(
                 GgmlType::Q4_1 => groups!(Q8_0, q4_1_n),
                 GgmlType::Q5_0 => groups!(Q8_0, q5_0_n),
                 GgmlType::Q5_1 => groups!(Q8_0, q5_1_n),
+                GgmlType::Q2K => groups!(Q8K, q2k_n),
                 GgmlType::Q4K => groups!(Q8K, q4k_n),
                 GgmlType::Q6K => groups!(Q8K, q6k_n),
                 _ => {}
@@ -375,6 +383,30 @@ pub fn dot_scalar(kind: GgmlType, row: &[u8], x: &Prepared<'_>) -> f32 {
                     .map(|(&q, &y)| (q as i8) as i32 * y as i32)
                     .sum();
                 sum as f32 * half(w, 0) * a.d
+            })
+            .sum(),
+        // Q2_K: sixteen sub-blocks of sixteen values, each with a 4-bit
+        // scale and a 4-bit minimum packed into one byte. Sub-block j takes
+        // its quants from byte 16 + 32*(j/8) + 16*(j%2) of the block, shifted
+        // right by 2*((j%8)/2). The minimum term needs only the activation
+        // sums, which Q8_K already carries as `bsums`.
+        (GgmlType::Q2K, Prepared::Q8K(x)) => row
+            .chunks_exact(84)
+            .zip(x)
+            .map(|(w, a)| {
+                let (mut main, mut mins) = (0_i32, 0_i32);
+                for j in 0..16 {
+                    let packed = w[j];
+                    let q = &w[16 + 32 * (j / 8) + 16 * (j % 2)..][..16];
+                    let shift = 2 * ((j % 8) / 2);
+                    let mut dot = 0_i32;
+                    for l in 0..16 {
+                        dot += ((q[l] >> shift) & 3) as i32 * a.qs[j * 16 + l] as i32;
+                    }
+                    main += (packed & 15) as i32 * dot;
+                    mins += (packed >> 4) as i32 * a.bsums[j] as i32;
+                }
+                a.d * (half(w, 80) * main as f32 - half(w, 82) * mins as f32)
             })
             .sum(),
         (GgmlType::Q4K, Prepared::Q8K(x)) => row
@@ -1171,6 +1203,82 @@ mod avx2 {
         acc.map(|a| hsum(a))
     }
 
+    /// Q2_K against Q8_K activations.
+    ///
+    /// Two sub-blocks share one 32-byte quant load, so the block is walked as
+    /// eight (half, shift) passes. Shifting with `vpsrlw` lets bits cross the
+    /// byte boundary, but only into positions the 2-bit mask then discards,
+    /// so no per-byte shift is needed. The minimum term reduces to
+    /// `sum(min_j * bsums_j)`, which Q8_K already has the sums for.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn q2k_n<const N: usize>(row: &[u8], xs: [&[BlockQ8K]; N]) -> [f32; N] {
+        let m3 = _mm256_set1_epi8(3);
+        let nibble = _mm_set1_epi8(0x0f);
+        let mut acc = [_mm256_setzero_ps(); N];
+        let mut acc_m = [_mm256_setzero_ps(); N];
+        let w = row.as_ptr();
+        for b in 0..row.len() / 84 {
+            let block = w.add(b * 84);
+            let qs = block.add(16);
+            let packed = _mm_loadu_si128(block as *const __m128i);
+            // The sixteen 4-bit minimums, widened for `vpmaddwd` against bsums.
+            let mins = _mm256_cvtepu8_epi16(_mm_and_si128(_mm_srli_epi16(packed, 4), nibble));
+            let scale = |j: usize| (*block.add(j) & 15) as i16;
+
+            let mut sumi = [_mm256_setzero_si256(); N];
+            macro_rules! pass {
+                ($half:expr, $shift:literal) => {{
+                    // Sub-blocks j and j + 1, whose activations are adjacent.
+                    let j = $half * 8 + $shift;
+                    let q = _mm256_loadu_si256(qs.add(32 * $half) as *const __m256i);
+                    let v = _mm256_and_si256(_mm256_srli_epi16::<$shift>(q), m3);
+                    // Low lane carries sub-block j, high lane j + 1.
+                    let s = _mm256_inserti128_si256::<1>(
+                        _mm256_castsi128_si256(_mm_set1_epi16(scale(j))),
+                        _mm_set1_epi16(scale(j + 1)),
+                    );
+                    for c in 0..N {
+                        let a = xs[c].get_unchecked(b);
+                        let y = _mm256_loadu_si256(a.qs.as_ptr().add(j * 16) as *const __m256i);
+                        // maddubs stays in range: 2 * 3 * 127 = 762.
+                        let p = _mm256_maddubs_epi16(v, y);
+                        sumi[c] = _mm256_add_epi32(sumi[c], _mm256_madd_epi16(p, s));
+                    }
+                }};
+            }
+            pass!(0, 0);
+            pass!(0, 2);
+            pass!(0, 4);
+            pass!(0, 6);
+            pass!(1, 0);
+            pass!(1, 2);
+            pass!(1, 4);
+            pass!(1, 6);
+
+            let d = half8(block.add(80));
+            let dmin = half8(block.add(82));
+            for c in 0..N {
+                let a = xs[c].get_unchecked(b);
+                let ad = _mm256_set1_ps(a.d);
+                acc[c] = _mm256_fmadd_ps(_mm256_mul_ps(ad, d), _mm256_cvtepi32_ps(sumi[c]), acc[c]);
+                let bsums = _mm256_loadu_si256(a.bsums.as_ptr() as *const __m256i);
+                let folded = _mm256_madd_epi16(mins, bsums);
+                let folded = _mm256_hadd_epi32(folded, folded);
+                let folded = _mm256_hadd_epi32(folded, folded);
+                let total =
+                    (_mm256_extract_epi32(folded, 0) + _mm256_extract_epi32(folded, 4)) as f32;
+                acc_m[c] =
+                    _mm256_fmadd_ps(_mm256_mul_ps(ad, dmin), _mm256_set1_ps(total), acc_m[c]);
+            }
+        }
+        let mut out = [0.0_f32; N];
+        for c in 0..N {
+            // acc_m holds the minimum correction in every lane; take one.
+            out[c] = hsum(acc[c]) - _mm256_cvtss_f32(acc_m[c]);
+        }
+        out
+    }
+
     #[target_feature(enable = "avx2,fma,f16c")]
     pub unsafe fn q4k_n<const N: usize>(row: &[u8], xs: [&[BlockQ8K]; N]) -> [f32; N] {
         let mask = _mm256_set1_epi8(0x0f);
@@ -1825,6 +1933,8 @@ mod tests {
             GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q4_1 | GgmlType::Q5_1 => &[0, 2],
             GgmlType::Q5_0 => &[0],
             GgmlType::Q6K => &[208],
+            // Q2_K keeps its scale and minimum at the end of the block.
+            GgmlType::Q2K => &[80, 82],
             _ => &[],
         };
         for &at in scale_offsets {
@@ -1835,7 +1945,8 @@ mod tests {
     }
 
     /// Types whose blocks can be filled with random bytes (finite scales).
-    const RANDOM_TYPES: [GgmlType; 6] = [
+    const RANDOM_TYPES: [GgmlType; 7] = [
+        GgmlType::Q2K,
         GgmlType::Q4K,
         GgmlType::Q5K,
         GgmlType::Q6K,

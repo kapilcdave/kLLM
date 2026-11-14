@@ -78,7 +78,7 @@ Mean KL divergence against each family's reference model, kLLM against
 | SmolLM2-135M Q5_0 | f16 | 0.088250 | 0.087968 | 83.14% / 82.45% |
 | SmolLM2-135M Q4_0 | f16 | 0.148069 | 0.146500 | 81.08% / 81.08% |
 | SmolLM2-135M Q4_1 | f16 | 0.271327 | 0.270642 | 72.65% / 74.12% |
-| SmolLM2-135M Q2_K | f16 | 2.130084 | 2.118842 | 30.29% / 30.69% |
+| SmolLM2-135M Q2_K | f16 | 2.130084 | 2.124023 | 30.10% / 30.69% |
 | Qwen3-0.6B Q4_K_M | Q8_0 | 0.076557 | 0.076500 | 86.76% / 86.77% |
 
 kLLM is within 2% of llama.cpp on every one, and lower on eight of the ten.
@@ -91,8 +91,7 @@ On F16, greedy decoding reproduces llama.cpp's tokens exactly, with a mean
 top-10 log-probability difference of 0.003. Quantized paths quantize
 activations to 8 bits (as llama.cpp does), which amplifies summation-order
 differences: llama.cpp disagrees with *itself* by up to 0.4% perplexity when
-only its flash-attention switch is flipped (0.56% on pure Q2_K, whose
-perplexity of 228 makes it hypersensitive). kLLM's differences are within that
+only its flash-attention switch is flipped. kLLM's differences are within that
 spread.
 
 ## Performance
