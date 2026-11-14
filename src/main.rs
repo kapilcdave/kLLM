@@ -409,13 +409,12 @@ fn cgroup_headroom() -> Option<u64> {
     let mut best: Option<u64> = None;
     loop {
         let read = |f: &str| std::fs::read_to_string(dir.join(f)).ok();
-        if let (Some(max), Some(current)) = (read("memory.max"), read("memory.current")) {
-            if let (Ok(max), Ok(current)) =
+        if let (Some(max), Some(current)) = (read("memory.max"), read("memory.current"))
+            && let (Ok(max), Ok(current)) =
                 (max.trim().parse::<u64>(), current.trim().parse::<u64>())
-            {
-                let headroom = max.saturating_sub(current);
-                best = Some(best.map_or(headroom, |b| b.min(headroom)));
-            }
+        {
+            let headroom = max.saturating_sub(current);
+            best = Some(best.map_or(headroom, |b| b.min(headroom)));
         }
         if dir == std::path::Path::new("/sys/fs/cgroup") || !dir.pop() {
             break;
