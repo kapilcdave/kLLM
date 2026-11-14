@@ -1,32 +1,166 @@
-//! Minimal, allocation-bounded GGUF metadata and tensor inspector.
+//! Allocation-bounded GGUF parser.
+//!
+//! The parser reads the header, every metadata value, and the tensor
+//! directory, but never the tensor payloads. Every length and count read from
+//! the file is checked against the bytes that remain before anything is
+//! allocated, so a malformed or hostile file cannot make kLLM allocate more
+//! memory than the file itself occupies. Tensor payloads are exposed through a
+//! read-only memory map by [`GgufFile`].
 
 use std::{
+    collections::HashMap,
     fmt,
     fs::File,
-    io::{self, BufReader, Read, Seek, SeekFrom},
+    io::{self, BufReader, Read, Seek},
     path::Path,
 };
 
+use memmap2::Mmap;
+
+use crate::quant::GgmlType;
+
 const MAGIC: &[u8; 4] = b"GGUF";
-const MAX_STRING_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_ITEMS: u64 = 1_000_000;
+const MAX_STRING_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ITEMS: u64 = 16 * 1024 * 1024;
+const MAX_DIMENSIONS: u32 = 4;
 const DEFAULT_ALIGNMENT: u64 = 32;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A typed GGUF metadata value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    U8(u8),
+    I8(i8),
+    U16(u16),
+    I16(i16),
+    U32(u32),
+    I32(i32),
+    U64(u64),
+    I64(i64),
+    F32(f32),
+    F64(f64),
+    Bool(bool),
+    String(String),
+    Array(Vec<Value>),
+}
+
+impl Value {
+    /// Any non-negative integer value, widened to `u64`.
+    pub fn as_u64(&self) -> Option<u64> {
+        match *self {
+            Self::U8(v) => Some(v.into()),
+            Self::U16(v) => Some(v.into()),
+            Self::U32(v) => Some(v.into()),
+            Self::U64(v) => Some(v),
+            Self::I8(v) => u64::try_from(v).ok(),
+            Self::I16(v) => u64::try_from(v).ok(),
+            Self::I32(v) => u64::try_from(v).ok(),
+            Self::I64(v) => u64::try_from(v).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        match *self {
+            Self::I8(v) => Some(v.into()),
+            Self::I16(v) => Some(v.into()),
+            Self::I32(v) => Some(v.into()),
+            Self::I64(v) => Some(v),
+            _ => self.as_u64().and_then(|v| i64::try_from(v).ok()),
+        }
+    }
+
+    pub fn as_f32(&self) -> Option<f32> {
+        match *self {
+            Self::F32(v) => Some(v),
+            Self::F64(v) => Some(v as f32),
+            _ => self.as_i64().map(|v| v as f32),
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match *self {
+            Self::Bool(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn as_array(&self) -> Option<&[Value]> {
+        match self {
+            Self::Array(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Short human-readable rendering; long arrays are summarised.
+    pub fn summary(&self) -> String {
+        match self {
+            Self::String(v) if v.len() > 80 => {
+                let cut: String = v.chars().take(77).collect();
+                format!("{:?}...", cut)
+            }
+            Self::String(v) => format!("{v:?}"),
+            Self::Array(items) if items.len() > 8 => {
+                let kind = items.first().map(Value::kind_name).unwrap_or("?");
+                format!("[{kind}; {}]", items.len())
+            }
+            Self::Array(items) => {
+                let parts: Vec<String> = items.iter().map(Value::summary).collect();
+                format!("[{}]", parts.join(", "))
+            }
+            Self::U8(v) => v.to_string(),
+            Self::I8(v) => v.to_string(),
+            Self::U16(v) => v.to_string(),
+            Self::I16(v) => v.to_string(),
+            Self::U32(v) => v.to_string(),
+            Self::I32(v) => v.to_string(),
+            Self::U64(v) => v.to_string(),
+            Self::I64(v) => v.to_string(),
+            Self::F32(v) => v.to_string(),
+            Self::F64(v) => v.to_string(),
+            Self::Bool(v) => v.to_string(),
+        }
+    }
+
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::U8(_) => "u8",
+            Self::I8(_) => "i8",
+            Self::U16(_) => "u16",
+            Self::I16(_) => "i16",
+            Self::U32(_) => "u32",
+            Self::I32(_) => "i32",
+            Self::U64(_) => "u64",
+            Self::I64(_) => "i64",
+            Self::F32(_) => "f32",
+            Self::F64(_) => "f64",
+            Self::Bool(_) => "bool",
+            Self::String(_) => "string",
+            Self::Array(_) => "array",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct GgufInfo {
     pub version: u32,
-    pub metadata_count: u64,
-    pub tensor_count: u64,
     pub alignment: u64,
     pub data_offset: u64,
-    pub architecture: Option<String>,
-    pub block_count: Option<u32>,
+    pub metadata: Vec<(String, Value)>,
     pub tensors: Vec<TensorInfo>,
+    index: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorInfo {
     pub name: String,
+    /// GGML order: `dimensions[0]` is the contiguous (innermost) axis.
     pub dimensions: Vec<u64>,
     pub ggml_type: u32,
     pub relative_offset: u64,
@@ -39,19 +173,64 @@ impl TensorInfo {
             .try_fold(1_u64, |total, dimension| total.checked_mul(*dimension))
     }
 
+    pub fn kind(&self) -> Option<GgmlType> {
+        GgmlType::from_id(self.ggml_type)
+    }
+
     pub fn byte_size(&self) -> Option<u64> {
+        let kind = self.kind()?;
         let elements = self.element_count()?;
-        let (block_elements, block_bytes) = ggml_layout(self.ggml_type)?;
-        let blocks = elements.checked_add(block_elements - 1)? / block_elements;
-        blocks.checked_mul(block_bytes)
+        // Quantized rows must hold a whole number of blocks.
+        let row = *self.dimensions.first()?;
+        if row % kind.block_elements() as u64 != 0 {
+            return None;
+        }
+        (elements / kind.block_elements() as u64).checked_mul(kind.block_bytes() as u64)
     }
 
     pub fn type_name(&self) -> &'static str {
-        ggml_type_name(self.ggml_type)
+        self.kind().map(GgmlType::name).unwrap_or("UNKNOWN")
+    }
+
+    /// Transformer block index for tensors named `blk.N.*`.
+    pub fn block_index(&self) -> Option<u32> {
+        self.name
+            .strip_prefix("blk.")?
+            .split('.')
+            .next()?
+            .parse()
+            .ok()
     }
 }
 
 impl GgufInfo {
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.metadata
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value)
+    }
+
+    pub fn architecture(&self) -> Option<&str> {
+        self.get("general.architecture")?.as_str()
+    }
+
+    /// Look up `<architecture>.<suffix>`, e.g. `arch_get("block_count")`.
+    pub fn arch_get(&self, suffix: &str) -> Option<&Value> {
+        let arch = self.architecture()?;
+        self.get(&format!("{arch}.{suffix}"))
+    }
+
+    pub fn block_count(&self) -> Option<u32> {
+        self.arch_get("block_count")?
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+    }
+
+    pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
+        self.index.get(name).map(|&i| &self.tensors[i])
+    }
+
     pub fn known_weight_bytes(&self) -> Option<u64> {
         self.tensors.iter().try_fold(0_u64, |total, tensor| {
             total.checked_add(tensor.byte_size()?)
@@ -62,7 +241,7 @@ impl GgufInfo {
 #[derive(Debug)]
 pub enum GgufError {
     Io(io::Error),
-    Invalid(&'static str),
+    Invalid(String),
     UnsupportedVersion(u32),
     UnsupportedValueType(u32),
     LimitExceeded(&'static str),
@@ -76,7 +255,7 @@ impl fmt::Display for GgufError {
             Self::Invalid(message) => write!(f, "invalid GGUF: {message}"),
             Self::UnsupportedVersion(version) => write!(f, "unsupported GGUF version {version}"),
             Self::UnsupportedValueType(kind) => write!(f, "unsupported GGUF value type {kind}"),
-            Self::LimitExceeded(what) => write!(f, "GGUF {what} exceeds inspector limit"),
+            Self::LimitExceeded(what) => write!(f, "GGUF {what} exceeds parser limit"),
             Self::ArithmeticOverflow => write!(f, "GGUF offset arithmetic overflow"),
         }
     }
@@ -86,8 +265,16 @@ impl std::error::Error for GgufError {}
 
 impl From<io::Error> for GgufError {
     fn from(value: io::Error) -> Self {
-        Self::Io(value)
+        if value.kind() == io::ErrorKind::UnexpectedEof {
+            Self::Invalid("file is truncated".into())
+        } else {
+            Self::Io(value)
+        }
     }
+}
+
+fn invalid(message: impl Into<String>) -> GgufError {
+    GgufError::Invalid(message.into())
 }
 
 pub fn inspect_file(path: impl AsRef<Path>) -> Result<GgufInfo, GgufError> {
@@ -96,58 +283,176 @@ pub fn inspect_file(path: impl AsRef<Path>) -> Result<GgufInfo, GgufError> {
     inspect(BufReader::new(file), file_len)
 }
 
-pub fn inspect<R: Read + Seek>(mut reader: R, file_len: u64) -> Result<GgufInfo, GgufError> {
-    let mut magic = [0; 4];
-    reader.read_exact(&mut magic)?;
-    if &magic != MAGIC {
-        return Err(GgufError::Invalid("bad magic"));
+/// Reader wrapper that knows how many bytes remain, so every declared length
+/// can be rejected before it is allocated.
+struct Bounded<R> {
+    inner: R,
+    position: u64,
+    len: u64,
+}
+
+impl<R: Read + Seek> Bounded<R> {
+    fn remaining(&self) -> u64 {
+        self.len.saturating_sub(self.position)
     }
-    let version = read_u32(&mut reader)?;
+
+    fn need(&self, bytes: u64) -> Result<(), GgufError> {
+        if bytes > self.remaining() {
+            Err(invalid("declared length runs past end of file"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), GgufError> {
+        self.need(buffer.len() as u64)?;
+        self.inner.read_exact(buffer)?;
+        self.position += buffer.len() as u64;
+        Ok(())
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], GgufError> {
+        let mut bytes = [0; N];
+        self.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn u32(&mut self) -> Result<u32, GgufError> {
+        Ok(u32::from_le_bytes(self.array()?))
+    }
+
+    fn u64(&mut self) -> Result<u64, GgufError> {
+        Ok(u64::from_le_bytes(self.array()?))
+    }
+
+    fn string(&mut self) -> Result<String, GgufError> {
+        let length = self.u64()?;
+        if length > MAX_STRING_BYTES {
+            return Err(GgufError::LimitExceeded("string length"));
+        }
+        self.need(length)?;
+        let mut bytes = vec![0; length as usize];
+        self.read_exact(&mut bytes)?;
+        String::from_utf8(bytes).map_err(|_| invalid("string is not UTF-8"))
+    }
+
+    fn value(&mut self, kind: u32, depth: u8) -> Result<Value, GgufError> {
+        Ok(match kind {
+            0 => Value::U8(self.array::<1>()?[0]),
+            1 => Value::I8(self.array::<1>()?[0] as i8),
+            2 => Value::U16(u16::from_le_bytes(self.array()?)),
+            3 => Value::I16(i16::from_le_bytes(self.array()?)),
+            4 => Value::U32(self.u32()?),
+            5 => Value::I32(i32::from_le_bytes(self.array()?)),
+            6 => Value::F32(f32::from_le_bytes(self.array()?)),
+            7 => match self.array::<1>()?[0] {
+                0 => Value::Bool(false),
+                1 => Value::Bool(true),
+                _ => return Err(invalid("boolean is neither 0 nor 1")),
+            },
+            8 => Value::String(self.string()?),
+            9 => {
+                if depth >= 4 {
+                    return Err(GgufError::LimitExceeded("array nesting"));
+                }
+                let element_type = self.u32()?;
+                let count = self.u64()?;
+                if count > MAX_ITEMS {
+                    return Err(GgufError::LimitExceeded("array length"));
+                }
+                // Every element occupies at least one byte on disk.
+                self.need(count.saturating_mul(min_encoded_size(element_type)?))?;
+                let mut items = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    items.push(self.value(element_type, depth + 1)?);
+                }
+                Value::Array(items)
+            }
+            10 => Value::U64(self.u64()?),
+            11 => Value::I64(i64::from_le_bytes(self.array()?)),
+            12 => Value::F64(f64::from_le_bytes(self.array()?)),
+            _ => return Err(GgufError::UnsupportedValueType(kind)),
+        })
+    }
+}
+
+fn min_encoded_size(kind: u32) -> Result<u64, GgufError> {
+    Ok(match kind {
+        0 | 1 | 7 => 1,
+        2 | 3 => 2,
+        4..=6 => 4,
+        8 | 10 | 11 | 12 => 8,
+        9 => 12,
+        _ => return Err(GgufError::UnsupportedValueType(kind)),
+    })
+}
+
+pub fn inspect<R: Read + Seek>(reader: R, file_len: u64) -> Result<GgufInfo, GgufError> {
+    let mut reader = Bounded {
+        inner: reader,
+        position: 0,
+        len: file_len,
+    };
+    if &reader.array::<4>()? != MAGIC {
+        return Err(invalid("bad magic"));
+    }
+    let version = reader.u32()?;
     if !(2..=3).contains(&version) {
         return Err(GgufError::UnsupportedVersion(version));
     }
-    let tensor_count = read_u64(&mut reader)?;
-    let metadata_count = read_u64(&mut reader)?;
-    check_count(tensor_count, "tensor count")?;
-    check_count(metadata_count, "metadata count")?;
-
-    let mut architecture = None;
-    let mut block_count = None;
-    let mut alignment = DEFAULT_ALIGNMENT;
+    let tensor_count = reader.u64()?;
+    let metadata_count = reader.u64()?;
+    if tensor_count > MAX_ITEMS {
+        return Err(GgufError::LimitExceeded("tensor count"));
+    }
+    if metadata_count > MAX_ITEMS {
+        return Err(GgufError::LimitExceeded("metadata count"));
+    }
+    // Each metadata entry is at least key length + type + one byte; each
+    // tensor descriptor is at least 8 + 4 + 4 + 8 bytes.
+    reader.need(metadata_count.saturating_mul(13))?;
+    let mut metadata = Vec::with_capacity(metadata_count as usize);
     for _ in 0..metadata_count {
-        let key = read_string(&mut reader)?;
-        let value_type = read_u32(&mut reader)?;
-        if key == "general.architecture" && value_type == 8 {
-            architecture = Some(read_string(&mut reader)?);
-        } else if key == "general.alignment" && value_type == 4 {
-            alignment = u64::from(read_u32(&mut reader)?);
-        } else if key.ends_with(".block_count") && value_type == 4 {
-            block_count = Some(read_u32(&mut reader)?);
-        } else {
-            skip_value(&mut reader, value_type, 0)?;
-        }
-    }
-    if alignment == 0 || !alignment.is_power_of_two() {
-        return Err(GgufError::Invalid(
-            "general.alignment must be a nonzero power of two",
-        ));
+        let key = reader.string()?;
+        let value_type = reader.u32()?;
+        let value = reader.value(value_type, 0)?;
+        metadata.push((key, value));
     }
 
-    let tensor_capacity =
-        usize::try_from(tensor_count).map_err(|_| GgufError::LimitExceeded("tensor count"))?;
-    let mut tensors = Vec::with_capacity(tensor_capacity);
-    for _ in 0..tensor_count {
-        let name = read_string(&mut reader)?;
-        let dimension_count = read_u32(&mut reader)?;
-        if dimension_count > 4 {
-            return Err(GgufError::Invalid("tensor has more than four dimensions"));
+    let alignment = match metadata.iter().find(|(k, _)| k == "general.alignment") {
+        Some((_, value)) => value
+            .as_u64()
+            .ok_or_else(|| invalid("general.alignment is not an integer"))?,
+        None => DEFAULT_ALIGNMENT,
+    };
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return Err(invalid("general.alignment must be a nonzero power of two"));
+    }
+
+    reader.need(tensor_count.saturating_mul(24))?;
+    let mut tensors = Vec::with_capacity(tensor_count as usize);
+    let mut index = HashMap::with_capacity(tensor_count as usize);
+    for i in 0..tensor_count as usize {
+        let name = reader.string()?;
+        let dimension_count = reader.u32()?;
+        if dimension_count == 0 || dimension_count > MAX_DIMENSIONS {
+            return Err(invalid(format!(
+                "tensor {name} has {dimension_count} dimensions"
+            )));
         }
         let mut dimensions = Vec::with_capacity(dimension_count as usize);
         for _ in 0..dimension_count {
-            dimensions.push(read_u64(&mut reader)?);
+            let dimension = reader.u64()?;
+            if dimension == 0 {
+                return Err(invalid(format!("tensor {name} has a zero dimension")));
+            }
+            dimensions.push(dimension);
         }
-        let ggml_type = read_u32(&mut reader)?;
-        let relative_offset = read_u64(&mut reader)?;
+        let ggml_type = reader.u32()?;
+        let relative_offset = reader.u64()?;
+        if index.insert(name.clone(), i).is_some() {
+            return Err(invalid(format!("duplicate tensor name {name}")));
+        }
         tensors.push(TensorInfo {
             name,
             dimensions,
@@ -156,123 +461,90 @@ pub fn inspect<R: Read + Seek>(mut reader: R, file_len: u64) -> Result<GgufInfo,
         });
     }
 
-    let descriptors_end = reader.stream_position()?;
-    let data_offset = align_up(descriptors_end, alignment)?;
+    let data_offset = align_up(reader.position, alignment)?;
     if data_offset > file_len {
-        return Err(GgufError::Invalid("tensor data begins beyond end of file"));
+        return Err(invalid("tensor data begins beyond end of file"));
     }
+    let data_len = file_len - data_offset;
     for tensor in &tensors {
-        let absolute = data_offset
-            .checked_add(tensor.relative_offset)
-            .ok_or(GgufError::ArithmeticOverflow)?;
-        if absolute > file_len {
-            return Err(GgufError::Invalid("tensor offset is beyond end of file"));
+        if tensor.relative_offset % alignment != 0 {
+            return Err(invalid(format!("tensor {} is misaligned", tensor.name)));
+        }
+        if tensor.element_count().is_none() {
+            return Err(GgufError::ArithmeticOverflow);
+        }
+        // Unknown types are allowed for inspection; their extent is unchecked
+        // here and they are rejected by the model loader.
+        if let Some(size) = tensor.byte_size() {
+            let end = tensor
+                .relative_offset
+                .checked_add(size)
+                .ok_or(GgufError::ArithmeticOverflow)?;
+            if end > data_len {
+                return Err(invalid(format!(
+                    "tensor {} extends beyond end of file",
+                    tensor.name
+                )));
+            }
+        } else if tensor.relative_offset > data_len {
+            return Err(invalid(format!(
+                "tensor {} starts beyond end of file",
+                tensor.name
+            )));
         }
     }
 
     Ok(GgufInfo {
         version,
-        metadata_count,
-        tensor_count,
         alignment,
         data_offset,
-        architecture,
-        block_count,
+        metadata,
         tensors,
+        index,
     })
 }
 
-fn ggml_layout(kind: u32) -> Option<(u64, u64)> {
-    match kind {
-        0 => Some((1, 4)),      // F32
-        1 => Some((1, 2)),      // F16
-        2 => Some((32, 18)),    // Q4_0
-        3 => Some((32, 20)),    // Q4_1
-        6 => Some((32, 22)),    // Q5_0
-        7 => Some((32, 24)),    // Q5_1
-        8 => Some((32, 34)),    // Q8_0
-        9 => Some((32, 40)),    // Q8_1
-        10 => Some((256, 84)),  // Q2_K
-        11 => Some((256, 110)), // Q3_K
-        12 => Some((256, 144)), // Q4_K
-        13 => Some((256, 176)), // Q5_K
-        14 => Some((256, 210)), // Q6_K
-        15 => Some((256, 292)), // Q8_K
-        _ => None,
-    }
+/// A parsed GGUF file whose tensor payloads are memory-mapped, not copied.
+pub struct GgufFile {
+    pub info: GgufInfo,
+    map: Mmap,
 }
 
-fn ggml_type_name(kind: u32) -> &'static str {
-    match kind {
-        0 => "F32",
-        1 => "F16",
-        2 => "Q4_0",
-        3 => "Q4_1",
-        6 => "Q5_0",
-        7 => "Q5_1",
-        8 => "Q8_0",
-        9 => "Q8_1",
-        10 => "Q2_K",
-        11 => "Q3_K",
-        12 => "Q4_K",
-        13 => "Q5_K",
-        14 => "Q6_K",
-        15 => "Q8_K",
-        _ => "UNKNOWN",
-    }
-}
-
-fn skip_value<R: Read + Seek>(reader: &mut R, kind: u32, depth: u8) -> Result<(), GgufError> {
-    if depth > 8 {
-        return Err(GgufError::LimitExceeded("array nesting"));
-    }
-    let byte_count = match kind {
-        0 | 1 | 7 => 1,
-        2 | 3 => 2,
-        4 | 5 | 6 => 4,
-        10 | 11 | 12 => 8,
-        8 => {
-            let length = read_u64(reader)?;
-            check_string_length(length)?;
-            seek_forward(reader, length)?;
-            return Ok(());
+impl GgufFile {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, GgufError> {
+        let file = File::open(path.as_ref())?;
+        let file_len = file.metadata()?.len();
+        let info = inspect(BufReader::new(&file), file_len)?;
+        // SAFETY: the map is read-only. Mutating the file while kLLM runs is
+        // undefined behaviour, the same contract as every mmap-based loader.
+        let map = unsafe { Mmap::map(&file)? };
+        if map.len() as u64 != file_len {
+            return Err(invalid("file changed size while being opened"));
         }
-        9 => {
-            let element_type = read_u32(reader)?;
-            let count = read_u64(reader)?;
-            check_count(count, "array length")?;
-            for _ in 0..count {
-                skip_value(reader, element_type, depth + 1)?;
-            }
-            return Ok(());
-        }
-        _ => return Err(GgufError::UnsupportedValueType(kind)),
-    };
-    seek_forward(reader, byte_count)
-}
-
-fn read_string<R: Read>(reader: &mut R) -> Result<String, GgufError> {
-    let length = read_u64(reader)?;
-    check_string_length(length)?;
-    let length = usize::try_from(length).map_err(|_| GgufError::LimitExceeded("string"))?;
-    let mut bytes = vec![0; length];
-    reader.read_exact(&mut bytes)?;
-    String::from_utf8(bytes).map_err(|_| GgufError::Invalid("string is not UTF-8"))
-}
-
-fn check_string_length(length: u64) -> Result<(), GgufError> {
-    if length > MAX_STRING_BYTES {
-        Err(GgufError::LimitExceeded("string"))
-    } else {
-        Ok(())
+        Ok(Self { info, map })
     }
-}
 
-fn check_count(count: u64, what: &'static str) -> Result<(), GgufError> {
-    if count > MAX_ITEMS {
-        Err(GgufError::LimitExceeded(what))
-    } else {
-        Ok(())
+    /// Raw payload bytes of a tensor. Bounds were validated at parse time.
+    pub fn tensor_bytes(&self, tensor: &TensorInfo) -> Result<&[u8], GgufError> {
+        let size = tensor
+            .byte_size()
+            .ok_or_else(|| invalid(format!("tensor {} has an unsupported type", tensor.name)))?;
+        let start = self.info.data_offset + tensor.relative_offset;
+        let end = start + size;
+        self.map
+            .get(start as usize..end as usize)
+            .ok_or_else(|| invalid(format!("tensor {} is out of bounds", tensor.name)))
+    }
+
+    /// The whole mapped file.
+    pub fn mapped(&self) -> &[u8] {
+        &self.map
+    }
+
+    /// Ask the kernel to start reading the mapped file in the background.
+    pub fn advise_willneed(&self) {
+        #[cfg(unix)]
+        let _ = self.map.advise(memmap2::Advice::WillNeed);
     }
 }
 
@@ -283,86 +555,203 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, GgufError> {
         .ok_or(GgufError::ArithmeticOverflow)
 }
 
-fn seek_forward<R: Seek>(reader: &mut R, amount: u64) -> Result<(), GgufError> {
-    let amount = i64::try_from(amount).map_err(|_| GgufError::ArithmeticOverflow)?;
-    reader.seek(SeekFrom::Current(amount))?;
-    Ok(())
-}
-
-fn read_u32<R: Read>(reader: &mut R) -> Result<u32, GgufError> {
-    let mut bytes = [0; 4];
-    reader.read_exact(&mut bytes)?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn read_u64<R: Read>(reader: &mut R) -> Result<u64, GgufError> {
-    let mut bytes = [0; 8];
-    reader.read_exact(&mut bytes)?;
-    Ok(u64::from_le_bytes(bytes))
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Cursor;
+
+    pub(crate) struct Builder {
+        metadata: Vec<u8>,
+        metadata_count: u64,
+        tensors: Vec<(String, Vec<u64>, u32, Vec<u8>)>,
+    }
+
+    impl Builder {
+        pub(crate) fn new() -> Self {
+            Self {
+                metadata: Vec::new(),
+                metadata_count: 0,
+                tensors: Vec::new(),
+            }
+        }
+
+        fn key(&mut self, key: &str, kind: u32) {
+            push_string(&mut self.metadata, key);
+            self.metadata.extend_from_slice(&kind.to_le_bytes());
+            self.metadata_count += 1;
+        }
+
+        pub(crate) fn string(mut self, key: &str, value: &str) -> Self {
+            self.key(key, 8);
+            push_string(&mut self.metadata, value);
+            self
+        }
+
+        pub(crate) fn u32(mut self, key: &str, value: u32) -> Self {
+            self.key(key, 4);
+            self.metadata.extend_from_slice(&value.to_le_bytes());
+            self
+        }
+
+        pub(crate) fn f32(mut self, key: &str, value: f32) -> Self {
+            self.key(key, 6);
+            self.metadata.extend_from_slice(&value.to_le_bytes());
+            self
+        }
+
+        pub(crate) fn strings(mut self, key: &str, values: &[&str]) -> Self {
+            self.key(key, 9);
+            self.metadata.extend_from_slice(&8_u32.to_le_bytes());
+            self.metadata
+                .extend_from_slice(&(values.len() as u64).to_le_bytes());
+            for value in values {
+                push_string(&mut self.metadata, value);
+            }
+            self
+        }
+
+        pub(crate) fn tensor(mut self, name: &str, dims: &[u64], kind: u32, data: Vec<u8>) -> Self {
+            self.tensors.push((name.into(), dims.to_vec(), kind, data));
+            self
+        }
+
+        pub(crate) fn build(self) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(MAGIC);
+            bytes.extend_from_slice(&3_u32.to_le_bytes());
+            bytes.extend_from_slice(&(self.tensors.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&self.metadata_count.to_le_bytes());
+            bytes.extend_from_slice(&self.metadata);
+            let mut offset = 0_u64;
+            let mut offsets = Vec::new();
+            for (name, dims, kind, data) in &self.tensors {
+                push_string(&mut bytes, name);
+                bytes.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+                for dim in dims {
+                    bytes.extend_from_slice(&dim.to_le_bytes());
+                }
+                bytes.extend_from_slice(&kind.to_le_bytes());
+                bytes.extend_from_slice(&offset.to_le_bytes());
+                offsets.push(offset);
+                offset =
+                    (offset + data.len() as u64).div_ceil(DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT;
+            }
+            pad(&mut bytes);
+            for (_, _, _, data) in &self.tensors {
+                bytes.extend_from_slice(data);
+                pad(&mut bytes);
+            }
+            bytes
+        }
+    }
+
+    fn pad(bytes: &mut Vec<u8>) {
+        while !bytes.len().is_multiple_of(DEFAULT_ALIGNMENT as usize) {
+            bytes.push(0);
+        }
+    }
 
     fn push_string(output: &mut Vec<u8>, value: &str) {
         output.extend_from_slice(&(value.len() as u64).to_le_bytes());
         output.extend_from_slice(value.as_bytes());
     }
 
+    fn parse(bytes: &[u8]) -> Result<GgufInfo, GgufError> {
+        inspect(Cursor::new(bytes), bytes.len() as u64)
+    }
+
     fn fixture() -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&3_u32.to_le_bytes());
-        bytes.extend_from_slice(&1_u64.to_le_bytes());
-        bytes.extend_from_slice(&1_u64.to_le_bytes());
-        push_string(&mut bytes, "general.architecture");
-        bytes.extend_from_slice(&8_u32.to_le_bytes());
-        push_string(&mut bytes, "llama");
-        push_string(&mut bytes, "token_embd.weight");
-        bytes.extend_from_slice(&2_u32.to_le_bytes());
-        bytes.extend_from_slice(&16_u64.to_le_bytes());
-        bytes.extend_from_slice(&32_u64.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u64.to_le_bytes());
-        while bytes.len() % DEFAULT_ALIGNMENT as usize != 0 {
-            bytes.push(0);
-        }
-        bytes
+        Builder::new()
+            .string("general.architecture", "llama")
+            .u32("llama.block_count", 2)
+            .f32("llama.rope.freq_base", 10000.0)
+            .strings("tokenizer.ggml.tokens", &["a", "b", "c"])
+            .tensor("token_embd.weight", &[16, 32], 0, vec![0; 16 * 32 * 4])
+            .tensor("blk.1.attn_q.weight", &[32, 2], 2, vec![0; 36])
+            .build()
     }
 
     #[test]
-    fn inspects_header_metadata_and_tensor() {
-        let bytes = fixture();
-        let info = inspect(Cursor::new(&bytes), bytes.len() as u64).unwrap();
+    fn parses_metadata_and_tensors() {
+        let info = parse(&fixture()).unwrap();
         assert_eq!(info.version, 3);
-        assert_eq!(info.architecture.as_deref(), Some("llama"));
-        assert_eq!(info.tensors[0].dimensions, vec![16, 32]);
-        assert_eq!(info.tensors[0].byte_size(), Some(2048));
-        assert_eq!(info.known_weight_bytes(), Some(2048));
+        assert_eq!(info.architecture(), Some("llama"));
+        assert_eq!(info.block_count(), Some(2));
+        assert_eq!(
+            info.arch_get("rope.freq_base").and_then(Value::as_f32),
+            Some(10000.0)
+        );
+        let tokens = info
+            .get("tokenizer.ggml.tokens")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[2].as_str(), Some("c"));
+        let embd = info.tensor("token_embd.weight").unwrap();
+        assert_eq!(embd.dimensions, vec![16, 32]);
+        assert_eq!(embd.byte_size(), Some(2048));
+        let q = info.tensor("blk.1.attn_q.weight").unwrap();
+        assert_eq!(q.byte_size(), Some(36));
+        assert_eq!(q.type_name(), "Q4_0");
+        assert_eq!(q.block_index(), Some(1));
+        assert_eq!(info.known_weight_bytes(), Some(2048 + 36));
         assert_eq!(info.data_offset % DEFAULT_ALIGNMENT, 0);
     }
 
     #[test]
-    fn computes_quantized_tensor_size() {
-        let tensor = TensorInfo {
-            name: "q4".into(),
-            dimensions: vec![32, 2],
-            ggml_type: 2,
-            relative_offset: 0,
-        };
-        assert_eq!(tensor.element_count(), Some(64));
-        assert_eq!(tensor.byte_size(), Some(36));
-        assert_eq!(tensor.type_name(), "Q4_0");
+    fn rejects_bad_magic() {
+        assert!(matches!(parse(&[0; 24]), Err(GgufError::Invalid(_))));
     }
 
     #[test]
-    fn rejects_bad_magic() {
-        let bytes = vec![0; 24];
-        assert!(matches!(
-            inspect(Cursor::new(&bytes), bytes.len() as u64),
-            Err(GgufError::Invalid("bad magic"))
-        ));
+    fn rejects_every_truncation_without_panicking() {
+        let bytes = fixture();
+        let info = parse(&bytes).unwrap();
+        let last = info.tensor("blk.1.attn_q.weight").unwrap();
+        let payload_end = (info.data_offset + last.relative_offset + 36) as usize;
+        // Bytes past the last payload are alignment padding and may be cut.
+        assert!(parse(&bytes[..payload_end]).is_ok());
+        for cut in 0..payload_end {
+            // Cutting inside the final tensor payload must fail the bounds
+            // check; cutting earlier must fail the reader. Nothing may panic.
+            assert!(
+                parse(&bytes[..cut]).is_err(),
+                "accepted truncation at {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_huge_declared_lengths_without_allocating() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        push_string(&mut bytes, "k");
+        bytes.extend_from_slice(&9_u32.to_le_bytes());
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        bytes.extend_from_slice(&(MAX_ITEMS - 1).to_le_bytes());
+        assert!(matches!(parse(&bytes), Err(GgufError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_tensor_past_end_and_duplicates() {
+        let mut bytes = fixture();
+        bytes.truncate(bytes.len() - 32);
+        assert!(parse(&bytes).is_err());
+
+        let duplicate = Builder::new()
+            .tensor("x", &[4], 0, vec![0; 16])
+            .tensor("x", &[4], 0, vec![0; 16])
+            .build();
+        assert!(matches!(parse(&duplicate), Err(GgufError::Invalid(m)) if m.contains("duplicate")));
+    }
+
+    #[test]
+    fn rejects_bad_alignment_and_bool() {
+        let bytes = Builder::new().u32("general.alignment", 24).build();
+        assert!(parse(&bytes).is_err());
     }
 }

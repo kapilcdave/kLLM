@@ -61,13 +61,17 @@ return a useful error containing the estimated shortfall and safe settings.
 
 ### Memory planner
 
-- Inputs: model bytes, layer count, VRAM limit, context length, KV bytes per
-  token, fixed GPU workspace, and safety margin.
+- Inputs: per-layer weight bytes, head and embedding bytes, VRAM limit,
+  context length, KV bytes per token per layer (derived from GGUF metadata),
+  fixed GPU workspace, and safety margin.
 - Reserve KV cache, workspace, and safety margin before placing weights.
-- Place the largest possible whole prefix of uniform transformer layers in
-  VRAM for the initial implementation.
-- Account for embeddings and output tensors separately once GGUF metadata is
-  available.
+- Place the largest possible whole *suffix* of transformer layers in VRAM,
+  using each layer's real tensor sizes and its own KV-cache share. A suffix
+  keeps the GPU layers adjacent to the output head, so a token crosses the bus
+  once in each direction.
+- Account for embeddings and output tensors separately: the embedding table is
+  a row lookup and stays in RAM; the output head goes to VRAM only once every
+  layer fits.
 - Never intentionally exceed the configured VRAM limit.
 - Produce a stable, human-readable plan and machine-readable plan later.
 
