@@ -9,7 +9,7 @@ and execute a minimal Llama-family model without exceeding a configured budget.
 |---|---|---|---|
 | M1 | Deterministic memory planner | Bounded plans and passing tests | Done |
 | M2 | GGUF inspector | Metadata and tensor inventory without loading weights | In progress |
-| M3 | CPU reference backend | Greedy token generation matches a fixture | Planned |
+| M3 | CPU reference backend | Greedy token generation matches a fixture | In progress |
 | M4 | Q4_0 kernels | Quantized operations match float reference tolerances | Planned |
 | M5 | Legacy CUDA backend | Q4_0 decode runs without tensor cores | Planned |
 | M6 | Hybrid placement | Planned layers execute across CPU and GPU | Planned |
