@@ -20,6 +20,7 @@ pub struct GgufInfo {
     pub alignment: u64,
     pub data_offset: u64,
     pub architecture: Option<String>,
+    pub block_count: Option<u32>,
     pub tensors: Vec<TensorInfo>,
 }
 
@@ -29,6 +30,33 @@ pub struct TensorInfo {
     pub dimensions: Vec<u64>,
     pub ggml_type: u32,
     pub relative_offset: u64,
+}
+
+impl TensorInfo {
+    pub fn element_count(&self) -> Option<u64> {
+        self.dimensions
+            .iter()
+            .try_fold(1_u64, |total, dimension| total.checked_mul(*dimension))
+    }
+
+    pub fn byte_size(&self) -> Option<u64> {
+        let elements = self.element_count()?;
+        let (block_elements, block_bytes) = ggml_layout(self.ggml_type)?;
+        let blocks = elements.checked_add(block_elements - 1)? / block_elements;
+        blocks.checked_mul(block_bytes)
+    }
+
+    pub fn type_name(&self) -> &'static str {
+        ggml_type_name(self.ggml_type)
+    }
+}
+
+impl GgufInfo {
+    pub fn known_weight_bytes(&self) -> Option<u64> {
+        self.tensors.iter().try_fold(0_u64, |total, tensor| {
+            total.checked_add(tensor.byte_size()?)
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -84,6 +112,7 @@ pub fn inspect<R: Read + Seek>(mut reader: R, file_len: u64) -> Result<GgufInfo,
     check_count(metadata_count, "metadata count")?;
 
     let mut architecture = None;
+    let mut block_count = None;
     let mut alignment = DEFAULT_ALIGNMENT;
     for _ in 0..metadata_count {
         let key = read_string(&mut reader)?;
@@ -92,6 +121,8 @@ pub fn inspect<R: Read + Seek>(mut reader: R, file_len: u64) -> Result<GgufInfo,
             architecture = Some(read_string(&mut reader)?);
         } else if key == "general.alignment" && value_type == 4 {
             alignment = u64::from(read_u32(&mut reader)?);
+        } else if key.ends_with(".block_count") && value_type == 4 {
+            block_count = Some(read_u32(&mut reader)?);
         } else {
             skip_value(&mut reader, value_type, 0)?;
         }
@@ -146,8 +177,49 @@ pub fn inspect<R: Read + Seek>(mut reader: R, file_len: u64) -> Result<GgufInfo,
         alignment,
         data_offset,
         architecture,
+        block_count,
         tensors,
     })
+}
+
+fn ggml_layout(kind: u32) -> Option<(u64, u64)> {
+    match kind {
+        0 => Some((1, 4)),      // F32
+        1 => Some((1, 2)),      // F16
+        2 => Some((32, 18)),    // Q4_0
+        3 => Some((32, 20)),    // Q4_1
+        6 => Some((32, 22)),    // Q5_0
+        7 => Some((32, 24)),    // Q5_1
+        8 => Some((32, 34)),    // Q8_0
+        9 => Some((32, 40)),    // Q8_1
+        10 => Some((256, 84)),  // Q2_K
+        11 => Some((256, 110)), // Q3_K
+        12 => Some((256, 144)), // Q4_K
+        13 => Some((256, 176)), // Q5_K
+        14 => Some((256, 210)), // Q6_K
+        15 => Some((256, 292)), // Q8_K
+        _ => None,
+    }
+}
+
+fn ggml_type_name(kind: u32) -> &'static str {
+    match kind {
+        0 => "F32",
+        1 => "F16",
+        2 => "Q4_0",
+        3 => "Q4_1",
+        6 => "Q5_0",
+        7 => "Q5_1",
+        8 => "Q8_0",
+        9 => "Q8_1",
+        10 => "Q2_K",
+        11 => "Q3_K",
+        12 => "Q4_K",
+        13 => "Q5_K",
+        14 => "Q6_K",
+        15 => "Q8_K",
+        _ => "UNKNOWN",
+    }
 }
 
 fn skip_value<R: Read + Seek>(reader: &mut R, kind: u32, depth: u8) -> Result<(), GgufError> {
@@ -267,7 +339,22 @@ mod tests {
         assert_eq!(info.version, 3);
         assert_eq!(info.architecture.as_deref(), Some("llama"));
         assert_eq!(info.tensors[0].dimensions, vec![16, 32]);
+        assert_eq!(info.tensors[0].byte_size(), Some(2048));
+        assert_eq!(info.known_weight_bytes(), Some(2048));
         assert_eq!(info.data_offset % DEFAULT_ALIGNMENT, 0);
+    }
+
+    #[test]
+    fn computes_quantized_tensor_size() {
+        let tensor = TensorInfo {
+            name: "q4".into(),
+            dimensions: vec![32, 2],
+            ggml_type: 2,
+            relative_offset: 0,
+        };
+        assert_eq!(tensor.element_count(), Some(64));
+        assert_eq!(tensor.byte_size(), Some(36));
+        assert_eq!(tensor.type_name(), "Q4_0");
     }
 
     #[test]

@@ -20,8 +20,9 @@ fn main() -> ExitCode {
 fn run(args: Vec<String>) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("plan") => run_plan(&args),
+        Some("plan-model") => run_plan_model(&args),
         Some("inspect") => run_inspect(&args),
-        _ => Err("expected `plan` or `inspect`".into()),
+        _ => Err("expected plan, plan-model, or inspect".into()),
     }
 }
 
@@ -93,14 +94,91 @@ fn run_inspect(args: &[String]) -> Result<(), String> {
     );
     println!("  metadata entries: {}", info.metadata_count);
     println!("  tensors:          {}", info.tensor_count);
+    if let Some(block_count) = info.block_count {
+        println!("  transformer blocks: {block_count}");
+    }
+    if let Some(bytes) = info.known_weight_bytes() {
+        println!("  known weights:    {:.2} GiB", gib(bytes));
+    }
     println!("  alignment:        {} bytes", info.alignment);
     println!("  data offset:      {} bytes", info.data_offset);
     for tensor in &info.tensors {
         println!(
-            "  - {} {:?} type={} offset={}",
-            tensor.name, tensor.dimensions, tensor.ggml_type, tensor.relative_offset
+            "  - {} {:?} {} bytes={} offset={}",
+            tensor.name,
+            tensor.dimensions,
+            tensor.type_name(),
+            tensor
+                .byte_size()
+                .map(|size| size.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            tensor.relative_offset
         );
     }
+    Ok(())
+}
+
+fn run_plan_model(args: &[String]) -> Result<(), String> {
+    let path = args.get(1).ok_or_else(|| "missing GGUF path".to_string())?;
+    let info = inspect_file(path).map_err(|error| error.to_string())?;
+    let model_bytes = info.known_weight_bytes().ok_or_else(|| {
+        "model contains a GGML tensor type whose size KLLM does not know".to_string()
+    })?;
+    let layer_count = info
+        .block_count
+        .ok_or_else(|| "GGUF does not contain an architecture block count".to_string())?;
+    let input = PlanInput {
+        model_bytes,
+        layer_count,
+        vram_bytes: bytes_from_gib(flag_f64(args, "--vram-gib")?).map_err(str::to_string)?,
+        context_tokens: flag_u64(args, "--context")?,
+        kv_bytes_per_token: flag_u64(args, "--kv-bytes-per-token")?,
+        workspace_bytes: bytes_from_gib(
+            optional_flag_f64(args, "--workspace-gib")?.unwrap_or(DEFAULT_WORKSPACE_GIB),
+        )
+        .map_err(str::to_string)?,
+        safety_bytes: bytes_from_gib(
+            optional_flag_f64(args, "--safety-gib")?.unwrap_or(DEFAULT_SAFETY_GIB),
+        )
+        .map_err(str::to_string)?,
+    };
+    print_plan(input)
+}
+
+fn print_plan(input: PlanInput) -> Result<(), String> {
+    let result = plan(input).map_err(|error| error.to_string())?;
+    println!("KLLM memory plan");
+    println!("  model weights:    {:>6.2} GiB", gib(input.model_bytes));
+    println!("  VRAM limit:       {:>6.2} GiB", gib(input.vram_bytes));
+    println!(
+        "  GPU layers:       {:>6} / {}",
+        result.gpu_layers, input.layer_count
+    );
+    println!(
+        "  CPU layers:       {:>6} / {}",
+        result.cpu_layers, input.layer_count
+    );
+    println!(
+        "  GPU weights:      {:>6.2} GiB",
+        gib(result.gpu_weight_bytes)
+    );
+    println!(
+        "  CPU weights:      {:>6.2} GiB",
+        gib(result.cpu_weight_bytes)
+    );
+    println!(
+        "  KV cache:         {:>6.2} GiB",
+        gib(result.kv_cache_bytes)
+    );
+    println!(
+        "  workspace:        {:>6.2} GiB",
+        gib(result.workspace_bytes)
+    );
+    println!("  safety reserve:   {:>6.2} GiB", gib(result.safety_bytes));
+    println!(
+        "  unused VRAM:      {:>6.2} GiB",
+        gib(result.unused_vram_bytes)
+    );
     Ok(())
 }
 
@@ -135,5 +213,5 @@ fn flag_u64(args: &[String], flag: &str) -> Result<u64, String> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  kllm inspect MODEL.gguf\n  kllm plan --model-gib N --layers N --vram-gib N --context N \\\n       --kv-bytes-per-token N [--workspace-gib N] [--safety-gib N]"
+    "usage:\n  kllm inspect MODEL.gguf\n  kllm plan-model MODEL.gguf --vram-gib N --context N --kv-bytes-per-token N\n  kllm plan --model-gib N --layers N --vram-gib N --context N \\\n       --kv-bytes-per-token N [--workspace-gib N] [--safety-gib N]"
 }

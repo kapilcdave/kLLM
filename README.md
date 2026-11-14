@@ -24,5 +24,12 @@ Inspect a GGUF file without loading its tensor data:
 cargo run -- inspect model.gguf
 ```
 
+Plan directly from the tensor inventory in a GGUF file:
+
+~~~sh
+cargo run -- plan-model model.gguf \
+  --vram-gib 4 --context 4096 --kv-bytes-per-token 131072
+~~~
+
 See [SPEC.md](SPEC.md) for the product and implementation specification.
 
