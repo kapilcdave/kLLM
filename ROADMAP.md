@@ -22,13 +22,13 @@ and execute Llama-family models without exceeding a configured budget.
    matter most: Qwen3-0.6B Q4_K_M at 0.88x and Q5_K_M at 0.94x. It is
    bandwidth-bound and scales 1.48x on four threads where pure compute
    scales 3.88x. Software prefetching the next weight group made it slightly
-   worse, so the stream itself is fine. Two
-   things left to try: a single contiguous arena for the x8-repacked weights
-   instead of one allocation per tensor (210 of them per token, so the TLB
-   takes ~21k misses that 2 MiB pages would remove — worth about 3% by
-   estimate). (Shrinking the Q4_K x8 layout from 1248 to 1184 bytes per eight
-   rows, by storing the unpacked mins as `u8`, is done: +3-4% decode on
-   Qwen3-0.6B Q4_K_M.)
+   worse, so the stream itself is fine. Tried and
+   closed: one contiguous huge-page arena for the x8-repacked weights
+   instead of a heap block per tensor measured as noise (-2% to +5% across
+   interleaved runs) because transparent huge pages are already `always` on
+   the reference machine; shrinking the Q4_K x8 layout from 1248 to 1184
+   bytes per eight rows (u8 mins) gave +3-4% on Qwen3-0.6B Q4_K_M. The
+   remaining K-quant gap is in the kernels themselves.
 2. **Hybrid execution (M6).** Run the planner's GPU suffix of layers plus the
    output head on the device; one activation transfer each way per token.
    Before building it, note what `examples/gpu_bench` measured on the
