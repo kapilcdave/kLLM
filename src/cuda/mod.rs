@@ -164,6 +164,8 @@ fn check(code: CuResult, what: &str) -> Result<(), CudaError> {
 #[derive(Clone, Copy)]
 struct Kernels {
     matvec: [(GgmlType, CuFunction); 13],
+    /// Coalesced struct-of-arrays matvecs: (type, 1-column, 4-column).
+    soa: [(GgmlType, CuFunction, CuFunction); 4],
     rms_norm: CuFunction,
     add_bias: CuFunction,
     add_inplace: CuFunction,
@@ -302,6 +304,12 @@ impl Gpu {
             ];
             let kernels = Kernels {
                 matvec,
+                soa: [
+                    (GgmlType::Q4_0, get("soa_q4_0_1")?, get("soa_q4_0_4")?),
+                    (GgmlType::Q8_0, get("soa_q8_0_1")?, get("soa_q8_0_4")?),
+                    (GgmlType::Q4K, get("soa_q4_k_1")?, get("soa_q4_k_4")?),
+                    (GgmlType::Q6K, get("soa_q6_k_1")?, get("soa_q6_k_4")?),
+                ],
                 rms_norm: get("rms_norm")?,
                 add_bias: get("add_bias")?,
                 add_inplace: get("add_inplace")?,
@@ -481,6 +489,69 @@ impl Gpu {
         )
     }
 
+    /// Upload a weight matrix in the layout its kernel wants: struct-of-arrays
+    /// for the types with coalesced kernels, row-major GGML otherwise.
+    pub fn upload_matrix(
+        self: &Arc<Self>,
+        kind: GgmlType,
+        data: &[u8],
+        rows: usize,
+        cols: usize,
+    ) -> Result<GpuMatrix, CudaError> {
+        match soa_layout(kind, data, rows, cols) {
+            Some((bytes, regions)) => Ok(GpuMatrix {
+                buffer: self.upload(&bytes)?,
+                kind,
+                rows,
+                cols,
+                regions: Some(regions),
+            }),
+            None => Ok(GpuMatrix {
+                buffer: self.upload(data)?,
+                kind,
+                rows,
+                cols,
+                regions: None,
+            }),
+        }
+    }
+
+    /// `y[b] = W · x[b]` for `batch` columns of an uploaded matrix.
+    pub fn matmul_matrix(
+        &self,
+        w: &GpuMatrix,
+        x: DevicePtr,
+        y: DevicePtr,
+        batch: usize,
+    ) -> Result<(), CudaError> {
+        let Some(regions) = w.regions else {
+            return self.matmul(w.kind, w.buffer.ptr, w.rows, w.cols, x, y, batch);
+        };
+        let &(_, one, four) = self
+            .kernels
+            .soa
+            .iter()
+            .find(|(k, _, _)| *k == w.kind)
+            .expect("SoA layout implies a kernel");
+        let (f, per) = if batch >= 4 { (four, 4) } else { (one, 1) };
+        let region = |i: usize| Arg::Ptr(w.buffer.ptr + regions[i] as u64);
+        self.launch(
+            f,
+            (Self::blocks(w.rows, 4), batch.div_ceil(per) as u32),
+            128,
+            &[
+                region(0),
+                region(1),
+                region(2),
+                Arg::Ptr(x),
+                Arg::Ptr(y),
+                Arg::I32(w.rows as i32),
+                Arg::I32(w.cols as i32),
+                Arg::I32(batch as i32),
+            ],
+        )
+    }
+
     /// In-place-safe RMSNorm of `rows` rows of length `n`.
     pub fn rms_norm(
         &self,
@@ -646,6 +717,76 @@ impl Drop for Gpu {
     }
 }
 
+/// A weight matrix resident on the GPU.
+pub struct GpuMatrix {
+    pub buffer: DeviceBuffer,
+    pub kind: GgmlType,
+    pub rows: usize,
+    pub cols: usize,
+    /// Byte offsets of the struct-of-arrays regions, or `None` for row-major.
+    regions: Option<[usize; 3]>,
+}
+
+/// Split a row-major GGML matrix into the struct-of-arrays layout the
+/// coalesced kernels read (see kernels.cu). Every region starts 256-byte
+/// aligned. Returns the bytes and the region offsets.
+fn soa_layout(
+    kind: GgmlType,
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Option<(Vec<u8>, [usize; 3])> {
+    // (bytes of each region per block, and how to fill them from a block).
+    let sizes: [usize; 3] = match kind {
+        GgmlType::Q4_0 => [16, 2, 0],
+        GgmlType::Q8_0 => [32, 2, 0],
+        GgmlType::Q4K => [128, 16, 0],
+        GgmlType::Q6K => [128, 64, 32],
+        _ => return None,
+    };
+    let blocks = rows * kind.row_bytes(cols)? / kind.block_bytes();
+    if blocks * kind.block_bytes() != data.len() {
+        return None;
+    }
+    let mut offsets = [0usize; 3];
+    let mut total = 0;
+    for (o, size) in offsets.iter_mut().zip(sizes) {
+        *o = total;
+        total = (total + size * blocks).next_multiple_of(256);
+    }
+    let mut out = vec![0_u8; total];
+    for (i, block) in data.chunks_exact(kind.block_bytes()).enumerate() {
+        let mut put = |region: usize, bytes: &[u8]| {
+            let at = offsets[region] + i * sizes[region];
+            out[at..at + bytes.len()].copy_from_slice(bytes);
+        };
+        match kind {
+            GgmlType::Q4_0 => {
+                put(0, &block[2..18]);
+                put(1, &block[0..2]);
+            }
+            GgmlType::Q8_0 => {
+                put(0, &block[2..34]);
+                put(1, &block[0..2]);
+            }
+            GgmlType::Q4K => {
+                put(0, &block[16..144]);
+                put(1, &block[0..16]); // d, dmin, scales[12]
+            }
+            GgmlType::Q6K => {
+                put(0, &block[0..128]); // ql
+                put(1, &block[128..192]); // qh
+                let mut meta = [0_u8; 32];
+                meta[0..16].copy_from_slice(&block[192..208]); // scales
+                meta[16..18].copy_from_slice(&block[208..210]); // d
+                put(2, &meta);
+            }
+            _ => unreachable!(),
+        }
+    }
+    Some((out, offsets))
+}
+
 /// Device memory, freed on drop.
 pub struct DeviceBuffer {
     gpu: Arc<Gpu>,
@@ -780,18 +921,12 @@ impl Backend for CudaBackend {
         if !self.gpu.supports(matrix.kind) {
             return Err(BackendError::UnsupportedType(matrix.kind));
         }
-        let w = self.gpu.upload(matrix.data)?;
+        let w = self
+            .gpu
+            .upload_matrix(matrix.kind, matrix.data, matrix.rows, matrix.cols)?;
         let x = self.gpu.upload(inputs)?;
         let y = self.gpu.alloc(outputs.len() * 4)?;
-        self.gpu.matmul(
-            matrix.kind,
-            w.ptr,
-            matrix.rows,
-            matrix.cols,
-            x.ptr,
-            y.ptr,
-            batch,
-        )?;
+        self.gpu.matmul_matrix(&w, x.ptr, y.ptr, batch)?;
         y.read(outputs)?;
         Ok(())
     }
@@ -898,7 +1033,7 @@ mod tests {
         }
         for (kind, data) in cases {
             let m = Matrix::new(kind, rows, cols, &data).unwrap();
-            for batch in [1, 3] {
+            for batch in [1, 3, 4, 9] {
                 let x: Vec<f32> = (0..cols * batch).map(|i| (i as f32 * 0.37).sin()).collect();
                 let mut y = vec![0.0; rows * batch];
                 backend.matmul(m, &x, &mut y, batch).unwrap();

@@ -11,8 +11,8 @@ and execute Llama-family models without exceeding a configured budget.
 | M2 | GGUF parser | Metadata and tensor inventory without loading weights; malformed files rejected | Done |
 | M3 | CPU reference backend | Greedy generation matches llama.cpp on a fixture | Done (F16 token-exact) |
 | M4 | Quantized kernels | Quantized operations match references; perplexity within llama.cpp's own spread | Done; every type also checked on a real model by KL divergence |
-| M5 | Legacy CUDA backend | Q4_0 decode runs without tensor cores | Kernels done and tested; not yet in the forward pass |
-| M6 | Hybrid placement | Planned layers execute across CPU and GPU | Planned |
+| M5 | Legacy CUDA backend | Q4_0 decode runs without tensor cores | Done |
+| M6 | Hybrid placement | Planned layers execute across CPU and GPU | Done (`--gpu-layers N|auto`); slower than the CPU at the 65 W charger clock |
 | M7 | Runtime CLI | Tokenization, sampling, streaming, and benchmarks | Done (CPU) |
 
 ## Immediate work queue
@@ -22,26 +22,25 @@ and execute Llama-family models without exceeding a configured budget.
    matter most: Qwen3-0.6B Q4_K_M at 0.88x and Q5_K_M at 0.94x. It is
    bandwidth-bound and scales 1.48x on four threads where pure compute
    scales 3.88x. Software prefetching the next weight group made it slightly
-   worse, so the stream itself is fine. Two
-   things left to try: a single contiguous arena for the x8-repacked weights
-   instead of one allocation per tensor (210 of them per token, so the TLB
-   takes ~21k misses that 2 MiB pages would remove — worth about 3% by
-   estimate), and shrinking the Q4_K x8 layout, which is 1248 bytes per eight
-   rows against 1152 row-major: in a bandwidth-bound loop that 8.3% is paid
-   directly, and storing the unpacked mins as `i8` rather than `i16` would
-   recover most of it. That one is aimed straight at the Q4_K/Q5_K gap.
-2. **Hybrid execution (M6).** Run the planner's GPU suffix of layers plus the
-   output head on the device; one activation transfer each way per token.
-   Before building it, note what `examples/gpu_bench` measured on the
-   reference machine: the quantized CUDA matvecs manage 0.56-0.93 GB/s against
-   F16's 19 GB/s, because every lane walks a whole block byte by byte and the
-   loads do not coalesce. Repacking the weights into a struct-of-arrays layout
-   on upload (scales in one array, quants in another, as the CPU side already
-   does for x8) is the fix, and it should come first. Also worth knowing: this
-   laptop's M1200 is clamped to 287 MHz on a 65 W charger — a quarter of its
-   1150 MHz — while its memory stays at full 2505 MHz, so GPU work here is
-   instruction-starved rather than bandwidth-starved, and kernels should be
-   judged on instructions per byte.
+   worse, so the stream itself is fine. Tried and
+   closed: one contiguous huge-page arena for the x8-repacked weights
+   instead of a heap block per tensor measured as noise (-2% to +5% across
+   interleaved runs) because transparent huge pages are already `always` on
+   the reference machine; shrinking the Q4_K x8 layout from 1248 to 1184
+   bytes per eight rows (u8 mins) gave +3-4% on Qwen3-0.6B Q4_K_M. The
+   remaining K-quant gap is in the kernels themselves.
+2. **GPU speed.** M6 works (`tests/gpu.rs`: perplexity matches llama.cpp
+   on the GPU as on the CPU), and the quantized matvecs were rewritten to be
+   coalesced over a struct-of-arrays layout (Q4_0 0.80 -> 5.9 GB/s, Q8_0
+   0.92 -> 10.2 GB/s, batch-64 matmul 1.8 -> 22 GOP/s). But this laptop's
+   M1200 is clamped to 287 MHz on a 65 W charger -- a quarter of its 1150 MHz
+   -- while its memory stays at full 2505 MHz. At that clock the GPU is the
+   slower device: SmolLM2-135M Q4_0 decodes at 37 tok/s on it against 215 on
+   the CPU, and Qwen3-0.6B Q4_K_M at 10.5 against 46. Next steps, in order:
+   re-measure with the 130 W charger; then cut instructions per byte
+   further (the Q4_0 kernel costs about what F16's does per element, so it
+   is ALU-bound here); then fuse the small per-layer kernels (about 15
+   launches per block at ~5 µs each).
 3. **Prefill for the float types.** F16 and BF16 prefill run at 0.58-0.61x
    of llama.cpp while every quantized type is now ahead of it (1.22-1.65x). The x8 packing
    covers only Q4_0, Q8_0, Q4_K and Q6_K, so a float row is dequantized to f32

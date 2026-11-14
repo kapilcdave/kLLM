@@ -37,11 +37,11 @@ usage:
   kllm plan --model-gib N --layers N --vram-gib N --context N --kv-bytes-per-token N
   kllm run MODEL.gguf --prompt TEXT [-n N] [--chat] [--system TEXT] [--context N]
            [--temp T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R]
-           [--seed S] [--threads N] [--batch N] [--ignore-eos]
-  kllm perplexity MODEL.gguf --file TEXT [--context 512] [--chunks N] [--threads N]
+           [--seed S] [--threads N] [--batch N] [--ignore-eos] [--gpu-layers N|auto]
+  kllm perplexity MODEL.gguf --file TEXT [--context 512] [--chunks N] [--threads N] [--gpu-layers N|auto]
   kllm compare REFERENCE.gguf TEST.gguf --file TEXT [--context 512] [--chunks N] [--threads N]
   kllm devices
-  kllm bench MODEL.gguf [-p 128] [-n 64] [--threads N] [--repeat 3] [--profile]";
+  kllm bench MODEL.gguf [-p 128] [-n 64] [--threads N] [--repeat 3] [--profile] [--gpu-layers N|auto]";
 
 struct Args(Vec<String>);
 
@@ -284,7 +284,12 @@ fn plan_shape(info: &GgufInfo) -> Result<(usize, u64, u64), String> {
     ))
 }
 
-fn model_plan_input(info: &GgufInfo, args: &Args, context: u64) -> Result<ModelPlanInput, String> {
+fn model_plan_input(
+    info: &GgufInfo,
+    args: &Args,
+    context: u64,
+    vram_bytes: u64,
+) -> Result<ModelPlanInput, String> {
     let (n_layer, kv_per_layer, _) = plan_shape(info)?;
     let mut layer_bytes = vec![0_u64; n_layer];
     let (mut head, mut embedding) = (0_u64, 0_u64);
@@ -309,7 +314,7 @@ fn model_plan_input(info: &GgufInfo, args: &Args, context: u64) -> Result<ModelP
         layer_bytes,
         head_bytes: head,
         embedding_bytes: embedding,
-        vram_bytes: bytes_from_gib(args.required("--vram-gib")?)?,
+        vram_bytes,
         context_tokens: context,
         kv_bytes_per_token_per_layer: kv_override.map_or(kv_per_layer, |k| k / n_layer as u64),
         workspace_bytes: bytes_from_gib(args.or(&["--workspace-gib"], DEFAULT_WORKSPACE_GIB)?)?,
@@ -322,7 +327,12 @@ fn cmd_plan_model(args: &Args) -> Result<(), String> {
     let info = inspect_file(path).map_err(|e| e.to_string())?;
     let (_, _, train_context) = plan_shape(&info)?;
     let context: u64 = args.or(&["--context", "-c"], train_context.min(4096))?;
-    let input = model_plan_input(&info, args, context)?;
+    let input = model_plan_input(
+        &info,
+        args,
+        context,
+        bytes_from_gib(args.required("--vram-gib")?)?,
+    )?;
     let p = plan_model(&input).map_err(|e| e.to_string())?;
     let layers = input.layer_bytes.len();
     out!(
@@ -396,7 +406,35 @@ fn cpu_name() -> String {
 }
 
 /// Load a model after printing (and checking) its memory plan.
+/// `--gpu-layers N|auto` (alias `-ngl`): how many transformer blocks to run
+/// on the GPU. N >= the block count also offloads the output head, as with
+/// llama.cpp's `-ngl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuRequest {
+    Off,
+    Layers(usize),
+    Auto,
+}
+
+fn gpu_request(args: &Args) -> Result<GpuRequest, String> {
+    Ok(match args.value(&["--gpu-layers", "-ngl"])? {
+        None => GpuRequest::Off,
+        Some("auto") => GpuRequest::Auto,
+        Some(v) => match v.parse::<usize>() {
+            Ok(0) => GpuRequest::Off,
+            Ok(n) => GpuRequest::Layers(n),
+            Err(_) => {
+                return Err(format!(
+                    "invalid value {v:?} for --gpu-layers (a count or \"auto\")"
+                ));
+            }
+        },
+    })
+}
+
 fn load_with_plan(
+    args: &Args,
+    gpu: GpuRequest,
     path: &str,
     context: usize,
     batch: usize,
@@ -432,9 +470,67 @@ fn load_with_plan(
         ));
     }
     let start = Instant::now();
-    let model = Model::load(path).map_err(|e| e.to_string())?;
+    #[allow(unused_mut)]
+    let mut model = Model::load(path).map_err(|e| e.to_string())?;
+    if gpu != GpuRequest::Off {
+        offload(args, gpu, &info, &mut model, context, batch)?;
+    }
     eprintln!("kllm: loaded in {:.2} s", start.elapsed().as_secs_f64());
     Ok(model)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn offload(
+    _: &Args,
+    _: GpuRequest,
+    _: &GgufInfo,
+    _: &mut Model,
+    _: usize,
+    _: usize,
+) -> Result<(), String> {
+    Err("this kLLM was built without GPU support (enable the `cuda` feature)".into())
+}
+
+#[cfg(feature = "cuda")]
+fn offload(
+    args: &Args,
+    gpu: GpuRequest,
+    info: &GgufInfo,
+    model: &mut Model,
+    context: usize,
+    batch: usize,
+) -> Result<(), String> {
+    let device = kllm::cuda::default_gpu().map_err(|e| e.to_string())?;
+    let (free, _) = device.memory_info().map_err(|e| e.to_string())?;
+    let c = model.config.clone();
+    let c = &c;
+    let (layers, head) = match gpu {
+        GpuRequest::Off => return Ok(()),
+        GpuRequest::Layers(n) => (n.min(c.n_layer), n >= c.n_layer),
+        GpuRequest::Auto => {
+            // The planner reserves KV per GPU block itself; the workspace is
+            // the session's scratch with the head's logits buffer included.
+            let mut input = model_plan_input(info, args, context as u64, free)?;
+            input.workspace_bytes = Model::gpu_session_bytes(c, 0, true, context, batch);
+            let plan = plan_model(&input).map_err(|e| e.to_string())?;
+            (plan.gpu_layers as usize, plan.head_on_gpu)
+        }
+    };
+    let needed = Model::gpu_session_bytes(c, layers, head, context, batch);
+    let placed = model
+        .offload(std::sync::Arc::clone(&device), layers, head)
+        .map_err(|e| e.to_string())?;
+    eprintln!(
+        "kllm: GPU {}: {} of {} blocks{} | weights {:.0} MiB, KV+scratch {:.0} MiB, {:.0} MiB was free",
+        device.name,
+        placed.gpu_layers,
+        c.n_layer,
+        if placed.head { " + head" } else { "" },
+        placed.weight_bytes as f64 / MIB,
+        needed as f64 / MIB,
+        free as f64 / MIB
+    );
+    Ok(())
 }
 
 /// Emit only complete UTF-8 sequences; tokens can split a character.
@@ -468,7 +564,7 @@ fn cmd_run(args: &Args) -> Result<(), String> {
     let info = inspect_file(path).map_err(|e| e.to_string())?;
     let config = Config::from_gguf(&info).map_err(|e| e.to_string())?;
     let context: usize = args.or(&["--context", "-c"], config.train_context.min(4096))?;
-    let model = load_with_plan(path, context, batch, threads)?;
+    let model = load_with_plan(args, gpu_request(args)?, path, context, batch, threads)?;
     let tokenizer = Tokenizer::from_gguf(model.info()).map_err(|e| e.to_string())?;
 
     let text = if args.has("--chat") {
@@ -499,7 +595,9 @@ fn cmd_run(args: &Args) -> Result<(), String> {
     });
     let ignore_eos = args.has("--ignore-eos");
 
-    let mut session = model.new_session(context, batch);
+    let mut session = model
+        .new_session(context, batch)
+        .map_err(|e| e.to_string())?;
     let mut stdout = io::stdout().lock();
     let mut stream = Utf8Stream {
         pending: Vec::new(),
@@ -563,7 +661,7 @@ fn cmd_perplexity(args: &Args) -> Result<(), String> {
     if n_ctx < 8 {
         return Err("--context must be at least 8".into());
     }
-    let model = load_with_plan(path, n_ctx, n_ctx, threads)?;
+    let model = load_with_plan(args, gpu_request(args)?, path, n_ctx, n_ctx, threads)?;
     let tokenizer = Tokenizer::from_gguf(model.info()).map_err(|e| e.to_string())?;
     let text = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?;
     let tokens = tokenizer.encode(&text, true, false);
@@ -616,8 +714,8 @@ fn cmd_compare(args: &Args) -> Result<(), String> {
     }
     // Both models are resident at once, so plan them against half the budget
     // each rather than letting either believe it owns the machine.
-    let reference = load_with_plan(reference_path, n_ctx, n_ctx, threads)?;
-    let test = load_with_plan(test_path, n_ctx, n_ctx, threads)?;
+    let reference = load_with_plan(args, GpuRequest::Off, reference_path, n_ctx, n_ctx, threads)?;
+    let test = load_with_plan(args, GpuRequest::Off, test_path, n_ctx, n_ctx, threads)?;
     let tokenizer = Tokenizer::from_gguf(reference.info()).map_err(|e| e.to_string())?;
     let text = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?;
     let tokens = tokenizer.encode(&text, true, false);
@@ -711,13 +809,15 @@ fn cmd_bench(args: &Args) -> Result<(), String> {
     let repeats: usize = args.or(&["--repeat", "-r"], 3)?.max(1);
     let batch: usize = args.or(&["--batch", "-b"], 64)?;
     let context = n_prompt + n_gen + 1;
-    let model = load_with_plan(path, context, batch, threads)?;
+    let model = load_with_plan(args, gpu_request(args)?, path, context, batch, threads)?;
     let vocab = model.config.n_vocab as u32;
     let prompt: Vec<u32> = (0..n_prompt as u32)
         .map(|i| (i * 7919 + 13) % vocab)
         .collect();
 
-    let mut session = model.new_session(context, batch);
+    let mut session = model
+        .new_session(context, batch)
+        .map_err(|e| e.to_string())?;
     let profile = args.has("--profile");
     // Warm-up: touch every weight page once.
     session

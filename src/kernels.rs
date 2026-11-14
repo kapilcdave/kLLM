@@ -554,8 +554,8 @@ pub fn axpy_f16(out: &mut [f32], a: f32, v: &[u16]) {
 //   4m..4m+4 and 16+4m..16+4m+4 of row r.
 // Q8_0x8 (272 B = 8 x 34): f16 d[8]; then for m in 0..8, qs[4m..4m+4] of
 //   rows 0..7.
-// Q4_Kx8 (1248 B, 8 x 144 + 96): f16 d[8], f16 dmin[8]; u8 scale[8 sub][8
-//   rows]; i16 (min[2p], min[2p+1]) pairs [4 p][8 rows]; then for k in 0..4,
+// Q4_Kx8 (1184 B, 8 x 144 + 32): f16 d[8], f16 dmin[8]; u8 scale[8 sub][8
+//   rows]; u8 min[8 sub][8 rows]; then for k in 0..4,
 //   m in 0..8, qs[32k+4m..+4] of rows 0..7. The 6-bit scales and mins are
 //   unpacked once here instead of on every block.
 // Q6_Kx8 (1680 B = 8 x 210): f16 d[8]; i8 scale[16 groups][8 rows]; then
@@ -567,7 +567,7 @@ fn packed_block_bytes(kind: GgmlType) -> Option<usize> {
     match kind {
         GgmlType::Q4_0 => Some(144),
         GgmlType::Q8_0 => Some(272),
-        GgmlType::Q4K => Some(1248),
+        GgmlType::Q4K => Some(1184),
         GgmlType::Q6K => Some(1680),
         _ => None,
     }
@@ -635,16 +635,10 @@ pub fn repack_x8(kind: GgmlType, data: &[u8], rows: usize, cols: usize) -> Optio
                         for j in 0..8 {
                             let (sc, mn) = scale_min_k4(j, &s[4..16]);
                             dst[32 + 8 * j + r] = sc;
-                            if j % 2 == 0 {
-                                let at = 96 + 32 * (j / 2) + 4 * r;
-                                dst[at..at + 2].copy_from_slice(&(mn as i16).to_le_bytes());
-                            } else {
-                                let at = 96 + 32 * (j / 2) + 4 * r + 2;
-                                dst[at..at + 2].copy_from_slice(&(mn as i16).to_le_bytes());
-                            }
+                            dst[96 + 8 * j + r] = mn;
                         }
                     }
-                    interleave(dst, 224, 16, 32);
+                    interleave(dst, 160, 16, 32);
                 }
                 GgmlType::Q6K => {
                     for r in 0..8 {
@@ -1625,11 +1619,11 @@ mod avx2 {
         let mask = _mm256_set1_epi8(0x0f);
         let mut acc = [_mm256_setzero_ps(); C];
         let g = group.as_ptr();
-        for b in 0..group.len() / 1248 {
-            let block = g.add(b * 1248);
+        for b in 0..group.len() / 1184 {
+            let block = g.add(b * 1184);
             let d = _mm256_cvtph_ps(_mm_loadu_si128(block as *const __m128i));
             let dmin = _mm256_cvtph_ps(_mm_loadu_si128(block.add(16) as *const __m128i));
-            let qs = block.add(224);
+            let qs = block.add(160);
             let mut sumi = [_mm256_setzero_si256(); C];
             for k in 0..4 {
                 // Eight maddubs of 4-bit x 8-bit stay within i16: 30480.
@@ -1666,7 +1660,10 @@ mod avx2 {
                 let bsum = |j: usize| a.bsums[2 * j] as i32 + a.bsums[2 * j + 1] as i32;
                 let mut mins = _mm256_setzero_si256();
                 for p in 0..4 {
-                    let pairs = _mm256_loadu_si256(block.add(96 + 32 * p) as *const __m256i);
+                    // Rebuild the (min[2p], min[2p+1]) i16 pairs from the u8 mins.
+                    let lo = _mm_loadl_epi64(block.add(96 + 8 * (2 * p)) as *const __m128i);
+                    let hi = _mm_loadl_epi64(block.add(96 + 8 * (2 * p + 1)) as *const __m128i);
+                    let pairs = _mm256_cvtepu8_epi16(_mm_unpacklo_epi8(lo, hi));
                     mins = _mm256_add_epi32(
                         mins,
                         _mm256_madd_epi16(pairs, pair16(bsum(2 * p), bsum(2 * p + 1))),

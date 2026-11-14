@@ -24,7 +24,7 @@ cargo build --release
 | Execution | CPU: batched prefill, f16 KV cache, AVX2/FMA/F16C kernels with a portable scalar fallback |
 | Sampling | Greedy, temperature, top-k, top-p, min-p, repetition penalty, seeded |
 | Planning | Per-layer VRAM/RAM placement from real tensor sizes and KV costs |
-| CUDA | Kernels for all 12 weight types plus norm/attention/RoPE, loaded as PTX through the driver API with no CUDA toolkit; tested against an exact reference on a Quadro M1200. Not yet wired into the forward pass (milestone M6) |
+| CUDA | Whole transformer blocks and the output head run on the GPU with `--gpu-layers N|auto` (M6): kernels for all 12 weight types, coalesced struct-of-arrays matvecs for Q4_0/Q8_0/Q4_K/Q6_K, KV cache in VRAM. Loaded as PTX through the driver API, so no CUDA toolkit is needed. Perplexity matches llama.cpp on the GPU as closely as on the CPU (`tests/gpu.rs`) |
 
 ## Commands
 
@@ -37,6 +37,16 @@ kllm compare REFERENCE.gguf TEST.gguf --file TEXT [--context 512] [--chunks N]
 kllm bench MODEL.gguf [-p 128] [-n 64] [--profile]
 kllm devices
 ```
+
+`run`, `perplexity` and `bench` take `--gpu-layers N` (or `-ngl N`): the
+last N blocks run on the GPU, and N at or above the block count also moves
+the output head, as with llama.cpp. `--gpu-layers auto` lets the planner
+place as many blocks as fit in the GPU's free memory. It is off by default.
+On the reference laptop the M1200 is clock-limited to 287 MHz on its 65 W
+charger, and the CPU is faster: SmolLM2-135M Q4_0 decodes at 215 tok/s on
+the CPU against 37 on the GPU, and Qwen3-0.6B Q4_K_M at 46 against 10.5. At the
+GPU's full 1150 MHz that balance should change. Re-measure with the 130 W
+charger before relying on it.
 
 `run` prints its memory plan before allocating anything and refuses a context
 that does not fit in available RAM. `plan-model` works for any GGUF, including

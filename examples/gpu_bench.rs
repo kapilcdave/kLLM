@@ -41,17 +41,15 @@ fn main() {
             (GgmlType::Q8_0, quantize_q8_0(&values)),
             (GgmlType::F16, encode_f16(&values)),
         ] {
-            let w = gpu.upload(&data).unwrap();
+            let w = gpu.upload_matrix(kind, &data, rows, cols).unwrap();
             let xd = gpu.upload(&x).unwrap();
             let y = gpu.alloc(rows * 4).unwrap();
             let reps = (400_000_000 / data.len()).clamp(5, 2000);
-            gpu.matmul(kind, w.ptr, rows, cols, xd.ptr, y.ptr, 1)
-                .unwrap();
+            gpu.matmul_matrix(&w, xd.ptr, y.ptr, 1).unwrap();
             gpu.synchronize().unwrap();
             let t = Instant::now();
             for _ in 0..reps {
-                gpu.matmul(kind, w.ptr, rows, cols, xd.ptr, y.ptr, 1)
-                    .unwrap();
+                gpu.matmul_matrix(&w, xd.ptr, y.ptr, 1).unwrap();
             }
             gpu.synchronize().unwrap();
             let s = t.elapsed().as_secs_f64() / reps as f64;
@@ -75,17 +73,15 @@ fn main() {
             (GgmlType::Q4_0, quantize_q4_0(&values)),
             (GgmlType::Q8_0, quantize_q8_0(&values)),
         ] {
-            let w = gpu.upload(&data).unwrap();
+            let w = gpu.upload_matrix(kind, &data, rows, cols).unwrap();
             let xd = gpu.upload(&x).unwrap();
             let y = gpu.alloc(rows * batch * 4).unwrap();
             let reps = 200;
-            gpu.matmul(kind, w.ptr, rows, cols, xd.ptr, y.ptr, batch)
-                .unwrap();
+            gpu.matmul_matrix(&w, xd.ptr, y.ptr, batch).unwrap();
             gpu.synchronize().unwrap();
             let t = Instant::now();
             for _ in 0..reps {
-                gpu.matmul(kind, w.ptr, rows, cols, xd.ptr, y.ptr, batch)
-                    .unwrap();
+                gpu.matmul_matrix(&w, xd.ptr, y.ptr, batch).unwrap();
             }
             gpu.synchronize().unwrap();
             let s = t.elapsed().as_secs_f64() / reps as f64;

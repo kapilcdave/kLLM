@@ -14,7 +14,7 @@ fn main() {
             .iter()
             .map(|x| x.as_u64().unwrap() as u32)
             .collect();
-        let mut s = model.new_session(512, 64);
+        let mut s = model.new_session(512, 64).unwrap();
         let mut logits = s.forward(&ids, Logits::Last).unwrap().to_vec();
         for (n, step) in case["steps"].as_array().unwrap().iter().enumerate().take(6) {
             let top = step["top"].as_array().unwrap();
