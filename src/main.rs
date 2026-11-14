@@ -38,6 +38,7 @@ usage:
   kllm run MODEL.gguf --prompt TEXT [-n N] [--chat] [--system TEXT] [--context N]
            [--temp T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R]
            [--seed S] [--threads N] [--batch N] [--ignore-eos] [--gpu-layers N|auto]
+           [--ram-gib N|auto|all]
   kllm perplexity MODEL.gguf --file TEXT [--context 512] [--chunks N] [--threads N] [--gpu-layers N|auto]
   kllm compare REFERENCE.gguf TEST.gguf --file TEXT [--context 512] [--chunks N] [--threads N]
   kllm devices
@@ -469,9 +470,34 @@ fn load_with_plan(
             config.kv_bytes_per_token()
         ));
     }
+    let budget = ram_budget(args, kv + scratch)?;
+    let residency = kllm::model::Residency::plan(&info, config.n_layer, budget);
+    if residency.first_streamed < config.n_layer || residency.head_streamed {
+        let streamed = config.n_layer - residency.first_streamed;
+        eprintln!(
+            "kllm: model exceeds the RAM budget ({:.0} MiB): {} of {} blocks{} resident ({:.0} MiB), \
+             {streamed} blocks{} streamed from disk ({:.0} MiB per token)",
+            budget.unwrap_or(0) as f64 / MIB,
+            residency.first_streamed,
+            config.n_layer,
+            if residency.head_streamed {
+                ""
+            } else {
+                " + head"
+            },
+            residency.resident_bytes as f64 / MIB,
+            if residency.head_streamed {
+                " + head"
+            } else {
+                ""
+            },
+            residency.streamed_bytes as f64 / MIB
+        );
+    }
     let start = Instant::now();
     #[allow(unused_mut)]
-    let mut model = Model::load(path).map_err(|e| e.to_string())?;
+    let mut model = Model::load_with(path, kllm::model::LoadOptions { ram_budget: budget })
+        .map_err(|e| e.to_string())?;
     if gpu != GpuRequest::Off {
         offload(args, gpu, &info, &mut model, context, batch)?;
     }
@@ -531,6 +557,24 @@ fn offload(
         free as f64 / MIB
     );
     Ok(())
+}
+
+/// RAM the weights may occupy: `--ram-gib N`, `--ram-gib all` (never stream),
+/// or by default what is available now minus the session's own needs and a
+/// 1 GiB margin for everything else running.
+fn ram_budget(args: &Args, session_bytes: u64) -> Result<Option<u64>, String> {
+    match args.value(&["--ram-gib"])? {
+        Some("all") => Ok(None),
+        Some("auto") | None => {
+            Ok(mem_available().map(|a| a.saturating_sub(session_bytes + (1 << 30))))
+        }
+        Some(v) => {
+            let gib: f64 = v
+                .parse()
+                .map_err(|_| format!("invalid value {v:?} for --ram-gib"))?;
+            Ok(Some(bytes_from_gib(gib)?))
+        }
+    }
 }
 
 /// Emit only complete UTF-8 sequences; tokens can split a character.

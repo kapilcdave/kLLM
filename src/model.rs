@@ -220,7 +220,98 @@ struct Layer {
     w_gate: Weight,
     w_up: Weight,
     w_down: Weight,
+    /// Read from disk every token instead of held in RAM (see `LoadOptions`).
+    streamed: bool,
 }
+
+impl Layer {
+    fn matrices(&self) -> [Weight; 7] {
+        [
+            self.wq,
+            self.wk,
+            self.wv,
+            self.wo,
+            self.w_gate,
+            self.w_up,
+            self.w_down,
+        ]
+    }
+}
+
+/// How to load a model.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoadOptions {
+    /// Bytes of RAM the weights may occupy. A model larger than this keeps
+    /// the output head and a prefix of blocks resident and streams the rest
+    /// from disk every token, with read-ahead of the next blocks and
+    /// immediate release of each streamed block, so the stream never evicts
+    /// the resident set. `None` keeps everything resident.
+    pub ram_budget: Option<u64>,
+}
+
+/// Which weights stay in RAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Residency {
+    /// Blocks `0..first_streamed` are resident; the rest stream from disk.
+    pub first_streamed: usize,
+    pub head_streamed: bool,
+    /// Weight bytes read from disk per token.
+    pub streamed_bytes: u64,
+    pub resident_bytes: u64,
+}
+
+impl Residency {
+    /// Plan residency from the tensor directory alone, before loading.
+    pub fn plan(info: &GgufInfo, n_layer: usize, budget: Option<u64>) -> Self {
+        let mut layer = vec![0u64; n_layer];
+        let (mut head, mut other) = (0u64, 0u64);
+        let tied = info.tensor("output.weight").is_none();
+        for t in &info.tensors {
+            let size = t.byte_size().unwrap_or(0);
+            match t.block_index() {
+                Some(i) if (i as usize) < n_layer => layer[i as usize] += size,
+                _ if t.name == "output.weight" || (tied && t.name == "token_embd.weight") => {
+                    head += size
+                }
+                _ => other += size,
+            }
+        }
+        let total: u64 = layer.iter().sum::<u64>() + head + other;
+        let all = Self {
+            first_streamed: n_layer,
+            head_streamed: false,
+            streamed_bytes: 0,
+            resident_bytes: total,
+        };
+        let Some(budget) = budget else { return all };
+        if total <= budget {
+            return all;
+        }
+        // The head is read in full by every token, like a block, but it sits
+        // at the end of the pass: keep it resident first, then a prefix.
+        let mut remaining = budget.saturating_sub(other);
+        let head_streamed = head > remaining;
+        if !head_streamed {
+            remaining -= head;
+        }
+        let mut first_streamed = 0;
+        while first_streamed < n_layer && layer[first_streamed] <= remaining {
+            remaining -= layer[first_streamed];
+            first_streamed += 1;
+        }
+        let streamed_bytes =
+            layer[first_streamed..].iter().sum::<u64>() + if head_streamed { head } else { 0 };
+        Self {
+            first_streamed,
+            head_streamed,
+            streamed_bytes,
+            resident_bytes: total - streamed_bytes,
+        }
+    }
+}
+
+/// Blocks to read ahead of the one being computed.
+const STREAM_LOOKAHEAD: usize = 2;
 
 #[cfg(feature = "cuda")]
 mod gpu;
@@ -238,6 +329,7 @@ pub struct Model {
     /// x8-repacked weight copies (see `kernels::repack_x8`).
     packed: Vec<Vec<u8>>,
     backend: CpuBackend,
+    pub residency: Residency,
     /// Blocks (and head) offloaded to a GPU, if any.
     #[cfg(feature = "cuda")]
     gpu: Option<gpu::GpuStack>,
@@ -245,14 +337,22 @@ pub struct Model {
 
 impl Model {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ModelError> {
+        Self::load_with(path, LoadOptions::default())
+    }
+
+    pub fn load_with(path: impl AsRef<Path>, options: LoadOptions) -> Result<Self, ModelError> {
         let file = GgufFile::open(path)?;
         let config = Config::from_gguf(&file.info)?;
         let c = &config;
+        let residency = Residency::plan(&file.info, c.n_layer, options.ram_budget);
         let loader = Loader {
             file: &file,
             packed: std::cell::RefCell::new(Vec::new()),
             repack: std::env::var_os("KLLM_NO_REPACK").is_none(),
+            streaming: std::cell::Cell::new(false),
+            released: std::cell::RefCell::new(Vec::new()),
         };
+        loader.streaming.set(residency.head_streamed);
         let token_embd = loader.matrix("token_embd.weight", c.n_vocab, c.n_embd)?;
         let output = match file.info.tensor("output.weight") {
             Some(_) => loader.matrix("output.weight", c.n_vocab, c.n_embd)?,
@@ -264,7 +364,10 @@ impl Model {
         for i in 0..c.n_layer {
             let name = |suffix: &str| format!("blk.{i}.{suffix}");
             let qk_norm = c.arch == Arch::Qwen3;
+            let streamed = i >= residency.first_streamed;
+            loader.streaming.set(streamed);
             layers.push(Layer {
+                streamed,
                 attn_norm: loader.vector(&name("attn_norm.weight"), c.n_embd)?,
                 wq: loader.matrix(&name("attn_q.weight"), c.q_dim(), c.n_embd)?,
                 wk: loader.matrix(&name("attn_k.weight"), c.kv_dim(), c.n_embd)?,
@@ -289,7 +392,16 @@ impl Model {
                 w_down: loader.matrix(&name("ffn_down.weight"), c.n_embd, c.n_ff)?,
             });
         }
-        file.advise_willneed();
+        // Read ahead only what stays resident; streamed blocks are read
+        // block by block during the forward pass.
+        if residency.first_streamed == c.n_layer && !residency.head_streamed {
+            file.advise_willneed();
+        }
+        // Repacked weights never read their row-major pages again (except the
+        // embedding table, which is looked up by row): give that memory back.
+        for w in loader.released.borrow().iter() {
+            file.release(w.offset, w.len);
+        }
         let packed = loader.packed.into_inner();
         Ok(Self {
             file,
@@ -301,6 +413,7 @@ impl Model {
             rope_freq_factors,
             packed,
             backend: CpuBackend,
+            residency,
             #[cfg(feature = "cuda")]
             gpu: None,
         })
@@ -370,6 +483,30 @@ impl Model {
         Session::new(self, context, max_batch)
     }
 
+    /// Read ahead the streamed blocks that follow block `layer`.
+    fn stream_ahead(&self, layer: usize) {
+        let n = self.layers.len();
+        for next in layer + 1..(layer + 1 + STREAM_LOOKAHEAD).min(n) {
+            if self.layers[next].streamed {
+                for w in self.layers[next].matrices() {
+                    self.file.prefetch(w.offset, w.len);
+                }
+            }
+        }
+        if self.residency.head_streamed && layer + STREAM_LOOKAHEAD >= n {
+            self.file.prefetch(self.output.offset, self.output.len);
+        }
+    }
+
+    /// Return a streamed block's pages once it has been computed.
+    fn stream_done(&self, layer: usize) {
+        if self.layers[layer].streamed {
+            for w in self.layers[layer].matrices() {
+                self.file.release(w.offset, w.len);
+            }
+        }
+    }
+
     /// Blocks that run on the CPU (all of them unless some were offloaded).
     pub fn cpu_layers(&self) -> usize {
         #[cfg(feature = "cuda")]
@@ -382,6 +519,10 @@ impl Model {
 
 struct Loader<'f> {
     file: &'f GgufFile,
+    /// Whether the matrices being loaded now are streamed from disk.
+    streaming: std::cell::Cell<bool>,
+    /// Row-major originals made redundant by a repacked copy.
+    released: std::cell::RefCell<Vec<Weight>>,
     packed: std::cell::RefCell<Vec<Vec<u8>>>,
     repack: bool,
 }
@@ -408,7 +549,9 @@ impl Loader<'_> {
         }
         let bytes = self.file.tensor_bytes(t)?;
         let offset = bytes.as_ptr() as usize - self.file.mapped().as_ptr() as usize;
-        let packed = if self.repack {
+        // Streamed weights stay row-major in the mapping: a repacked copy
+        // would be heap memory, which is exactly what they must not take.
+        let packed = if self.repack && !self.streaming.get() {
             kernels::repack_x8(kind, bytes, rows, cols).map(|copy| {
                 let mut packed = self.packed.borrow_mut();
                 packed.push(copy);
@@ -417,14 +560,18 @@ impl Loader<'_> {
         } else {
             None
         };
-        Ok(Weight {
+        let weight = Weight {
             kind,
             rows,
             cols,
             offset,
             len: bytes.len(),
             packed,
-        })
+        };
+        if weight.packed.is_some() && name != "token_embd.weight" {
+            self.released.borrow_mut().push(weight);
+        }
+        Ok(weight)
     }
 
     fn vector(&self, name: &str, len: usize) -> Result<Vec<f32>, ModelError> {
@@ -698,7 +845,17 @@ impl<'m> Session<'m> {
         let layer_stride = self.context * kvd;
         let query_block = query_block(c, n, crate::pool::global().threads());
 
+        let streaming = model.residency.first_streamed < c.n_layer || model.residency.head_streamed;
+        if streaming {
+            // The first streamed block is read while the resident ones run.
+            if let Some(first) = model.layers.iter().position(|l| l.streamed) {
+                model.stream_ahead(first.saturating_sub(1));
+            }
+        }
         for (li, layer) in model.layers.iter().enumerate().take(model.cpu_layers()) {
+            if streaming {
+                model.stream_ahead(li);
+            }
             // --- attention ---
             for i in 0..n {
                 let (x, xn) = (
@@ -893,6 +1050,9 @@ impl<'m> Session<'m> {
             )?;
             self.profiler.lap(6);
             add_assign(&mut self.x[..n * d], &self.proj[..n * d]);
+            if streaming {
+                model.stream_done(li);
+            }
         }
         #[cfg(feature = "cuda")]
         let logits_done = self.forward_gpu(n, start, rows)?;
@@ -923,6 +1083,9 @@ impl<'m> Session<'m> {
             &mut self.logits[..count * c.n_vocab],
             count,
         )?;
+        if model.residency.head_streamed && model.output.packed.is_none() {
+            model.file.release(model.output.offset, model.output.len);
+        }
         self.profiler.lap(7);
         Ok(())
     }
