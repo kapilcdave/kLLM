@@ -402,3 +402,188 @@ extern "C" __global__ void attention(const float* q, const u16* k_cache, const u
         o[i] = acc * inv;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Coalesced matvecs over a struct-of-arrays weight layout.
+//
+// The row-major GGML kernels above walk a whole block per lane with byte
+// loads, which neither coalesces nor uses the load width; on a clock-starved
+// GPU they reach under 1 GB/s. Here the host splits each matrix into aligned
+// arrays (quants apart from scales) on upload, lanes share a block and issue
+// aligned 32-bit loads, integers become floats with a byte permute and one
+// subtraction (Maxwell's int->float convert runs at quarter rate), and one
+// pass over the weights serves N activation columns.
+//
+// grid = (ceil(rows / 4), ceil(batch / N)), block = 128 (one warp per row).
+
+// Float with value 2^23 + byte i of `v`: PRMT builds the bit pattern
+// 0x4B0000vv. Subtract (2^23 + offset) to get `byte - offset`.
+__device__ __forceinline__ float byte_float(u32 v, int i) {
+    return __int_as_float(__byte_perm(v, 0x4B000000u, 0x7540 + i));
+}
+
+#define SOA_PROLOGUE                                                          \
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;                     \
+    int row = blockIdx.x * ROWS_PER_BLOCK + warp;                             \
+    if (row >= rows) return;                                                  \
+    int col0 = blockIdx.y * N;                                                \
+    float acc[N];                                                             \
+    _Pragma("unroll") for (int n = 0; n < N; n++) acc[n] = 0.0f;
+
+#define SOA_EPILOGUE                                                          \
+    _Pragma("unroll") for (int n = 0; n < N; n++) {                           \
+        float s = warp_sum(acc[n]);                                           \
+        if (lane == 0 && col0 + n < batch) y[(size_t)(col0 + n) * rows + row] = s; \
+    }
+
+// Q4_0: quants [rows * nb][16 B], scales [rows * nb] f16.
+// Four lanes per block (4 bytes = elements 4c..4c+3 and 16+4c..16+4c+3).
+template <int N>
+__device__ void mv_q4_0(const u8* qs, const u16* sc, const float* x, float* y, int rows, int cols,
+                        int batch) {
+    SOA_PROLOGUE
+    int nb = cols / 32, c = lane & 3;
+    for (int base = 0; base < nb; base += 8) {
+        int b = base + (lane >> 2);
+        if (b >= nb) continue;
+        size_t blk = (size_t)row * nb + b;
+        u32 q = *(const u32*)(qs + blk * 16 + 4 * c);
+        u32 lo = q & 0x0F0F0F0Fu, hi = (q >> 4) & 0x0F0F0F0Fu;
+        float d = h2f(sc[blk]);
+        float wl[4], wh[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            wl[i] = byte_float(lo, i) - 8388616.0f; // 2^23 + 8
+            wh[i] = byte_float(hi, i) - 8388616.0f;
+        }
+#pragma unroll
+        for (int n = 0; n < N; n++) {
+            if (col0 + n >= batch) break;
+            const float* xb = x + (size_t)(col0 + n) * cols + b * 32;
+            float4 a = *(const float4*)(xb + 4 * c);
+            float4 e = *(const float4*)(xb + 16 + 4 * c);
+            float s = wl[0] * a.x + wl[1] * a.y + wl[2] * a.z + wl[3] * a.w + wh[0] * e.x +
+                      wh[1] * e.y + wh[2] * e.z + wh[3] * e.w;
+            acc[n] += d * s;
+        }
+    }
+    SOA_EPILOGUE
+}
+
+// Q8_0: quants [rows * nb][32 B], scales [rows * nb] f16. Eight lanes per block.
+template <int N>
+__device__ void mv_q8_0(const u8* qs, const u16* sc, const float* x, float* y, int rows, int cols,
+                        int batch) {
+    SOA_PROLOGUE
+    int nb = cols / 32, c = lane & 7;
+    for (int base = 0; base < nb; base += 4) {
+        int b = base + (lane >> 3);
+        if (b >= nb) continue;
+        size_t blk = (size_t)row * nb + b;
+        u32 q = *(const u32*)(qs + blk * 32 + 4 * c) ^ 0x80808080u; // signed -> biased
+        float d = h2f(sc[blk]);
+        float w[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) w[i] = byte_float(q, i) - 8388736.0f; // 2^23 + 128
+#pragma unroll
+        for (int n = 0; n < N; n++) {
+            if (col0 + n >= batch) break;
+            float4 a = *(const float4*)(x + (size_t)(col0 + n) * cols + b * 32 + 4 * c);
+            acc[n] += d * (w[0] * a.x + w[1] * a.y + w[2] * a.z + w[3] * a.w);
+        }
+    }
+    SOA_EPILOGUE
+}
+
+// Q4_K: quants [rows * nb][128 B], meta [rows * nb][16 B] = d, dmin, scales[12].
+// One warp per 256-element block: lane t holds qs[4t..4t+4], i.e. elements
+// 4(t%8).. of sub-blocks 2(t/8) (low nibbles) and 2(t/8)+1 (high nibbles).
+template <int N>
+__device__ void mv_q4_k(const u8* qs, const u8* meta, const float* x, float* y, int rows, int cols,
+                        int batch) {
+    SOA_PROLOGUE
+    int nb = cols / 256, k = lane >> 3, l = 4 * (lane & 7);
+    for (int b = 0; b < nb; b++) {
+        size_t blk = (size_t)row * nb + b;
+        const u8* m = meta + blk * 16;
+        float d = h2f(ld16(m)), dmin = h2f(ld16(m + 2));
+        int sc1, m1, sc2, m2;
+        scale_min_k4(2 * k, m + 4, &sc1, &m1);
+        scale_min_k4(2 * k + 1, m + 4, &sc2, &m2);
+        u32 q = *(const u32*)(qs + blk * 128 + 4 * lane);
+        u32 lo = q & 0x0F0F0F0Fu, hi = (q >> 4) & 0x0F0F0F0Fu;
+        float wl[4], wh[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            wl[i] = byte_float(lo, i) - 8388608.0f;
+            wh[i] = byte_float(hi, i) - 8388608.0f;
+        }
+        float dl = d * sc1, ml = dmin * m1, dh = d * sc2, mh = dmin * m2;
+#pragma unroll
+        for (int n = 0; n < N; n++) {
+            if (col0 + n >= batch) break;
+            const float* xb = x + (size_t)(col0 + n) * cols + b * 256 + 64 * k + l;
+            float4 a = *(const float4*)xb;
+            float4 e = *(const float4*)(xb + 32);
+            float sl = wl[0] * a.x + wl[1] * a.y + wl[2] * a.z + wl[3] * a.w;
+            float sh = wh[0] * e.x + wh[1] * e.y + wh[2] * e.z + wh[3] * e.w;
+            float xl = a.x + a.y + a.z + a.w, xh = e.x + e.y + e.z + e.w;
+            acc[n] += dl * sl - ml * xl + dh * sh - mh * xh;
+        }
+    }
+    SOA_EPILOGUE
+}
+
+// Q6_K: ql [rows * nb][128 B], qh [rows * nb][64 B], meta [rows * nb][32 B] =
+// i8 scales[16], f16 d. Lane t takes half n = t / 16 and positions l, l + 1
+// with l = 2 (t % 16); each position yields four elements (l, l+32, l+64,
+// l+96 within the half).
+template <int N>
+__device__ void mv_q6_k(const u8* ql, const u8* qh, const u8* meta, const float* x, float* y,
+                        int rows, int cols, int batch) {
+    SOA_PROLOGUE
+    int nb = cols / 256, half = lane >> 4, l = 2 * (lane & 15);
+    for (int b = 0; b < nb; b++) {
+        size_t blk = (size_t)row * nb + b;
+        const u8* m = meta + blk * 32;
+        const i8* sc = (const i8*)m + 8 * half + l / 16;
+        float d = h2f(ld16(m + 16));
+        u32 a0 = *(const u16*)(ql + blk * 128 + 64 * half + l);      // positions l, l+1
+        u32 a1 = *(const u16*)(ql + blk * 128 + 64 * half + 32 + l); // l+32, l+33
+        u32 h = *(const u16*)(qh + blk * 64 + 32 * half + l);
+        // Assemble the 6-bit values of the four element groups, two per byte pair.
+        u32 g0 = (a0 & 0x0F0Fu) | ((h & 0x0303u) << 4);
+        u32 g1 = (a1 & 0x0F0Fu) | (((h >> 2) & 0x0303u) << 4);
+        u32 g2 = ((a0 >> 4) & 0x0F0Fu) | (((h >> 4) & 0x0303u) << 4);
+        u32 g3 = ((a1 >> 4) & 0x0F0Fu) | (((h >> 6) & 0x0303u) << 4);
+        float w[4][2];
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            w[0][i] = byte_float(g0, i) - 8388640.0f; // 2^23 + 32
+            w[1][i] = byte_float(g1, i) - 8388640.0f;
+            w[2][i] = byte_float(g2, i) - 8388640.0f;
+            w[3][i] = byte_float(g3, i) - 8388640.0f;
+        }
+        float s0 = d * sc[0], s1 = d * sc[2], s2 = d * sc[4], s3 = d * sc[6];
+#pragma unroll
+        for (int n = 0; n < N; n++) {
+            if (col0 + n >= batch) break;
+            const float* xb = x + (size_t)(col0 + n) * cols + b * 256 + 128 * half + l;
+            float2 e0 = *(const float2*)xb, e1 = *(const float2*)(xb + 32);
+            float2 e2 = *(const float2*)(xb + 64), e3 = *(const float2*)(xb + 96);
+            acc[n] += s0 * (w[0][0] * e0.x + w[0][1] * e0.y) + s1 * (w[1][0] * e1.x + w[1][1] * e1.y) +
+                      s2 * (w[2][0] * e2.x + w[2][1] * e2.y) + s3 * (w[3][0] * e3.x + w[3][1] * e3.y);
+        }
+    }
+    SOA_EPILOGUE
+}
+
+// Entry points: (a, b, c) are the layout regions, unused ones ignored.
+extern "C" __global__ void soa_q4_0_1(const u8* a, const u8* b, const u8* c, const float* x, float* y, int rows, int cols, int batch) { mv_q4_0<1>(a, (const u16*)b, x, y, rows, cols, batch); }
+extern "C" __global__ void soa_q4_0_4(const u8* a, const u8* b, const u8* c, const float* x, float* y, int rows, int cols, int batch) { mv_q4_0<4>(a, (const u16*)b, x, y, rows, cols, batch); }
+extern "C" __global__ void soa_q8_0_1(const u8* a, const u8* b, const u8* c, const float* x, float* y, int rows, int cols, int batch) { mv_q8_0<1>(a, (const u16*)b, x, y, rows, cols, batch); }
+extern "C" __global__ void soa_q8_0_4(const u8* a, const u8* b, const u8* c, const float* x, float* y, int rows, int cols, int batch) { mv_q8_0<4>(a, (const u16*)b, x, y, rows, cols, batch); }
+extern "C" __global__ void soa_q4_k_1(const u8* a, const u8* b, const u8* c, const float* x, float* y, int rows, int cols, int batch) { mv_q4_k<1>(a, b, x, y, rows, cols, batch); }
+extern "C" __global__ void soa_q4_k_4(const u8* a, const u8* b, const u8* c, const float* x, float* y, int rows, int cols, int batch) { mv_q4_k<4>(a, b, x, y, rows, cols, batch); }
+extern "C" __global__ void soa_q6_k_1(const u8* a, const u8* b, const u8* c, const float* x, float* y, int rows, int cols, int batch) { mv_q6_k<1>(a, b, c, x, y, rows, cols, batch); }
+extern "C" __global__ void soa_q6_k_4(const u8* a, const u8* b, const u8* c, const float* x, float* y, int rows, int cols, int batch) { mv_q6_k<4>(a, b, c, x, y, rows, cols, batch); }
