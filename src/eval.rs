@@ -46,7 +46,7 @@ pub fn perplexity(
     }
     let first = n_ctx / 2;
     let vocab = model.config.n_vocab;
-    let mut session = model.new_session(n_ctx, n_ctx);
+    let mut session = model.new_session(n_ctx, n_ctx)?;
     let mut nlls = Vec::with_capacity(chunks * (n_ctx - 1 - first));
     for chunk in 0..chunks {
         let mut batch = tokens[chunk * n_ctx..(chunk + 1) * n_ctx].to_vec();
@@ -169,8 +169,8 @@ pub fn divergence(
         )));
     }
     let first = n_ctx / 2;
-    let mut reference_session = reference.new_session(n_ctx, n_ctx);
-    let mut test_session = test.new_session(n_ctx, n_ctx);
+    let mut reference_session = reference.new_session(n_ctx, n_ctx)?;
+    let mut test_session = test.new_session(n_ctx, n_ctx)?;
     let mut kls: Vec<f64> = Vec::with_capacity(chunks * (n_ctx - 1 - first));
     let (mut top1, mut top5) = (0_usize, 0_usize);
     let (mut reference_nll, mut test_nll) = (0.0_f64, 0.0_f64);

@@ -25,6 +25,7 @@ pub enum ModelError {
     Missing(String),
     Shape(String),
     ContextFull { context: usize },
+    Gpu(String),
     BadToken(u32),
 }
 
@@ -39,6 +40,7 @@ impl fmt::Display for ModelError {
             Self::ContextFull { context } => {
                 write!(f, "context window of {context} tokens is full")
             }
+            Self::Gpu(m) => write!(f, "GPU: {m}"),
             Self::BadToken(t) => write!(f, "token id {t} is outside the vocabulary"),
         }
     }
@@ -220,6 +222,11 @@ struct Layer {
     w_down: Weight,
 }
 
+#[cfg(feature = "cuda")]
+mod gpu;
+#[cfg(feature = "cuda")]
+pub use gpu::Offload;
+
 pub struct Model {
     file: GgufFile,
     pub config: Config,
@@ -231,6 +238,9 @@ pub struct Model {
     /// x8-repacked weight copies (see `kernels::repack_x8`).
     packed: Vec<Vec<u8>>,
     backend: CpuBackend,
+    /// Blocks (and head) offloaded to a GPU, if any.
+    #[cfg(feature = "cuda")]
+    gpu: Option<gpu::GpuStack>,
 }
 
 impl Model {
@@ -291,6 +301,8 @@ impl Model {
             rope_freq_factors,
             packed,
             backend: CpuBackend,
+            #[cfg(feature = "cuda")]
+            gpu: None,
         })
     }
 
@@ -354,8 +366,17 @@ impl Model {
         kinds
     }
 
-    pub fn new_session(&self, context: usize, max_batch: usize) -> Session<'_> {
+    pub fn new_session(&self, context: usize, max_batch: usize) -> Result<Session<'_>, ModelError> {
         Session::new(self, context, max_batch)
+    }
+
+    /// Blocks that run on the CPU (all of them unless some were offloaded).
+    pub fn cpu_layers(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        if let Some(stack) = &self.gpu {
+            return stack.first;
+        }
+        self.config.n_layer
     }
 }
 
@@ -502,15 +523,24 @@ pub struct Session<'m> {
     logits: Vec<f32>,
     all_logits: Vec<f32>,
     pub profiler: Profiler,
+    #[cfg(feature = "cuda")]
+    gpu: Option<gpu::GpuState>,
 }
 
 impl<'m> Session<'m> {
-    fn new(model: &'m Model, context: usize, max_batch: usize) -> Self {
+    fn new(model: &'m Model, context: usize, max_batch: usize) -> Result<Self, ModelError> {
         let c = &model.config;
         let context = context.max(1);
         let b = max_batch.clamp(1, context);
-        let cache = c.n_layer * context * c.kv_dim();
-        Self {
+        // Offloaded blocks keep their KV cache in VRAM.
+        let cache = model.cpu_layers() * context * c.kv_dim();
+        #[cfg(feature = "cuda")]
+        let gpu = model
+            .gpu
+            .as_ref()
+            .map(|stack| gpu::GpuState::new(stack, c, context, b))
+            .transpose()?;
+        Ok(Self {
             model,
             context,
             max_batch: b,
@@ -535,7 +565,9 @@ impl<'m> Session<'m> {
                 last: Instant::now(),
                 totals: [Duration::ZERO; 8],
             },
-        }
+            #[cfg(feature = "cuda")]
+            gpu,
+        })
     }
 
     pub fn set_profiling(&mut self, enabled: bool) {
@@ -666,7 +698,7 @@ impl<'m> Session<'m> {
         let layer_stride = self.context * kvd;
         let query_block = query_block(c, n, crate::pool::global().threads());
 
-        for (li, layer) in model.layers.iter().enumerate() {
+        for (li, layer) in model.layers.iter().enumerate().take(model.cpu_layers()) {
             // --- attention ---
             for i in 0..n {
                 let (x, xn) = (
@@ -862,7 +894,15 @@ impl<'m> Session<'m> {
             self.profiler.lap(6);
             add_assign(&mut self.x[..n * d], &self.proj[..n * d]);
         }
+        #[cfg(feature = "cuda")]
+        let logits_done = self.forward_gpu(n, start, rows)?;
+        #[cfg(not(feature = "cuda"))]
+        let logits_done = false;
         self.pos += n;
+        if logits_done {
+            self.profiler.lap(7);
+            return Ok(());
+        }
 
         let first = match rows {
             Rows::None => return Ok(()),

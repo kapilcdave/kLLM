@@ -70,7 +70,7 @@ fn check(
             "prompt tokens for {prompt:?}"
         );
 
-        let mut session = model.new_session(512, 64);
+        let mut session = model.new_session(512, 64).unwrap();
         let mut logits = session.forward(&prompt_ids, Logits::Last).unwrap().to_vec();
         let steps = case["steps"].as_array().unwrap();
         let (mut matched, mut errors, mut top1) = (0, Vec::new(), 0.0_f64);
