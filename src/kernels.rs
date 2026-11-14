@@ -188,6 +188,7 @@ pub fn dot(kind: GgmlType, row: &[u8], x: &Prepared<'_>) -> f32 {
             match (kind, x) {
                 (GgmlType::F32, Prepared::F32(x)) => return avx2::dot_f32(row, x),
                 (GgmlType::F16, Prepared::F32(x)) => return avx2::dot_f16(row, x),
+                (GgmlType::BF16, Prepared::F32(x)) => return avx2::dot_bf16(row, x),
                 (GgmlType::Q4_0, Prepared::Q8_0(x)) => return avx2::q4_0_n(row, [x])[0],
                 (GgmlType::Q8_0, Prepared::Q8_0(x)) => return avx2::q8_0_n(row, [x])[0],
                 (GgmlType::Q4_1, Prepared::Q8_0(x)) => return avx2::q4_1_n(row, [x])[0],
@@ -229,10 +230,10 @@ pub fn dot_multi(
                     _ => 0,
                 });
                 scratch.resize(cols, 0.0);
-                if kind == GgmlType::F16 {
-                    load_f16(row, scratch);
-                } else {
-                    crate::quant::dequantize_row(kind, row, scratch);
+                match kind {
+                    GgmlType::F16 => load_f16(row, scratch),
+                    GgmlType::BF16 => load_bf16(row, scratch),
+                    _ => crate::quant::dequantize_row(kind, row, scratch),
                 }
                 for (o, x) in out.iter_mut().zip(xs) {
                     let Prepared::F32(x) = x else { unreachable!() };
@@ -722,6 +723,20 @@ pub fn load_f16(src: &[u8], dst: &mut [f32]) {
     }
     for (d, b) in dst[done..].iter_mut().zip(src[done * 2..].chunks_exact(2)) {
         *d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+    }
+}
+
+/// Widen bf16 bits to f32 in bulk.
+pub fn load_bf16(src: &[u8], dst: &mut [f32]) {
+    debug_assert_eq!(src.len(), dst.len() * 2);
+    let mut done = 0;
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        // SAFETY: features detected; only whole 8-lane chunks are touched.
+        done = unsafe { avx2::load_bf16(src, dst) };
+    }
+    for (d, b) in dst[done..].iter_mut().zip(src[done * 2..].chunks_exact(2)) {
+        *d = bf16_to_f32(u16::from_le_bytes([b[0], b[1]]));
     }
 }
 
@@ -1712,6 +1727,52 @@ mod avx2 {
             _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_cvtph_ps(h));
         }
         n
+    }
+
+    /// bf16 is the top half of an f32, so widening is a shift, not a
+    /// conversion -- no f16c needed and exact by construction.
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c")]
+    unsafe fn bf16x8(p: *const u8) -> __m256 {
+        let bits = _mm256_cvtepu16_epi32(_mm_loadu_si128(p as *const __m128i));
+        _mm256_castsi256_ps(_mm256_slli_epi32(bits, 16))
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn load_bf16(src: &[u8], dst: &mut [f32]) -> usize {
+        let n = dst.len() / 8 * 8;
+        for i in (0..n).step_by(8) {
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i), bf16x8(src.as_ptr().add(2 * i)));
+        }
+        n
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn dot_bf16(row: &[u8], x: &[f32]) -> f32 {
+        let n = x.len();
+        let w = row.as_ptr();
+        let mut acc = [_mm256_setzero_ps(); 4];
+        let mut i = 0;
+        while i + 32 <= n {
+            for (k, a) in acc.iter_mut().enumerate() {
+                *a = _mm256_fmadd_ps(
+                    bf16x8(w.add(2 * (i + 8 * k))),
+                    _mm256_loadu_ps(x.as_ptr().add(i + 8 * k)),
+                    *a,
+                );
+            }
+            i += 32;
+        }
+        let mut sum = hsum(_mm256_add_ps(
+            _mm256_add_ps(acc[0], acc[1]),
+            _mm256_add_ps(acc[2], acc[3]),
+        ));
+        while i < n {
+            sum += crate::quant::bf16_to_f32(std::ptr::read_unaligned(w.add(2 * i) as *const u16))
+                * x[i];
+            i += 1;
+        }
+        sum
     }
 
     /// f32 · f32 (used after dequantizing a row once for several columns).
