@@ -1,6 +1,6 @@
-# KLLM
+# kLLM
 
-KLLM (Kapil LLM) is a memory-first inference engine in Rust for quantized
+kLLM (Kapil LLM) is a memory-first inference engine in Rust for quantized
 language models on older, memory-constrained GPUs.
 
 The first executable milestone is a deterministic memory planner. It divides a

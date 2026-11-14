@@ -1,8 +1,8 @@
-# KLLM roadmap
+# kLLM roadmap
 
 ## Current release: 0.1
 
-The 0.1 line proves that KLLM can inspect a model, plan memory conservatively,
+The 0.1 line proves that kLLM can inspect a model, plan memory conservatively,
 and execute a minimal Llama-family model without exceeding a configured budget.
 
 | Milestone | Deliverable | Exit condition | Status |

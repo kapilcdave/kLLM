@@ -48,7 +48,7 @@ fn run_plan(args: &[String]) -> Result<(), String> {
     };
     let result = plan(input).map_err(|error| error.to_string())?;
 
-    println!("KLLM memory plan");
+    println!("kLLM memory plan");
     println!("  model weights:    {:>6.2} GiB", gib(input.model_bytes));
     println!("  VRAM limit:       {:>6.2} GiB", gib(input.vram_bytes));
     println!(
@@ -86,7 +86,7 @@ fn run_plan(args: &[String]) -> Result<(), String> {
 fn run_inspect(args: &[String]) -> Result<(), String> {
     let path = args.get(1).ok_or_else(|| "missing GGUF path".to_string())?;
     let info = inspect_file(path).map_err(|error| error.to_string())?;
-    println!("KLLM GGUF inspection");
+    println!("kLLM GGUF inspection");
     println!("  version:          {}", info.version);
     println!(
         "  architecture:     {}",
@@ -122,7 +122,7 @@ fn run_plan_model(args: &[String]) -> Result<(), String> {
     let path = args.get(1).ok_or_else(|| "missing GGUF path".to_string())?;
     let info = inspect_file(path).map_err(|error| error.to_string())?;
     let model_bytes = info.known_weight_bytes().ok_or_else(|| {
-        "model contains a GGML tensor type whose size KLLM does not know".to_string()
+        "model contains a GGML tensor type whose size kLLM does not know".to_string()
     })?;
     let layer_count = info
         .block_count
@@ -147,7 +147,7 @@ fn run_plan_model(args: &[String]) -> Result<(), String> {
 
 fn print_plan(input: PlanInput) -> Result<(), String> {
     let result = plan(input).map_err(|error| error.to_string())?;
-    println!("KLLM memory plan");
+    println!("kLLM memory plan");
     println!("  model weights:    {:>6.2} GiB", gib(input.model_bytes));
     println!("  VRAM limit:       {:>6.2} GiB", gib(input.vram_bytes));
     println!(

@@ -1,13 +1,13 @@
-# KLLM v0.1 specification
+# kLLM v0.1 specification
 
 ## 1. Product
 
-KLLM is a local LLM inference engine written in Rust. It targets machines with
+kLLM is a local LLM inference engine written in Rust. It targets machines with
 older NVIDIA GPUs, no tensor cores, small VRAM pools, and substantially more
 system RAM than VRAM. Its initial reference machine is a Dell Precision 5520
 with a 4 GiB NVIDIA Quadro M1200.
 
-KLLM does not promise that an arbitrarily large dense model will run quickly in
+kLLM does not promise that an arbitrarily large dense model will run quickly in
 4 GiB. It makes the capacity/speed trade-off explicit and predictable by
 quantizing weights, placing only selected layers on the GPU, and budgeting every
 large allocation before inference starts.
@@ -24,7 +24,7 @@ kllm serve model.gguf --host 127.0.0.1 --port 8080
 ```
 
 `plan` must work without CUDA. `run` must print its chosen memory plan before
-allocating model buffers. If the requested configuration cannot fit, KLLM must
+allocating model buffers. If the requested configuration cannot fit, kLLM must
 return a useful error containing the estimated shortfall and safe settings.
 
 ## 3. v0.1 scope

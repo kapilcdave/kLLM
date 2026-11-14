@@ -1,4 +1,4 @@
-//! Core types for KLLM.
+//! Core types for kLLM.
 
 pub mod gguf;
 pub mod planner;
