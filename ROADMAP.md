@@ -17,18 +17,19 @@ and execute Llama-family models without exceeding a configured budget.
 
 ## Immediate work queue
 
-1. **Decode bandwidth.** Decode is the remaining gap: 81-90% of llama.cpp,
-   where prefill is now 1.2-1.7x. It is bandwidth-bound and reaches about
-   17.8 GB/s against llama.cpp's 20.8 on the same machine, scaling 1.48x on
-   four threads where pure compute scales 3.88x. Software prefetching the next
-   weight group made it slightly worse, so the stream itself is fine. Two
+1. **Decode bandwidth.** Decode is now parity or better on most types
+   (Q8_0 1.18x, Q6_K 1.14x, Q4_0 1.05x) but trails on the K-quants that
+   matter most: Qwen3-0.6B Q4_K_M at 0.88x and Q5_K_M at 0.94x. It is
+   bandwidth-bound and scales 1.48x on four threads where pure compute
+   scales 3.88x. Software prefetching the next weight group made it slightly
+   worse, so the stream itself is fine. Two
    things left to try: a single contiguous arena for the x8-repacked weights
    instead of one allocation per tensor (210 of them per token, so the TLB
    takes ~21k misses that 2 MiB pages would remove — worth about 3% by
    estimate), and shrinking the Q4_K x8 layout, which is 1248 bytes per eight
    rows against 1152 row-major: in a bandwidth-bound loop that 8.3% is paid
    directly, and storing the unpacked mins as `i8` rather than `i16` would
-   recover most of it.
+   recover most of it. That one is aimed straight at the Q4_K/Q5_K gap.
 2. **Hybrid execution (M6).** Run the planner's GPU suffix of layers plus the
    output head on the device; one activation transfer each way per token.
    Before building it, note what `examples/gpu_bench` measured on the
@@ -41,10 +42,16 @@ and execute Llama-family models without exceeding a configured budget.
    1150 MHz — while its memory stays at full 2505 MHz, so GPU work here is
    instruction-starved rather than bandwidth-starved, and kernels should be
    judged on instructions per byte.
-3. **Q3_K kernels**, the remaining common K-quant.
-4. **More architectures**: Gemma, Phi-3, and the hybrid Qwen3.5, whose
+3. **Prefill for the float types.** F16 and BF16 prefill run at 0.58-0.61x
+   of llama.cpp while every quantized type is now ahead of it (1.22-1.65x). The x8 packing
+   covers only Q4_0, Q8_0, Q4_K and Q6_K, so a float row is dequantized to f32
+   and then reduced once per activation column; llama.cpp runs an f16 GEMM at
+   half the bytes with register tiling. Decode for these types is fine
+   (1.0x), so this is specifically the batched path.
+4. **Q3_K kernels**, the remaining common K-quant.
+5. **More architectures**: Gemma, Phi-3, and the hybrid Qwen3.5, whose
    linear-attention layers need new kernels.
-5. `serve`: an OpenAI-compatible local HTTP endpoint (spec milestone 8).
+6. `serve`: an OpenAI-compatible local HTTP endpoint (spec milestone 8).
 
 ## Closed
 
@@ -53,9 +60,13 @@ and execute Llama-family models without exceeding a configured budget.
   packed kernel runs at ~22 MAC/cycle, near the `vpmaddubsw` port limit. The
   bottleneck was that activation quantization ran on the calling thread before
   any worker woke: 48% of a 1536x576 matmul and 71% of a 576x1536 one. Making
-  it parallel and then vectorizing it took prefill to 1.2-1.7x llama.cpp.
+  it parallel and then vectorizing it took prefill to 1.22-1.65x llama.cpp on
+  every quantized type. See `evals/` for the full table.
 - **Real-model checks** for every weight type, by perplexity and KL
-  divergence (`tests/divergence.rs`).
+  divergence (`tests/divergence.rs`). This is what found the two weight types
+  that were quietly running on scalar code -- BF16 (no entry in the AVX2
+  dispatch) and Q2_K (no kernel against quantized activations at all, which
+  also explained a 2.3% perplexity gap previously written off as noise).
 
 ## Release gates
 

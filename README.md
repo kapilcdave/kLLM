@@ -98,19 +98,36 @@ spread.
 
 Same machine, 4 threads, `kllm bench MODEL -p 128 -n 64 -t 4 -r 3` against
 `llama-bench -t 4 -p 128 -n 64 -r 3` (llama.cpp b12099 CPU build), tokens per
-second. Run-to-run noise on this laptop is about ±10%.
+second, best of three. The full table with model hashes and the exact commands
+is in [evals/](evals/); regenerate it with `scripts/eval_report.py`.
 
-| Model (sha256 prefix) | Prefill (pp128) llama.cpp / kLLM | Decode (tg64) llama.cpp / kLLM |
-|---|---|---|
-| SmolLM2-135M F16 (`f535f83e`) | 613 / 311 | 82.0 / 82.6 |
-| SmolLM2-135M Q8_0 (`5a139571`) | 688 / 352 | 146 / 117 |
-| SmolLM2-135M Q4_0 (`bcc3af28`) | 760 / 333 | 199 / 135 |
-| Qwen3-0.6B Q4_K_M (`ac2d9771`) | 230 / 120 | 52.5 / 41.1 |
+| Model | pp128 kLLM / llama.cpp | ratio | tg64 kLLM / llama.cpp | ratio |
+|---|---|---|---|---|
+| SmolLM2-135M Q4_0 | 1145 / 750 | 1.53x | 229 / 219 | 1.05x |
+| SmolLM2-135M Q8_0 | 1060 / 658 | 1.61x | 165 / 140 | 1.18x |
+| SmolLM2-135M Q6_K | 988 / 667 | 1.48x | 165 / 145 | 1.14x |
+| SmolLM2-135M Q2_K | 1089 / 814 | 1.34x | 247 / 244 | 1.01x |
+| SmolLM2-135M Q5_K_M | 462 / 352 | 1.31x | 157 / 167 | 0.94x |
+| SmolLM2-135M f16 | 282 / 484 | 0.58x | 85 / 82 | 1.04x |
+| Qwen3-0.6B Q4_K_M | 324 / 266 | 1.22x | 48.3 / 55.2 | 0.88x |
+| Qwen3-0.6B Q8_0 | 284 / 184 | 1.54x | 36.4 / 37.0 | 0.98x |
 
-Decode is at 68–100% of llama.cpp. Prefill is at about half: kLLM's batched
-kernels unpack each weight block once per eight activation columns but still
-reduce every (row, column) pair separately, where llama.cpp uses row-
-interleaved GEMM tiles. `kllm bench --profile` prints a per-phase breakdown.
+Prefill is ahead of llama.cpp on every quantized type (1.22-1.65x) and behind
+on the two float types (0.58-0.61x), which have no x8-packed layout and so get
+a row dequantized to f32 and reduced once per activation column. Decode is
+parity or better on most types and trails on the K-quants (Q4_K 0.88x); it is
+memory-bandwidth-bound, where prefill is compute-bound.
+
+Two notes on reading these numbers. Prefill was at 65% of llama.cpp until the
+real bottleneck turned up, and it was not the kernels: at *one* thread kLLM
+already beat llama.cpp, and the packed Q4_0 kernel runs near the
+`vpmaddubsw` port limit. Activation quantization was running on the calling
+thread while the workers idled — 71% of a 576x1536 matmul. And this machine
+usually has other work on it, so `kllm bench` reports the best run rather than
+the mean (interference can only ever slow a run down) and comparisons against
+llama.cpp are interleaved in the same window.
+
+`kllm bench --profile` prints a per-phase breakdown.
 
 ## Development
 
