@@ -448,23 +448,53 @@ pub fn axpy_f16(out: &mut [f32], a: f32, v: &[u16]) {
 // x8 packing: eight weight rows interleaved so that each 32-bit SIMD lane
 // holds one row. A single vector op then applies all eight row scales and the
 // eight results store directly, with no horizontal sums. This is the layout
-// trick behind llama.cpp's repacked CPU kernels.
+// trick behind llama.cpp's repacked CPU kernels. Packed blocks, per group of
+// eight rows and per block index (all multi-byte fields little-endian):
 //
-// Q4_0x8 block (144 bytes, same as 8 x 18): the eight f16 row scales, then
-// for m in 0..4 the bytes qs[4m..4m+4] of rows 0..7 in turn. A Q4_0 byte
-// qs[j] holds element j (low nibble) and element j + 16 (high nibble), so
-// lane r of chunk m carries elements 4m..4m+4 and 16+4m..16+4m+4 of row r.
+// Q4_0x8 (144 B = 8 x 18): f16 d[8]; then for m in 0..4 the bytes
+//   qs[4m..4m+4] of rows 0..7. A Q4_0 byte qs[j] holds elements j (low
+//   nibble) and j + 16 (high), so lane r of chunk m carries elements
+//   4m..4m+4 and 16+4m..16+4m+4 of row r.
+// Q8_0x8 (272 B = 8 x 34): f16 d[8]; then for m in 0..8, qs[4m..4m+4] of
+//   rows 0..7.
+// Q4_Kx8 (1248 B, 8 x 144 + 96): f16 d[8], f16 dmin[8]; u8 scale[8 sub][8
+//   rows]; i16 (min[2p], min[2p+1]) pairs [4 p][8 rows]; then for k in 0..4,
+//   m in 0..8, qs[32k+4m..+4] of rows 0..7. The 6-bit scales and mins are
+//   unpacked once here instead of on every block.
+// Q6_Kx8 (1680 B = 8 x 210): f16 d[8]; i8 scale[16 groups][8 rows]; then
+//   for c in 0..32, ql[4c..4c+4] of rows 0..7; then for c in 0..16,
+//   qh[4c..4c+4] of rows 0..7.
 
-/// Whether `kind` has an x8 layout and `rows` allows it.
-pub fn packable(kind: GgmlType, rows: usize) -> bool {
-    kind == GgmlType::Q4_0 && rows.is_multiple_of(8)
+/// Packed bytes per (group of eight rows, block index).
+fn packed_block_bytes(kind: GgmlType) -> Option<usize> {
+    match kind {
+        GgmlType::Q4_0 => Some(144),
+        GgmlType::Q8_0 => Some(272),
+        GgmlType::Q4K => Some(1248),
+        GgmlType::Q6K => Some(1680),
+        _ => None,
+    }
 }
 
-/// Packed size for `len` bytes of `kind` weights.
+/// Whether `kind` has an x8 layout and `rows` allows it. Packed kernels exist
+/// only for AVX2; without it the row-major scalar kernels are used.
+pub fn packable(kind: GgmlType, rows: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        has_avx2() && packed_block_bytes(kind).is_some() && rows.is_multiple_of(8)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (kind, rows);
+        false
+    }
+}
+
+/// Packed size for `len` bytes of row-major `kind` weights.
 pub fn packed_len(kind: GgmlType, len: usize) -> usize {
-    match kind {
-        GgmlType::Q4_0 => len,
-        _ => 0,
+    match packed_block_bytes(kind) {
+        Some(packed) => len / (8 * kind.block_bytes()) * packed,
+        None => 0,
     }
 }
 
@@ -475,17 +505,62 @@ pub fn repack_x8(kind: GgmlType, data: &[u8], rows: usize, cols: usize) -> Optio
         return None;
     }
     let row_bytes = kind.row_bytes(cols)?;
-    let blocks = row_bytes / 18;
-    let mut out = vec![0_u8; data.len()];
+    let bb = kind.block_bytes();
+    let pb = packed_block_bytes(kind)?;
+    let blocks = row_bytes / bb;
+    let mut out = vec![0_u8; packed_len(kind, data.len())];
     for group in 0..rows / 8 {
         for b in 0..blocks {
-            let dst = &mut out[(group * blocks + b) * 144..][..144];
-            for r in 0..8 {
-                let src = &data[(group * 8 + r) * row_bytes + b * 18..][..18];
-                dst[2 * r..2 * r + 2].copy_from_slice(&src[0..2]);
-                for m in 0..4 {
-                    dst[16 + 32 * m + 4 * r..][..4].copy_from_slice(&src[2 + 4 * m..][..4]);
+            let dst = &mut out[(group * blocks + b) * pb..][..pb];
+            let src = |r: usize| &data[(group * 8 + r) * row_bytes + b * bb..][..bb];
+            // Interleave `chunks` 4-byte chunks starting at `from` in each
+            // source block into `dst[at..]`.
+            let interleave = |dst: &mut [u8], at: usize, from: usize, chunks: usize| {
+                for c in 0..chunks {
+                    for r in 0..8 {
+                        dst[at + 32 * c + 4 * r..][..4]
+                            .copy_from_slice(&src(r)[from + 4 * c..][..4]);
+                    }
                 }
+            };
+            match kind {
+                GgmlType::Q4_0 | GgmlType::Q8_0 => {
+                    for r in 0..8 {
+                        dst[2 * r..2 * r + 2].copy_from_slice(&src(r)[0..2]);
+                    }
+                    interleave(dst, 16, 2, (bb - 2) / 4);
+                }
+                GgmlType::Q4K => {
+                    for r in 0..8 {
+                        let s = src(r);
+                        dst[2 * r..2 * r + 2].copy_from_slice(&s[0..2]);
+                        dst[16 + 2 * r..16 + 2 * r + 2].copy_from_slice(&s[2..4]);
+                        for j in 0..8 {
+                            let (sc, mn) = scale_min_k4(j, &s[4..16]);
+                            dst[32 + 8 * j + r] = sc;
+                            if j % 2 == 0 {
+                                let at = 96 + 32 * (j / 2) + 4 * r;
+                                dst[at..at + 2].copy_from_slice(&(mn as i16).to_le_bytes());
+                            } else {
+                                let at = 96 + 32 * (j / 2) + 4 * r + 2;
+                                dst[at..at + 2].copy_from_slice(&(mn as i16).to_le_bytes());
+                            }
+                        }
+                    }
+                    interleave(dst, 224, 16, 32);
+                }
+                GgmlType::Q6K => {
+                    for r in 0..8 {
+                        let s = src(r);
+                        dst[2 * r..2 * r + 2].copy_from_slice(&s[208..210]);
+                        for g in 0..16 {
+                            dst[16 + 8 * g + r] = s[192 + g];
+                        }
+                    }
+                    interleave(dst, 144, 0, 32);
+                    interleave(dst, 1168, 128, 16);
+                }
+                _ => unreachable!(),
             }
         }
     }
@@ -493,55 +568,50 @@ pub fn repack_x8(kind: GgmlType, data: &[u8], rows: usize, cols: usize) -> Optio
 }
 
 /// Eight rows (one packed group) against `xs.len()` columns:
-/// `out[c * 8 + r] = row_r · xs[c]`.
+/// `out[c * 8 + r] = row_r · xs[c]`. Only valid where [`packable`] holds.
 pub fn dot_x8(kind: GgmlType, group: &[u8], xs: &[Prepared<'_>], out: &mut [f32]) {
-    debug_assert_eq!(kind, GgmlType::Q4_0);
     debug_assert_eq!(out.len(), xs.len() * 8);
-    let col = |j: usize| match &xs[j] {
-        Prepared::Q8_0(v) => v.as_slice(),
-        _ => unreachable!("activation prepared for the wrong weight type"),
-    };
     #[cfg(target_arch = "x86_64")]
-    if has_avx2() {
-        // SAFETY: features detected; every column has one block per weight
-        // block (shapes validated by the backend).
-        unsafe {
-            let mut j = 0;
-            while j + 4 <= xs.len() {
-                let r = avx2::q4_0x8::<4>(group, [col(j), col(j + 1), col(j + 2), col(j + 3)]);
-                for (c, v) in r.iter().enumerate() {
-                    out[(j + c) * 8..(j + c + 1) * 8].copy_from_slice(v);
+    {
+        assert!(has_avx2(), "x8-packed weights need AVX2");
+        macro_rules! run {
+            ($variant:ident, $kernel:ident, $tile:literal) => {{
+                let col = |j: usize| match &xs[j] {
+                    Prepared::$variant(v) => v.as_slice(),
+                    _ => unreachable!("activation prepared for the wrong weight type"),
+                };
+                // SAFETY: AVX2 checked above; every column has one block per
+                // weight block (shapes validated by the backend).
+                unsafe {
+                    let mut j = 0;
+                    while j + $tile <= xs.len() {
+                        let cols: [&[_]; $tile] = std::array::from_fn(|c| col(j + c));
+                        let r = avx2::$kernel::<$tile>(group, cols);
+                        for (c, v) in r.iter().enumerate() {
+                            out[(j + c) * 8..(j + c + 1) * 8].copy_from_slice(v);
+                        }
+                        j += $tile;
+                    }
+                    while j < xs.len() {
+                        let r = avx2::$kernel::<1>(group, [col(j)]);
+                        out[j * 8..(j + 1) * 8].copy_from_slice(&r[0]);
+                        j += 1;
+                    }
                 }
-                j += 4;
-            }
-            while j < xs.len() {
-                let r = avx2::q4_0x8::<1>(group, [col(j)]);
-                out[j * 8..(j + 1) * 8].copy_from_slice(&r[0]);
-                j += 1;
-            }
-            return;
+            }};
+        }
+        match kind {
+            GgmlType::Q4_0 => run!(Q8_0, q4_0x8, 4),
+            GgmlType::Q8_0 => run!(Q8_0, q8_0x8, 4),
+            GgmlType::Q4K => run!(Q8K, q4kx8, 2),
+            GgmlType::Q6K => run!(Q8K, q6kx8, 2),
+            other => unreachable!("{} has no x8 layout", other.name()),
         }
     }
-    for j in 0..xs.len() {
-        q4_0x8_scalar(group, col(j), &mut out[j * 8..(j + 1) * 8]);
-    }
-}
-
-fn q4_0x8_scalar(group: &[u8], x: &[BlockQ8_0], out: &mut [f32]) {
-    out.fill(0.0);
-    for (b, a) in x.iter().enumerate() {
-        let block = &group[b * 144..][..144];
-        for (r, o) in out.iter_mut().enumerate() {
-            let mut sum = 0_i32;
-            for m in 0..4 {
-                for t in 0..4 {
-                    let byte = block[16 + 32 * m + 4 * r + t];
-                    sum += ((byte & 0x0f) as i32 - 8) * a.qs[4 * m + t] as i32;
-                    sum += ((byte >> 4) as i32 - 8) * a.qs[16 + 4 * m + t] as i32;
-                }
-            }
-            *o += sum as f32 * half(block, 2 * r) * a.d;
-        }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (kind, group, xs, out);
+        unreachable!("x8 packing is AVX2-only");
     }
 }
 
@@ -1118,6 +1188,218 @@ mod avx2 {
         out
     }
 
+    /// `(sc, sc)` i16 pairs per lane from eight u8 or i8 scales.
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c")]
+    unsafe fn pair_u8(p: *const u8) -> __m256i {
+        let x = _mm256_cvtepu8_epi32(_mm_loadl_epi64(p as *const __m128i));
+        _mm256_or_si256(x, _mm256_slli_epi32(x, 16))
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c")]
+    unsafe fn pair_i8(p: *const u8) -> __m256i {
+        let x = _mm256_cvtepi8_epi32(_mm_loadl_epi64(p as *const __m128i));
+        _mm256_or_si256(
+            _mm256_and_si256(x, _mm256_set1_epi32(0xffff)),
+            _mm256_slli_epi32(x, 16),
+        )
+    }
+
+    /// Broadcast the i16 pair (lo, hi) to every 32-bit lane.
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c")]
+    unsafe fn pair16(lo: i32, hi: i32) -> __m256i {
+        _mm256_set1_epi32((hi << 16) | (lo & 0xffff))
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2,fma,f16c")]
+    unsafe fn bcast4(p: *const i8) -> __m256i {
+        _mm256_set1_epi32(std::ptr::read_unaligned(p as *const i32))
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn q8_0x8<const C: usize>(group: &[u8], xs: [&[BlockQ8_0]; C]) -> [[f32; 8]; C] {
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = [_mm256_setzero_ps(); C];
+        let g = group.as_ptr();
+        for b in 0..group.len() / 272 {
+            let block = g.add(b * 272);
+            let d = _mm256_cvtph_ps(_mm_loadu_si128(block as *const __m128i));
+            let mut sum = [_mm256_setzero_si256(); C];
+            for m in 0..8 {
+                let w = _mm256_loadu_si256(block.add(16 + 32 * m) as *const __m256i);
+                let aw = _mm256_sign_epi8(w, w);
+                for c in 0..C {
+                    let y = bcast4(xs[c].get_unchecked(b).qs.as_ptr().add(4 * m));
+                    let p = _mm256_maddubs_epi16(aw, _mm256_sign_epi8(y, w));
+                    sum[c] = _mm256_add_epi32(sum[c], _mm256_madd_epi16(p, ones));
+                }
+            }
+            for c in 0..C {
+                let a = xs[c].get_unchecked(b);
+                acc[c] = _mm256_fmadd_ps(
+                    _mm256_mul_ps(d, _mm256_set1_ps(a.d)),
+                    _mm256_cvtepi32_ps(sum[c]),
+                    acc[c],
+                );
+            }
+        }
+        let mut out = [[0.0_f32; 8]; C];
+        for c in 0..C {
+            _mm256_storeu_ps(out[c].as_mut_ptr(), acc[c]);
+        }
+        out
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn q4kx8<const C: usize>(group: &[u8], xs: [&[BlockQ8K]; C]) -> [[f32; 8]; C] {
+        let mask = _mm256_set1_epi8(0x0f);
+        let mut acc = [_mm256_setzero_ps(); C];
+        let g = group.as_ptr();
+        for b in 0..group.len() / 1248 {
+            let block = g.add(b * 1248);
+            let d = _mm256_cvtph_ps(_mm_loadu_si128(block as *const __m128i));
+            let dmin = _mm256_cvtph_ps(_mm_loadu_si128(block.add(16) as *const __m128i));
+            let qs = block.add(224);
+            let mut sumi = [_mm256_setzero_si256(); C];
+            for k in 0..4 {
+                // Eight maddubs of 4-bit x 8-bit stay within i16: 30480.
+                let mut slo = [_mm256_setzero_si256(); C];
+                let mut shi = [_mm256_setzero_si256(); C];
+                for m in 0..8 {
+                    let w = _mm256_loadu_si256(qs.add(256 * k + 32 * m) as *const __m256i);
+                    let lo = _mm256_and_si256(w, mask);
+                    let hi = _mm256_and_si256(_mm256_srli_epi16(w, 4), mask);
+                    for c in 0..C {
+                        let y = xs[c].get_unchecked(b).qs.as_ptr();
+                        slo[c] = _mm256_add_epi16(
+                            slo[c],
+                            _mm256_maddubs_epi16(lo, bcast4(y.add(64 * k + 4 * m))),
+                        );
+                        shi[c] = _mm256_add_epi16(
+                            shi[c],
+                            _mm256_maddubs_epi16(hi, bcast4(y.add(64 * k + 32 + 4 * m))),
+                        );
+                    }
+                }
+                let sc_lo = pair_u8(block.add(32 + 8 * (2 * k)));
+                let sc_hi = pair_u8(block.add(32 + 8 * (2 * k + 1)));
+                for c in 0..C {
+                    let p = _mm256_add_epi32(
+                        _mm256_madd_epi16(slo[c], sc_lo),
+                        _mm256_madd_epi16(shi[c], sc_hi),
+                    );
+                    sumi[c] = _mm256_add_epi32(sumi[c], p);
+                }
+            }
+            for c in 0..C {
+                let a = xs[c].get_unchecked(b);
+                let bsum = |j: usize| a.bsums[2 * j] as i32 + a.bsums[2 * j + 1] as i32;
+                let mut mins = _mm256_setzero_si256();
+                for p in 0..4 {
+                    let pairs = _mm256_loadu_si256(block.add(96 + 32 * p) as *const __m256i);
+                    mins = _mm256_add_epi32(
+                        mins,
+                        _mm256_madd_epi16(pairs, pair16(bsum(2 * p), bsum(2 * p + 1))),
+                    );
+                }
+                let ad = _mm256_set1_ps(a.d);
+                acc[c] = _mm256_fmadd_ps(_mm256_mul_ps(d, ad), _mm256_cvtepi32_ps(sumi[c]), acc[c]);
+                acc[c] =
+                    _mm256_fnmadd_ps(_mm256_mul_ps(dmin, ad), _mm256_cvtepi32_ps(mins), acc[c]);
+            }
+        }
+        let mut out = [[0.0_f32; 8]; C];
+        for c in 0..C {
+            _mm256_storeu_ps(out[c].as_mut_ptr(), acc[c]);
+        }
+        out
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn q6kx8<const C: usize>(group: &[u8], xs: [&[BlockQ8K]; C]) -> [[f32; 8]; C] {
+        let m4 = _mm256_set1_epi8(0x0f);
+        let m3 = _mm256_set1_epi8(3);
+        let mut acc = [_mm256_setzero_ps(); C];
+        let g = group.as_ptr();
+        for b in 0..group.len() / 1680 {
+            let block = g.add(b * 1680);
+            let d = _mm256_cvtph_ps(_mm_loadu_si128(block as *const __m128i));
+            let sc = block.add(16);
+            let ql = block.add(144);
+            let qh = block.add(1168);
+            let mut sumi = [_mm256_setzero_si256(); C];
+            for n in 0..2 {
+                // Element type 0..4 of this half: (ql chunk base, low/high
+                // nibble, qh shift, element offset).
+                for ty in 0..4 {
+                    let ql_base = 16 * n + if ty % 2 == 1 { 8 } else { 0 };
+                    let qh_shift = _mm_cvtsi32_si128(2 * ty as i32);
+                    let high_nibble = ty >= 2;
+                    let e_base = 128 * n + 32 * ty;
+                    for half in 0..2 {
+                        let scv = pair_i8(sc.add(8 * (8 * n + 2 * ty + half)));
+                        // Two maddubs of 6-bit x 8-bit stay within i16: 32004.
+                        for pair in 0..2 {
+                            let mut s16 = [_mm256_setzero_si256(); C];
+                            for t in 4 * half + 2 * pair..4 * half + 2 * pair + 2 {
+                                let l = _mm256_loadu_si256(
+                                    ql.add(32 * (ql_base + t)) as *const __m256i
+                                );
+                                let l = if high_nibble {
+                                    _mm256_srli_epi16(l, 4)
+                                } else {
+                                    l
+                                };
+                                let h =
+                                    _mm256_loadu_si256(qh.add(32 * (8 * n + t)) as *const __m256i);
+                                let h = _mm256_and_si256(_mm256_srl_epi16(h, qh_shift), m3);
+                                let q = _mm256_or_si256(
+                                    _mm256_and_si256(l, m4),
+                                    _mm256_slli_epi16(h, 4),
+                                );
+                                for c in 0..C {
+                                    let y = bcast4(
+                                        xs[c].get_unchecked(b).qs.as_ptr().add(e_base + 4 * t),
+                                    );
+                                    s16[c] = _mm256_add_epi16(s16[c], _mm256_maddubs_epi16(q, y));
+                                }
+                            }
+                            for c in 0..C {
+                                sumi[c] = _mm256_add_epi32(sumi[c], _mm256_madd_epi16(s16[c], scv));
+                            }
+                        }
+                    }
+                }
+            }
+            for c in 0..C {
+                let a = xs[c].get_unchecked(b);
+                // q was taken as unsigned 0..63: subtract 32 * sum(sc * y).
+                let mut corr = _mm256_setzero_si256();
+                for p in 0..8 {
+                    let lo = _mm_loadl_epi64(sc.add(8 * (2 * p)) as *const __m128i);
+                    let hi = _mm_loadl_epi64(sc.add(8 * (2 * p + 1)) as *const __m128i);
+                    let pairs = _mm256_cvtepi8_epi16(_mm_unpacklo_epi8(lo, hi));
+                    let bs = pair16(a.bsums[2 * p] as i32, a.bsums[2 * p + 1] as i32);
+                    corr = _mm256_add_epi32(corr, _mm256_madd_epi16(pairs, bs));
+                }
+                let total = _mm256_sub_epi32(sumi[c], _mm256_slli_epi32(corr, 5));
+                acc[c] = _mm256_fmadd_ps(
+                    _mm256_mul_ps(d, _mm256_set1_ps(a.d)),
+                    _mm256_cvtepi32_ps(total),
+                    acc[c],
+                );
+            }
+        }
+        let mut out = [[0.0_f32; 8]; C];
+        for c in 0..C {
+            _mm256_storeu_ps(out[c].as_mut_ptr(), acc[c]);
+        }
+        out
+    }
+
     /// exp(x) for 8 lanes: Cephes-style range reduction and degree-5
     /// polynomial, max relative error ~2 ulp on [-87, 88]; inputs below the
     /// range flush to 0, above saturate to f32::MAX.
@@ -1386,39 +1668,53 @@ mod tests {
 
     #[test]
     fn packed_x8_matches_row_major() {
+        if !packable(GgmlType::Q4_0, 8) {
+            return; // no AVX2: packing is disabled
+        }
         let mut seed = 5;
         let (rows, cols) = (24, 1024);
-        let values = input(rows * cols, &mut seed);
-        let data = quantize_q4_0(&values);
-        let packed = repack_x8(GgmlType::Q4_0, &data, rows, cols).unwrap();
-        assert_eq!(packed.len(), data.len());
-        let row_bytes = data.len() / rows;
-        for columns in [1, 3, 4, 6] {
-            let inputs: Vec<Vec<f32>> = (0..columns).map(|_| input(cols, &mut seed)).collect();
-            let prepared: Vec<Prepared> =
-                inputs.iter().map(|x| prepare(GgmlType::Q4_0, x)).collect();
-            for group in 0..rows / 8 {
-                let g = &packed[group * 8 * row_bytes..(group + 1) * 8 * row_bytes];
-                let mut out = vec![0.0; columns * 8];
-                dot_x8(GgmlType::Q4_0, g, &prepared, &mut out);
-                let mut scalar = vec![0.0; 8];
-                for (c, p) in prepared.iter().enumerate() {
-                    let Prepared::Q8_0(x) = p else { unreachable!() };
-                    q4_0x8_scalar(g, x, &mut scalar);
-                    for r in 0..8 {
-                        let row = &data[(group * 8 + r) * row_bytes..][..row_bytes];
-                        let reference = dot_scalar(GgmlType::Q4_0, row, p);
-                        let tol = 1e-4 * reference.abs().max(1.0);
-                        assert!(
-                            (out[c * 8 + r] - reference).abs() <= tol,
-                            "simd {} vs {reference}",
-                            out[c * 8 + r]
-                        );
-                        assert!(
-                            (scalar[r] - reference).abs() <= tol,
-                            "scalar {} vs {reference}",
-                            scalar[r]
-                        );
+        let cases: Vec<(GgmlType, Vec<u8>)> = vec![
+            (
+                GgmlType::Q4_0,
+                quantize_q4_0(&input(rows * cols, &mut seed)),
+            ),
+            (GgmlType::Q8_0, q8w(&input(rows * cols, &mut seed))),
+            (
+                GgmlType::Q4K,
+                (0..rows)
+                    .flat_map(|_| random_row(GgmlType::Q4K, &mut seed))
+                    .collect(),
+            ),
+            (
+                GgmlType::Q6K,
+                (0..rows)
+                    .flat_map(|_| random_row(GgmlType::Q6K, &mut seed))
+                    .collect(),
+            ),
+        ];
+        for (kind, data) in cases {
+            let packed = repack_x8(kind, &data, rows, cols).unwrap();
+            assert_eq!(packed.len(), packed_len(kind, data.len()));
+            let row_bytes = data.len() / rows;
+            let group_bytes = packed.len() / (rows / 8);
+            for columns in [1, 2, 3, 4, 5] {
+                let inputs: Vec<Vec<f32>> = (0..columns).map(|_| input(cols, &mut seed)).collect();
+                let prepared: Vec<Prepared> = inputs.iter().map(|x| prepare(kind, x)).collect();
+                for group in 0..rows / 8 {
+                    let g = &packed[group * group_bytes..(group + 1) * group_bytes];
+                    let mut out = vec![0.0; columns * 8];
+                    dot_x8(kind, g, &prepared, &mut out);
+                    for (c, p) in prepared.iter().enumerate() {
+                        for r in 0..8 {
+                            let row = &data[(group * 8 + r) * row_bytes..][..row_bytes];
+                            let reference = dot_scalar(kind, row, p);
+                            let got = out[c * 8 + r];
+                            assert!(
+                                (got - reference).abs() <= 1e-4 * reference.abs().max(1.0),
+                                "{} row {r} col {c}: packed {got} vs {reference}",
+                                kind.name()
+                            );
+                        }
                     }
                 }
             }
