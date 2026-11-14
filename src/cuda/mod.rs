@@ -446,6 +446,7 @@ impl Gpu {
     }
 
     /// `y[b] = W · x[b]` for `batch` columns; all pointers on the device.
+    #[allow(clippy::too_many_arguments)]
     pub fn matmul(
         &self,
         kind: GgmlType,

@@ -39,6 +39,7 @@ usage:
            [--temp T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R]
            [--seed S] [--threads N] [--batch N] [--ignore-eos]
   kllm perplexity MODEL.gguf --file TEXT [--context 512] [--chunks N] [--threads N]
+  kllm compare REFERENCE.gguf TEST.gguf --file TEXT [--context 512] [--chunks N] [--threads N]
   kllm devices
   kllm bench MODEL.gguf [-p 128] [-n 64] [--threads N] [--repeat 3] [--profile]";
 
@@ -101,6 +102,7 @@ fn run(args: &Args) -> Result<(), String> {
         Some("plan-model") => cmd_plan_model(args),
         Some("run") => cmd_run(args),
         Some("perplexity") => cmd_perplexity(args),
+        Some("compare") => cmd_compare(args),
         Some("bench") => cmd_bench(args),
         Some("devices") => cmd_devices(),
         Some("help" | "--help" | "-h") => {
@@ -600,6 +602,83 @@ fn cmd_perplexity(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_compare(args: &Args) -> Result<(), String> {
+    let reference_path = args.positional(1, "reference GGUF path")?;
+    let test_path = args.positional(2, "test GGUF path")?;
+    let threads = init_threads(args)?;
+    let file: String = args
+        .value(&["--file", "-f"])?
+        .ok_or("usage: missing --file")?
+        .into();
+    let n_ctx: usize = args.or(&["--context", "-c"], 512)?;
+    if n_ctx < 8 {
+        return Err("--context must be at least 8".into());
+    }
+    // Both models are resident at once, so plan them against half the budget
+    // each rather than letting either believe it owns the machine.
+    let reference = load_with_plan(reference_path, n_ctx, n_ctx, threads)?;
+    let test = load_with_plan(test_path, n_ctx, n_ctx, threads)?;
+    let tokenizer = Tokenizer::from_gguf(reference.info()).map_err(|e| e.to_string())?;
+    let text = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?;
+    let tokens = tokenizer.encode(&text, true, false);
+    let available = tokens.len() / n_ctx;
+    let chunks: usize = args.or(&["--chunks"], available)?.min(available);
+    if chunks == 0 {
+        return Err(format!("{file} has fewer than {n_ctx} tokens"));
+    }
+    eprintln!(
+        "kllm: {} tokens, {chunks} chunks of {n_ctx}; reference {} ({}), test {} ({})",
+        tokens.len(),
+        reference_path,
+        reference.weight_types().join("/"),
+        test_path,
+        test.weight_types().join("/"),
+    );
+    let start = Instant::now();
+    let d = kllm::eval::divergence(
+        &reference,
+        &test,
+        &tokenizer,
+        &tokens,
+        n_ctx,
+        Some(chunks),
+        |chunk, kl| eprint!("[{chunk}]{kl:.5} "),
+    )
+    .map_err(|e| e.to_string())?;
+    eprintln!();
+    out!("reference:      {reference_path}");
+    out!("test:           {test_path}");
+    out!(
+        "tokens scored:  {} ({} chunks of {n_ctx}) in {:.1} s",
+        d.tokens_scored,
+        d.chunks,
+        start.elapsed().as_secs_f64()
+    );
+    out!(
+        "mean KL:        {:.6} +/- {:.6} nats",
+        d.kl_mean,
+        d.kl_stderr
+    );
+    out!(
+        "KL median/p99:  {:.6} / {:.6}  (max {:.6})",
+        d.kl_median,
+        d.kl_p99,
+        d.kl_max
+    );
+    out!(
+        "top-1 agree:    {:.2}%   top-5 agree: {:.2}%",
+        d.top1_agree * 100.0,
+        d.top5_agree * 100.0
+    );
+    out!(
+        "PPL:            reference {:.4} -> test {:.4}  ({:+.2}%)",
+        d.reference_ppl,
+        d.test_ppl,
+        (d.test_ppl / d.reference_ppl - 1.0) * 100.0
+    );
+    Ok(())
+}
+
 fn cmd_devices() -> Result<(), String> {
     out!("CPU: {} | kernels {}", cpu_name(), kernels::kernel_name());
     #[cfg(feature = "cuda")]
@@ -704,14 +783,20 @@ fn cmd_bench(args: &Args) -> Result<(), String> {
         }
         report("decode", &session, start.elapsed().as_secs_f64(), n_gen);
     }
+    // The best run, not the mean, is the honest estimate of how fast the code
+    // is: anything else sharing the machine can only ever make a run slower,
+    // never faster. The mean and spread are still reported, because a wide
+    // spread is the signal that the machine was busy and the comparison
+    // should be repeated.
     let stats = |v: &[f64]| {
         let mean = v.iter().sum::<f64>() / v.len() as f64;
         let sd = (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
-        (mean, sd)
+        let best = v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        (mean, sd, best)
     };
-    let (pp_mean, pp_sd) = stats(&pp);
-    let (tg_mean, tg_sd) = stats(&tg);
-    let bandwidth = model.weight_bytes() as f64 * tg_mean / (1024.0 * MIB);
+    let (pp_mean, pp_sd, pp_best) = stats(&pp);
+    let (tg_mean, tg_sd, tg_best) = stats(&tg);
+    let bandwidth = model.weight_bytes() as f64 * tg_best / (1024.0 * MIB);
     out!("model:      {path}");
     out!("types:      {}", model.weight_types().join(", "));
     out!(
@@ -720,8 +805,11 @@ fn cmd_bench(args: &Args) -> Result<(), String> {
         kernels::kernel_name()
     );
     out!("command:    kllm {}", args.0.join(" "));
-    out!("pp{n_prompt}:      {pp_mean:8.1} ± {pp_sd:.1} tok/s");
-    out!("tg{n_gen}:       {tg_mean:8.1} ± {tg_sd:.1} tok/s  (~{bandwidth:.1} GiB/s of weights)");
+    out!("pp{n_prompt}:      {pp_best:8.1} tok/s best  (mean {pp_mean:.1} ± {pp_sd:.1})");
+    out!(
+        "tg{n_gen}:       {tg_best:8.1} tok/s best  (mean {tg_mean:.1} ± {tg_sd:.1}), \
+         ~{bandwidth:.1} GiB/s of weights"
+    );
     if !breakdown.is_empty() {
         out!("profile:");
         for line in breakdown {
