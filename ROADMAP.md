@@ -26,10 +26,9 @@ and execute Llama-family models without exceeding a configured budget.
    things left to try: a single contiguous arena for the x8-repacked weights
    instead of one allocation per tensor (210 of them per token, so the TLB
    takes ~21k misses that 2 MiB pages would remove — worth about 3% by
-   estimate), and shrinking the Q4_K x8 layout, which is 1248 bytes per eight
-   rows against 1152 row-major: in a bandwidth-bound loop that 8.3% is paid
-   directly, and storing the unpacked mins as `i8` rather than `i16` would
-   recover most of it. That one is aimed straight at the Q4_K/Q5_K gap.
+   estimate). (Shrinking the Q4_K x8 layout from 1248 to 1184 bytes per eight
+   rows, by storing the unpacked mins as `u8`, is done: +3-4% decode on
+   Qwen3-0.6B Q4_K_M.)
 2. **Hybrid execution (M6).** Run the planner's GPU suffix of layers plus the
    output head on the device; one activation transfer each way per token.
    Before building it, note what `examples/gpu_bench` measured on the
