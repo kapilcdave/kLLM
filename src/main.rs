@@ -38,6 +38,7 @@ usage:
   kllm run MODEL.gguf --prompt TEXT [-n N] [--chat] [--system TEXT] [--context N]
            [--temp T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R]
            [--seed S] [--threads N] [--batch N] [--ignore-eos] [--gpu-layers N|auto]
+           [--ram-gib N|auto|all]
   kllm perplexity MODEL.gguf --file TEXT [--context 512] [--chunks N] [--threads N] [--gpu-layers N|auto]
   kllm compare REFERENCE.gguf TEST.gguf --file TEXT [--context 512] [--chunks N] [--threads N]
   kllm devices
@@ -386,11 +387,40 @@ fn cmd_plan_model(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Memory this process can still use: the system's MemAvailable, capped by
+/// the headroom of every enclosing cgroup-v2 limit (`memory.max` minus
+/// `memory.current`). MemAvailable alone ignores a container's or systemd
+/// scope's limit, and a model sized to it gets OOM-killed there.
 fn mem_available() -> Option<u64> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
     let line = text.lines().find(|l| l.starts_with("MemAvailable:"))?;
     let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kib * 1024)
+    let mut available = kib * 1024;
+    if let Some(headroom) = cgroup_headroom() {
+        available = available.min(headroom);
+    }
+    Some(available)
+}
+
+fn cgroup_headroom() -> Option<u64> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = own.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    let mut dir = std::path::PathBuf::from("/sys/fs/cgroup").join(path.trim_start_matches('/'));
+    let mut best: Option<u64> = None;
+    loop {
+        let read = |f: &str| std::fs::read_to_string(dir.join(f)).ok();
+        if let (Some(max), Some(current)) = (read("memory.max"), read("memory.current"))
+            && let (Ok(max), Ok(current)) =
+                (max.trim().parse::<u64>(), current.trim().parse::<u64>())
+        {
+            let headroom = max.saturating_sub(current);
+            best = Some(best.map_or(headroom, |b| b.min(headroom)));
+        }
+        if dir == std::path::Path::new("/sys/fs/cgroup") || !dir.pop() {
+            break;
+        }
+    }
+    best
 }
 
 fn cpu_name() -> String {
@@ -469,9 +499,34 @@ fn load_with_plan(
             config.kv_bytes_per_token()
         ));
     }
+    let budget = ram_budget(args, kv + scratch)?;
+    let residency = kllm::model::Residency::plan(&info, config.n_layer, budget);
+    if residency.first_streamed < config.n_layer || residency.head_streamed {
+        let streamed = config.n_layer - residency.first_streamed;
+        eprintln!(
+            "kllm: model exceeds the RAM budget ({:.0} MiB): {} of {} blocks{} resident ({:.0} MiB), \
+             {streamed} blocks{} streamed from disk ({:.0} MiB per token)",
+            budget.unwrap_or(0) as f64 / MIB,
+            residency.first_streamed,
+            config.n_layer,
+            if residency.head_streamed {
+                ""
+            } else {
+                " + head"
+            },
+            residency.resident_bytes as f64 / MIB,
+            if residency.head_streamed {
+                " + head"
+            } else {
+                ""
+            },
+            residency.streamed_bytes as f64 / MIB
+        );
+    }
     let start = Instant::now();
     #[allow(unused_mut)]
-    let mut model = Model::load(path).map_err(|e| e.to_string())?;
+    let mut model = Model::load_with(path, kllm::model::LoadOptions { ram_budget: budget })
+        .map_err(|e| e.to_string())?;
     if gpu != GpuRequest::Off {
         offload(args, gpu, &info, &mut model, context, batch)?;
     }
@@ -531,6 +586,24 @@ fn offload(
         free as f64 / MIB
     );
     Ok(())
+}
+
+/// RAM the weights may occupy: `--ram-gib N`, `--ram-gib all` (never stream),
+/// or by default what is available now minus the session's own needs and a
+/// 1 GiB margin for everything else running.
+fn ram_budget(args: &Args, session_bytes: u64) -> Result<Option<u64>, String> {
+    match args.value(&["--ram-gib"])? {
+        Some("all") => Ok(None),
+        Some("auto") | None => {
+            Ok(mem_available().map(|a| a.saturating_sub(session_bytes + (1 << 30))))
+        }
+        Some(v) => {
+            let gib: f64 = v
+                .parse()
+                .map_err(|_| format!("invalid value {v:?} for --ram-gib"))?;
+            Ok(Some(bytes_from_gib(gib)?))
+        }
+    }
 }
 
 /// Emit only complete UTF-8 sequences; tokens can split a character.

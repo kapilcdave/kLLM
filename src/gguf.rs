@@ -508,6 +508,8 @@ pub fn inspect<R: Read + Seek>(reader: R, file_len: u64) -> Result<GgufInfo, Ggu
 pub struct GgufFile {
     pub info: GgufInfo,
     map: Mmap,
+    /// Kept open for page-cache advice (`posix_fadvise`).
+    file: File,
 }
 
 impl GgufFile {
@@ -521,7 +523,56 @@ impl GgufFile {
         if map.len() as u64 != file_len {
             return Err(invalid("file changed size while being opened"));
         }
-        Ok(Self { info, map })
+        Ok(Self { info, map, file })
+    }
+
+    /// Page-align `[start, start + len)` outward, clamped to the file.
+    fn page_span(&self, start: usize, len: usize) -> (usize, usize) {
+        const PAGE: usize = 4096;
+        let begin = start / PAGE * PAGE;
+        let end = (start + len).next_multiple_of(PAGE).min(self.map.len());
+        (begin, end.saturating_sub(begin))
+    }
+
+    /// Start reading `[start, start + len)` of the file into the page cache
+    /// in the background (`MADV_WILLNEED`), so a later access does not stall.
+    pub fn prefetch(&self, start: usize, len: usize) {
+        let (begin, len) = self.page_span(start, len);
+        if len > 0 {
+            let _ = self.map.advise_range(memmap2::Advice::WillNeed, begin, len);
+        }
+    }
+
+    /// Drop `[start, start + len)` from this mapping and from the page cache,
+    /// returning its memory now instead of letting least-recently-used
+    /// eviction pick victims. Later reads come from disk again.
+    pub fn release(&self, start: usize, len: usize) {
+        let (begin, len) = self.page_span(start, len);
+        if len == 0 {
+            return;
+        }
+        // SAFETY: the mapping is read-only and file-backed, so dropping its
+        // pages only discards clean copies; the next access re-reads the file.
+        unsafe {
+            let _ = self
+                .map
+                .unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, begin, len);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: plain syscall on our own descriptor.
+            unsafe {
+                libc::posix_fadvise(
+                    self.file.as_raw_fd(),
+                    begin as i64,
+                    len as i64,
+                    libc::POSIX_FADV_DONTNEED,
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = &self.file;
     }
 
     /// Raw payload bytes of a tensor. Bounds were validated at parse time.
