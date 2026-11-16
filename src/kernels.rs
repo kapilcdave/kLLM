@@ -598,6 +598,33 @@ pub fn packed_len(kind: GgmlType, len: usize) -> usize {
 /// Repack a row-major matrix eight rows at a time, or `None` if the type or
 /// shape has no x8 layout.
 pub fn repack_x8(kind: GgmlType, data: &[u8], rows: usize, cols: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    repack_x8_into(kind, data, rows, cols, &mut out).then_some(out)
+}
+
+/// [`repack_x8`] into a caller-owned buffer, for repacking the same shape
+/// repeatedly without allocating. Returns false if the type or shape has no
+/// x8 layout, leaving `out` untouched.
+pub fn repack_x8_into(
+    kind: GgmlType,
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    out: &mut Vec<u8>,
+) -> bool {
+    match repack_x8_impl(kind, data, rows, cols, out) {
+        Some(()) => true,
+        None => false,
+    }
+}
+
+fn repack_x8_impl(
+    kind: GgmlType,
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    out: &mut Vec<u8>,
+) -> Option<()> {
     if !packable(kind, rows) {
         return None;
     }
@@ -605,7 +632,8 @@ pub fn repack_x8(kind: GgmlType, data: &[u8], rows: usize, cols: usize) -> Optio
     let bb = kind.block_bytes();
     let pb = packed_block_bytes(kind)?;
     let blocks = row_bytes / bb;
-    let mut out = vec![0_u8; packed_len(kind, data.len())];
+    out.clear();
+    out.resize(packed_len(kind, data.len()), 0);
     for group in 0..rows / 8 {
         for b in 0..blocks {
             let dst = &mut out[(group * blocks + b) * pb..][..pb];
@@ -655,7 +683,7 @@ pub fn repack_x8(kind: GgmlType, data: &[u8], rows: usize, cols: usize) -> Optio
             }
         }
     }
-    Some(out)
+    Some(())
 }
 
 /// Eight rows (one packed group) against `xs.len()` columns:

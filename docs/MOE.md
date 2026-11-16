@@ -111,6 +111,16 @@ at 256 (16). So the default batch is now expert-aware --
 `16 * n_expert / n_expert_used`, capped at 256 -- while dense models keep 64,
 since they gain nothing from a wider batch and pay for it in logits scratch.
 
+Tried and rejected: repacking each expert's slice eight rows at a time into
+a reusable buffer, so the sorted groups could use the batched kernels. An
+expert is used once per sorted batch, which makes it look free, but the
+repack is a read and a write over the slice -- about 8 MiB of traffic
+against 2.65 for reducing it in place -- and a group of ~16 columns cannot
+amortize that. It cost prefill a third (pp256 6.7 and 8.3 tok/s against 10.7
+and 10.3). It would only pay if the repacked form were cached across
+batches, which is a second copy of the model again, which is the thing that
+does not fit.
+
 That scratch is the catch, and it is why the batch is also capped by the
 prompt. At batch 256 a 151936-token vocabulary needs 155 MiB of logits
 scratch for the whole session, and that competes with the page cache the

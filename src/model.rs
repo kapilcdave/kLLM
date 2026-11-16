@@ -1428,6 +1428,17 @@ impl<'m> Session<'m> {
                                 self.moe_x[j * d..(j + 1) * d]
                                     .copy_from_slice(&self.xn[i * d..(i + 1) * d]);
                             }
+                            // Not repacked. An expert is used once per
+                            // sorted batch, so repacking its weights eight
+                            // rows at a time into a scratch buffer looks
+                            // free -- but it is a read and a write over the
+                            // slice (about 8 MiB of traffic against 2.65 for
+                            // reducing it in place), and a group of ~16
+                            // columns cannot amortize that. Measured, it
+                            // cost prefill a third: pp256 6.7 and 8.3 tok/s
+                            // against 10.7 and 10.3. It would only pay if
+                            // the repacked form were cached across batches,
+                            // which is a second copy of the model again.
                             be.matmul_many(
                                 &mut [
                                     Job {
