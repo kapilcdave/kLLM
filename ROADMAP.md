@@ -29,19 +29,7 @@ and execute Llama-family models without exceeding a configured budget.
    mmap because the kernel can reclaim other caches. Deciding that at run
    time, from observed major faults, would beat a static budget.
 
-1. **Decode bandwidth.** Decode is now parity or better on most types
-   (Q8_0 1.18x, Q6_K 1.14x, Q4_0 1.05x) but trails on the K-quants that
-   matter most: Qwen3-0.6B Q4_K_M at 0.88x and Q5_K_M at 0.94x. It is
-   bandwidth-bound and scales 1.48x on four threads where pure compute
-   scales 3.88x. Software prefetching the next weight group made it slightly
-   worse, so the stream itself is fine. Tried and
-   closed: one contiguous huge-page arena for the x8-repacked weights
-   instead of a heap block per tensor measured as noise (-2% to +5% across
-   interleaved runs) because transparent huge pages are already `always` on
-   the reference machine; shrinking the Q4_K x8 layout from 1248 to 1184
-   bytes per eight rows (u8 mins) gave +3-4% on Qwen3-0.6B Q4_K_M. The
-   remaining K-quant gap is in the kernels themselves.
-2. **GPU speed.** M6 works (`tests/gpu.rs`: perplexity matches llama.cpp
+1. **GPU speed.** M6 works (`tests/gpu.rs`: perplexity matches llama.cpp
    on the GPU as on the CPU), and the quantized matvecs were rewritten to be
    coalesced over a struct-of-arrays layout (Q4_0 0.80 -> 5.9 GB/s, Q8_0
    0.92 -> 10.2 GB/s, batch-64 matmul 1.8 -> 22 GOP/s). But this laptop's
@@ -53,10 +41,10 @@ and execute Llama-family models without exceeding a configured budget.
    further (the Q4_0 kernel costs about what F16's does per element, so it
    is ALU-bound here); then fuse the small per-layer kernels (about 15
    launches per block at ~5 µs each).
-3. **Q3_K kernels**, the remaining common K-quant.
-4. **More architectures**: Gemma, Phi-3, and the hybrid Qwen3.5, whose
+2. **Q3_K kernels**, the remaining common K-quant.
+3. **More architectures**: Gemma, Phi-3, and the hybrid Qwen3.5, whose
    linear-attention layers need new kernels.
-5. `serve`: an OpenAI-compatible local HTTP endpoint (spec milestone 8).
+4. `serve`: an OpenAI-compatible local HTTP endpoint (spec milestone 8).
 
 ## Closed
 
@@ -67,6 +55,18 @@ and execute Llama-family models without exceeding a configured budget.
   any worker woke: 48% of a 1536x576 matmul and 71% of a 576x1536 one. Making
   it parallel and then vectorizing it took prefill to 1.22-1.65x llama.cpp on
   every quantized type. See `evals/` for the full table.
+- **Decode bandwidth.** Decode is at parity or better on every weight type
+  and there is no headroom left to chase. Qwen3-0.6B Q4_K_M, the type that
+  trailed longest, streams 22.2 GB/s of weights against a measured ceiling of
+  23.4-23.8 GB/s on this machine (`examples/kernel_bench`, 4096x4096, four
+  threads) -- 94% of what the memory system delivers -- and best-of-four lands
+  at 56.8 tok/s against llama.cpp's 57.4, inside llama.cpp's own 4% spread.
+  Q5_K_M is 1.08-1.18x and Q6_K 1.11-1.13x. What closed it was shrinking the
+  Q4_K x8 layout (u8 mins, 1248 -> 1184 bytes per eight rows), not kernel
+  instruction count. Tried and closed on this line: software prefetching the
+  next weight group (slightly worse), and one contiguous huge-page arena for
+  the repacked weights (noise, because transparent huge pages are already
+  `always` here).
 - **Prefill for the float types.** F16 and BF16 prefill were the last place
   kLLM lost to llama.cpp (0.58-0.61x). A float row has no x8-packed layout,
   so it was widened to f32 and reduced against one column at a time: one FMA
