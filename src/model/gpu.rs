@@ -178,21 +178,43 @@ fn upload_layer(
 ) -> Result<GpuLayer, ModelError> {
     let vector = |v: &[f32]| gpu.upload(v);
     let optional = |v: &Option<Vec<f32>>| v.as_deref().map(|v| gpu.upload(v)).transpose();
+    // Softmax attention only: a linear-attention block needs a convolution
+    // ring buffer and a recurrent state on the device.
+    let super::Mixer::Attention(attn) = &layer.mixer else {
+        return Err(ModelError::Unsupported(
+            "linear-attention layers on the GPU".into(),
+        ));
+    };
     Ok(GpuLayer {
         attn_norm: vector(&layer.attn_norm)?,
-        wq: matrix(layer.wq)?,
-        wk: matrix(layer.wk)?,
-        wv: matrix(layer.wv)?,
-        wo: matrix(layer.wo)?,
-        bq: optional(&layer.bq)?,
-        bk: optional(&layer.bk)?,
-        bv: optional(&layer.bv)?,
-        q_norm: optional(&layer.q_norm)?,
-        k_norm: optional(&layer.k_norm)?,
+        wq: matrix(attn.wq)?,
+        wk: matrix(attn.wk)?,
+        wv: matrix(attn.wv)?,
+        wo: matrix(attn.wo)?,
+        bq: optional(&attn.bq)?,
+        bk: optional(&attn.bk)?,
+        bv: optional(&attn.bv)?,
+        q_norm: optional(&attn.q_norm)?,
+        k_norm: optional(&attn.k_norm)?,
         ffn_norm: vector(&layer.ffn_norm)?,
-        w_gate: matrix(layer.w_gate)?,
-        w_up: matrix(layer.w_up)?,
-        w_down: matrix(layer.w_down)?,
+        // The GPU stack is dense-only for now: a routed layer would need
+        // the router, per-expert slicing and a gather on the device.
+        w_gate: match &layer.ffn {
+            super::Ffn::Dense { gate, .. } => matrix(*gate)?,
+            super::Ffn::Routed { .. } => {
+                return Err(ModelError::Unsupported(
+                    "mixture-of-experts layers on the GPU".into(),
+                ));
+            }
+        },
+        w_up: match &layer.ffn {
+            super::Ffn::Dense { up, .. } => matrix(*up)?,
+            super::Ffn::Routed { .. } => unreachable!("rejected above"),
+        },
+        w_down: match &layer.ffn {
+            super::Ffn::Dense { down, .. } => matrix(*down)?,
+            super::Ffn::Routed { .. } => unreachable!("rejected above"),
+        },
     })
 }
 

@@ -20,27 +20,42 @@ and execute Llama-family models without exceeding a configured budget.
 0. **Disk tier: done.** Models larger than the RAM budget keep the head and a
    block prefix resident and stream the rest, with read-ahead and immediate
    release (README, "Models bigger than RAM"). It is 1.45x llama.cpp on
-   Qwen3-14B Q4_K_M in a 6 GiB cgroup, running at 95% of disk bandwidth. Next
-   on this line: Mixture-of-Experts, where a token reads only its active
-   experts, so streaming cold experts from disk while caching hot ones costs
-   a fraction of a dense model's traffic. kLLM does not run any MoE
-   architecture yet (Qwen3-MoE would be the first). An open question: near
-   the edge (a model barely over MemAvailable), streaming loses to plain
-   mmap because the kernel can reclaim other caches. Deciding that at run
-   time, from observed major faults, would beat a static budget.
+   Qwen3-14B Q4_K_M in a 6 GiB cgroup, running at 95% of disk bandwidth. An
+   open question: near the edge (a model barely over MemAvailable), streaming
+   loses to plain mmap because the kernel can reclaim other caches. Deciding
+   that at run time, from observed major faults, would beat a static budget.
 
-1. **Decode bandwidth.** Decode is now parity or better on most types
-   (Q8_0 1.18x, Q6_K 1.14x, Q4_0 1.05x) but trails on the K-quants that
-   matter most: Qwen3-0.6B Q4_K_M at 0.88x and Q5_K_M at 0.94x. It is
-   bandwidth-bound and scales 1.48x on four threads where pure compute
-   scales 3.88x. Software prefetching the next weight group made it slightly
-   worse, so the stream itself is fine. Tried and
-   closed: one contiguous huge-page arena for the x8-repacked weights
-   instead of a heap block per tensor measured as noise (-2% to +5% across
-   interleaved runs) because transparent huge pages are already `always` on
-   the reference machine; shrinking the Q4_K x8 layout from 1248 to 1184
-   bytes per eight rows (u8 mins) gave +3-4% on Qwen3-0.6B Q4_K_M. The
-   remaining K-quant gap is in the kernels themselves.
+1. **Routed prefill and decode: at the hardware.** Mixture-of-experts runs (`qwen3moe`, designed
+   in [docs/MOE.md](docs/MOE.md)): Qwen3-30B-A3B Q4_K_M, a 17.3 GiB model on
+   a 16 GiB laptop, at **11.3 tok/s against llama.cpp's 1.81** -- 6x, up from
+   1.4 -- with perplexity 13.0682 against llama.cpp's 13.0579 (+0.08%, and
+   its own flash-attention spread on this model is 1.23%).
+
+   Prefill sorts tokens by expert so each expert is read once per batch
+   rather than once per token that chose it: pp64 22.2 tok/s against 14.7,
+   a 52% gain. That makes batch width matter, so the default is now
+   expert-aware (pp256 goes 7.1 -> 11.4 -> 16.2 across batches 64, 128,
+   256) and capped by the prompt, because the logits scratch a wide batch
+   needs competes with the experts' page cache.
+
+   Decode, measured, is memory-bandwidth-bound and not compute-bound as this
+   entry previously claimed: 20.0 GiB/s of weights against 20.7-27.3 GB/s for
+   this machine, so 80-100% of the hardware. A token reads ~1.79 GiB. There
+   is no headroom in the routed compute path for decode -- fusing the
+   per-expert matmuls, sharing the activation quantization and better tiling
+   are each worth a few percent against a bandwidth wall. The only remaining
+   decode lever is reading fewer bytes, i.e. trading quality by dropping the
+   lowest-weight experts, which should be opt-in and measured with
+   `kllm compare` rather than slipped in.
+
+   An explicit expert cache is deliberately *not* next. The locality curve
+   (an LRU over (layer, expert) reaching 61% at 1.9 GiB and 92% at 7.2 GiB,
+   with the hottest 10% of a layer's experts taking 38% of its reads) said
+   caching pays -- and the kernel's own page-cache LRU already delivers it,
+   once the planner stopped reserving budget for expert pages it never
+   prefetched. Building a second cache on top would be replacing a free one
+   that already reaches the compute ceiling.
+
 2. **GPU speed.** M6 works (`tests/gpu.rs`: perplexity matches llama.cpp
    on the GPU as on the CPU), and the quantized matvecs were rewritten to be
    coalesced over a struct-of-arrays layout (Q4_0 0.80 -> 5.9 GB/s, Q8_0
@@ -53,15 +68,44 @@ and execute Llama-family models without exceeding a configured budget.
    further (the Q4_0 kernel costs about what F16's does per element, so it
    is ALU-bound here); then fuse the small per-layer kernels (about 15
    launches per block at ~5 µs each).
-3. **Prefill for the float types.** F16 and BF16 prefill run at 0.58-0.61x
-   of llama.cpp while every quantized type is now ahead of it (1.22-1.65x). The x8 packing
-   covers only Q4_0, Q8_0, Q4_K and Q6_K, so a float row is dequantized to f32
-   and then reduced once per activation column; llama.cpp runs an f16 GEMM at
-   half the bytes with register tiling. Decode for these types is fine
-   (1.0x), so this is specifically the batched path.
-4. **Q3_K kernels**, the remaining common K-quant.
-5. **More architectures**: Gemma, Phi-3, and the hybrid Qwen3.5, whose
-   linear-attention layers need new kernels.
+3. **A cheaper Q3_K kernel.** Q3_K loads and is correct (Qwen3-0.6B
+   requantized: 44.5528 against llama.cpp's 44.4627 with flash attention off
+   and 44.7784 with it on, so inside its band) but it is not the speed win
+   that 24% fewer bytes ought to buy on a bandwidth-bound engine. Measured
+   both ways:
+
+   - Small dense model, cache-resident: 32.7 tok/s decode against Q4_K's
+     55.4, prefill 128 against 317.
+   - Qwen3-30B-A3B requantized to Q3_K_M, 13.7 GiB against Q4_K_M's 17.3,
+     each warmed alone to its plateau: **6.0-6.6 tok/s against 10.6-11.3**.
+
+   So it is instruction-bound, not byte-bound: a Q3_K block is eight passes
+   with a `hmask` bit-plane to extract against Q4_K's four, and that costs
+   more than 24% fewer bytes buys. Note an x8-packed layout would *not* fix
+   the MoE case, because a routed model's experts are never packed (that is
+   a second copy of the model); what is needed is a cheaper row-major
+   kernel. Until then Q3_K is a capability -- models that would otherwise
+   not load at all -- rather than a way to go faster.
+
+   Methodology note for anyone repeating this: do not interleave two
+   different multi-gigabyte models to compare them. Together they exceed the
+   page cache and each run evicts the other's weights, which turned a clean
+   6.2-against-11 into a meaningless 6.2-against-1.5. Warm each separately
+   to its plateau instead. Interleaving is still right when both arms read
+   the *same* file.
+4. **Qwen3.5 (`qwen35`)**, scoped in [docs/QWEN35.md](docs/QWEN35.md). It is
+   a layer-level hybrid: `full_attention_interval = 4`, so three of every
+   four blocks are a gated-DeltaNet SSM and every fourth is ordinary
+   attention. The attention blocks are nearly free (they are `qwen3`), and
+   M-RoPE collapses to plain RoPE for text-only input because all three
+   position axes carry the same index -- so the work is the SSM: a causal
+   four-tap depthwise conv needing a ring buffer, and a recurrence over a
+   16x128 state, neither of which the KV cache covers. Worth doing because
+   Qwen3.5-4B and 9B are already here as Q4_K_M and small enough to hold in
+   RAM, so they would be fast rather than merely possible. Qwen3.5-35B-A3B
+   additionally needs IQ2_XXS, which is where all of its bytes are.
+
+5. **More architectures**: Gemma, Phi-3.
 6. `serve`: an OpenAI-compatible local HTTP endpoint (spec milestone 8).
 
 ## Closed
@@ -73,6 +117,26 @@ and execute Llama-family models without exceeding a configured budget.
   any worker woke: 48% of a 1536x576 matmul and 71% of a 576x1536 one. Making
   it parallel and then vectorizing it took prefill to 1.22-1.65x llama.cpp on
   every quantized type. See `evals/` for the full table.
+- **Decode bandwidth.** Decode is at parity or better on every weight type
+  and there is no headroom left to chase. Qwen3-0.6B Q4_K_M, the type that
+  trailed longest, streams 22.2 GB/s of weights against a measured ceiling of
+  23.4-23.8 GB/s on this machine (`examples/kernel_bench`, 4096x4096, four
+  threads) -- 94% of what the memory system delivers -- and best-of-four lands
+  at 56.8 tok/s against llama.cpp's 57.4, inside llama.cpp's own 4% spread.
+  Q5_K_M is 1.08-1.18x and Q6_K 1.11-1.13x. What closed it was shrinking the
+  Q4_K x8 layout (u8 mins, 1248 -> 1184 bytes per eight rows), not kernel
+  instruction count. Tried and closed on this line: software prefetching the
+  next weight group (slightly worse), and one contiguous huge-page arena for
+  the repacked weights (noise, because transparent huge pages are already
+  `always` here).
+- **Prefill for the float types.** F16 and BF16 prefill were the last place
+  kLLM lost to llama.cpp (0.58-0.61x). A float row has no x8-packed layout,
+  so it was widened to f32 and reduced against one column at a time: one FMA
+  per two loads. A 3x3 register tile (nine accumulators, 13 of 16 YMM
+  registers; 4x3 spills) made it 1.11-1.15x. The tile only pays once there
+  are columns to fill it -- at batch one, widening a row block to f32 is 3x
+  the bytes of the f16 it came from, and it cost bandwidth-bound decode
+  1.04x -> 0.82x before being gated on batch size.
 - **Real-model checks** for every weight type, by perplexity and KL
   divergence (`tests/divergence.rs`). This is what found the two weight types
   that were quietly running on scalar code -- BF16 (no entry in the AVX2

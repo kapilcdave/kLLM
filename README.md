@@ -18,7 +18,7 @@ cargo build --release
 | Area | Status |
 |---|---|
 | GGUF parsing | Full metadata and tensor directory; every length is bounds-checked against the file before allocation; payloads are memory-mapped |
-| Architectures | `llama` (Llama 1–3, Mistral, SmolLM, TinyLlama), `qwen2`, `qwen3` |
+| Architectures | `llama` (Llama 1–3, Mistral, SmolLM, TinyLlama), `qwen2`, `qwen3`, `qwen3moe`. A 30B mixture of experts runs on a 16 GiB machine at 6x llama.cpp: see [docs/MOE.md](docs/MOE.md) |
 | Weight types | Validated end to end against llama.cpp on real models, by perplexity *and* KL divergence: F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q4_K, Q5_K, Q6_K. F32 is kernel-tested only |
 | Tokenizers | GPT-2 byte-level BPE (gpt2, smollm, llama3, qwen2 pre-tokenizers) and SentencePiece; special tokens; byte-exact with llama.cpp on the fixtures |
 | Execution | CPU: batched prefill, f16 KV cache, AVX2/FMA/F16C kernels with a portable scalar fallback |
@@ -89,6 +89,46 @@ Streaming is bounded by the disk: 3.98 GB streamed per token at 1.4 GB/s is
 kernel can often free enough other cache to hold the whole model, and
 `--ram-gib all` is then faster.
 
+## A 30B model on a 16 GiB laptop
+
+A dense 30B needs all of itself for every token, so on a machine this size it
+is hopeless. A mixture of experts needs a routed fraction -- 8 of 128 experts
+for Qwen3-30B-A3B, about 6% of the expert weights -- and *which* fraction
+repeats enough for the page cache to absorb it. That is the whole reason this
+works:
+
+```sh
+kllm run Qwen3-30B-A3B-Q4_K_M.gguf --chat --prompt "..." -n 400 --context 4096
+```
+
+17.3 GiB of weights, 16 GiB of RAM, **10-11 tok/s** against llama.cpp's 1.81
+on the same file and machine. Three things matter in practice:
+
+- **Let the cache warm.** The first run of a model reads experts from disk and
+  lands at 4-7 tok/s; by the second or third it is at 10-11. Switching
+  between two 18 GiB models resets that, so expect a slow first answer.
+- **Leave the budget alone.** `--ram-gib` defaults to something sensible, and
+  for a routed model it only governs the non-expert weights (about 1 GiB);
+  everything else is better spent on page cache for the experts. Forcing it
+  smaller makes kLLM stream blocks it had no need to and costs 6x.
+- **Prompt length picks the batch.** A long prompt gets a wide batch, which
+  is what makes routed prefill fast; a short one gets a narrow batch so the
+  session does not spend 155 MiB of logits scratch it will not use.
+
+For a conversation, use `kllm chat` rather than repeated `run` calls. It keeps
+the session alive, so each turn feeds only what is new: in a three-turn
+exchange the third turn fed 18 tokens instead of re-processing all 174.
+Re-sending the history every turn is what makes a one-shot CLI unusable on a
+slow machine -- a thousand tokens of context costs minutes to re-read at
+prefill speed, every single turn.
+
+For a reasoning model such as the base Qwen3-30B-A3B, pass `--no-think`.
+Otherwise it answers by thinking first, and at ten tokens a second a 100-token
+budget is spent before it has said anything. Its own chat template suppresses
+reasoning by pre-filling an empty `<think></think>`, and that is what the flag
+does. Instruct builds that do not reason (Qwen3's `-2507-Instruct`, for one)
+need nothing.
+
 ## Correctness
 
 The test-suite compares kLLM with llama.cpp (build 12099) on recorded
@@ -146,15 +186,16 @@ is in [evals/](evals/); regenerate it with `scripts/eval_report.py`.
 | SmolLM2-135M Q6_K | 988 / 667 | 1.48x | 165 / 145 | 1.14x |
 | SmolLM2-135M Q2_K | 1089 / 814 | 1.34x | 247 / 244 | 1.01x |
 | SmolLM2-135M Q5_K_M | 462 / 352 | 1.31x | 157 / 167 | 0.94x |
-| SmolLM2-135M f16 | 282 / 484 | 0.58x | 85 / 82 | 1.04x |
+| SmolLM2-135M f16 | 629 / 547 | 1.15x | 85.5 / 82.3 | 1.04x |
 | Qwen3-0.6B Q4_K_M | 324 / 266 | 1.22x | 48.3 / 55.2 | 0.88x |
 | Qwen3-0.6B Q8_0 | 284 / 184 | 1.54x | 36.4 / 37.0 | 0.98x |
 
-Prefill is ahead of llama.cpp on every quantized type (1.22-1.65x) and behind
-on the two float types (0.58-0.61x), which have no x8-packed layout and so get
-a row dequantized to f32 and reduced once per activation column. Decode is
-parity or better on most types and trails on the K-quants (Q4_K 0.88x); it is
-memory-bandwidth-bound, where prefill is compute-bound.
+Prefill is ahead of llama.cpp on every weight type, float ones included
+(1.11-1.65x). Decode is parity or better on most types and trails on the
+K-quants (Q4_K 0.88x); it is memory-bandwidth-bound, where prefill is
+compute-bound, which is why the two respond to different things -- a register
+tile doubled float prefill and *cost* float decode until it was gated on
+batch size.
 
 Two notes on reading these numbers. Prefill was at 65% of llama.cpp until the
 real bottleneck turned up, and it was not the kernels: at *one* thread kLLM

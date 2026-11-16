@@ -10,7 +10,7 @@ use kllm::kernels;
 use kllm::model::{Config, Logits, Model, Session};
 use kllm::planner::{ModelPlanInput, PlanInput, bytes_from_gib, gib, plan, plan_model};
 use kllm::sampler::{Sampler, SamplerConfig};
-use kllm::tokenizer::{Tokenizer, format_chat};
+use kllm::tokenizer::{Tokenizer, format_chat_with};
 
 const DEFAULT_WORKSPACE_GIB: f64 = 0.25;
 const DEFAULT_SAFETY_GIB: f64 = 0.25;
@@ -37,8 +37,11 @@ usage:
   kllm plan --model-gib N --layers N --vram-gib N --context N --kv-bytes-per-token N
   kllm run MODEL.gguf --prompt TEXT [-n N] [--chat] [--system TEXT] [--context N]
            [--temp T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R]
-           [--seed S] [--threads N] [--batch N] [--ignore-eos] [--gpu-layers N|auto]
+           [--seed S] [--threads N] [--batch N] [--ignore-eos] [--no-think]
+           [--gpu-layers N|auto]
            [--ram-gib N|auto|all]
+  kllm chat MODEL.gguf [--system TEXT] [-n 512] [--context N] [--no-think]
+           [--temp T] [--top-k K] [--top-p P] [--min-p P] [--threads N] [--ram-gib N]
   kllm perplexity MODEL.gguf --file TEXT [--context 512] [--chunks N] [--threads N] [--gpu-layers N|auto]
   kllm compare REFERENCE.gguf TEST.gguf --file TEXT [--context 512] [--chunks N] [--threads N]
   kllm devices
@@ -102,6 +105,7 @@ fn run(args: &Args) -> Result<(), String> {
         Some("plan") => cmd_plan(args),
         Some("plan-model") => cmd_plan_model(args),
         Some("run") => cmd_run(args),
+        Some("chat") => cmd_chat(args),
         Some("perplexity") => cmd_perplexity(args),
         Some("compare") => cmd_compare(args),
         Some("bench") => cmd_bench(args),
@@ -183,6 +187,30 @@ fn cmd_inspect(args: &Args) -> Result<(), String> {
                 c.rope_style,
                 c.rope_base
             );
+            if let Some(moe) = c.moe {
+                out!(
+                    "  experts:            {} of {} per token, ff={}{}, {:?} gating{}{}",
+                    moe.n_expert_used,
+                    moe.n_expert,
+                    moe.n_ff_exp,
+                    if moe.n_ff_shared > 0 {
+                        format!(" (+shared ff={})", moe.n_ff_shared)
+                    } else {
+                        String::new()
+                    },
+                    moe.gating,
+                    if moe.weights_norm { ", normalized" } else { "" },
+                    if moe.weights_scale != 1.0 {
+                        format!(", scale={}", moe.weights_scale)
+                    } else {
+                        String::new()
+                    },
+                );
+                out!(
+                    "  active fraction:    {:.1}% of expert weights per token",
+                    moe.active_fraction() * 100.0
+                );
+            }
             out!(
                 "  KV cache:           {} bytes/token (f16)",
                 c.kv_bytes_per_token()
@@ -501,6 +529,16 @@ fn load_with_plan(
     }
     let budget = ram_budget(args, kv + scratch)?;
     let residency = kllm::model::Residency::plan(&info, config.n_layer, budget);
+    if let Some(moe) = config.moe {
+        eprintln!(
+            "kllm: {} of {} experts per token ({:.0}% of {:.0} MiB of expert weights), \
+             demand-paged",
+            moe.n_expert_used,
+            moe.n_expert,
+            moe.active_fraction() * 100.0,
+            residency.demand_bytes as f64 / MIB,
+        );
+    }
     if residency.first_streamed < config.n_layer || residency.head_streamed {
         let streamed = config.n_layer - residency.first_streamed;
         eprintln!(
@@ -520,7 +558,12 @@ fn load_with_plan(
             } else {
                 ""
             },
-            residency.streamed_bytes as f64 / MIB
+            // A routed model reads only its selected experts, so the
+            // streamed figure has to be the active bytes or it overstates
+            // the traffic by 1/active_fraction -- 16x for Qwen3-30B-A3B.
+            config.moe.map_or(residency.streamed_bytes as f64, |m| {
+                residency.streamed_bytes as f64 * m.active_fraction()
+            }) / MIB
         );
     }
     let start = Instant::now();
@@ -633,16 +676,19 @@ fn cmd_run(args: &Args) -> Result<(), String> {
         .ok_or("usage: missing --prompt")?
         .into();
     let n_predict: usize = args.or(&["-n", "--n-predict"], 256)?;
-    let batch: usize = args.or(&["--batch", "-b"], 64)?;
     let info = inspect_file(path).map_err(|e| e.to_string())?;
     let config = Config::from_gguf(&info).map_err(|e| e.to_string())?;
     let context: usize = args.or(&["--context", "-c"], config.train_context.min(4096))?;
-    let model = load_with_plan(args, gpu_request(args)?, path, context, batch, threads)?;
-    let tokenizer = Tokenizer::from_gguf(model.info()).map_err(|e| e.to_string())?;
-
+    // Tokenize before loading, so the batch can be sized to the prompt that
+    // actually has to be processed. A wide batch is what makes a routed
+    // model's prefill fast, but it is paid for in logits scratch for the
+    // whole session -- and that scratch competes with the page cache the
+    // experts live in, so buying it for a twenty-token prompt would slow
+    // the generation that follows.
+    let tokenizer = Tokenizer::from_gguf(&info).map_err(|e| e.to_string())?;
     let text = if args.has("--chat") {
         let system = args.value(&["--system"])?;
-        format_chat(model.info(), system, &prompt)
+        format_chat_with(&info, system, &prompt, !args.has("--no-think"))
             .ok_or("model has no recognisable chat template")?
     } else {
         prompt
@@ -651,6 +697,11 @@ fn cmd_run(args: &Args) -> Result<(), String> {
     if tokens.is_empty() {
         return Err("prompt tokenized to nothing".into());
     }
+    let batch: usize = args.or(
+        &["--batch", "-b"],
+        default_batch(&config).min(tokens.len().max(1)),
+    )?;
+    let model = load_with_plan(args, gpu_request(args)?, path, context, batch, threads)?;
     if tokens.len() >= context {
         return Err(format!(
             "prompt is {} tokens; context is {context}",
@@ -720,6 +771,139 @@ fn cmd_run(args: &Args) -> Result<(), String> {
         gen_time.as_secs_f64(),
         generated.max(1) as f64 / gen_time.as_secs_f64().max(1e-9)
     );
+    Ok(())
+}
+
+/// One turn of a ChatML conversation, as the text to feed next.
+///
+/// Interactive chat only re-feeds what is new: the session's KV cache
+/// already holds every earlier turn, and re-sending the history would cost
+/// the whole prompt again on every turn -- at the speed a 30B runs on a
+/// laptop, a thousand tokens of history is minutes.
+fn chatml_turn(first: bool, system: Option<&str>, user: &str, think: bool) -> String {
+    let mut out = String::new();
+    if !first {
+        // Close the assistant turn the model left open by stopping at EOS.
+        out += "<|im_end|>\n";
+    } else if let Some(system) = system {
+        out += &format!("<|im_start|>system\n{system}<|im_end|>\n");
+    }
+    out += &format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n");
+    if !think {
+        out += "<think>\n\n</think>\n\n";
+    }
+    out
+}
+
+fn cmd_chat(args: &Args) -> Result<(), String> {
+    let path = args.positional(1, "GGUF path")?;
+    let threads = init_threads(args)?;
+    let info = inspect_file(path).map_err(|e| e.to_string())?;
+    let config = Config::from_gguf(&info).map_err(|e| e.to_string())?;
+    let template = info
+        .get("tokenizer.chat_template")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !template.contains("<|im_start|>") {
+        return Err(
+            "interactive chat needs a ChatML template (<|im_start|>); this model has another"
+                .into(),
+        );
+    }
+    let think = !args.has("--no-think") && template.contains("<think>");
+    let system = args.value(&["--system"])?.map(str::to_string);
+    let context: usize = args.or(&["--context", "-c"], config.train_context.min(4096))?;
+    let n_predict: usize = args.or(&["-n", "--n-predict"], 512)?;
+    // A turn's prompt is short, so a narrow batch keeps the logits scratch
+    // off the page cache the weights need.
+    let batch: usize = args.or(&["--batch", "-b"], 64)?;
+    let model = load_with_plan(args, gpu_request(args)?, path, context, batch, threads)?;
+    let tokenizer = Tokenizer::from_gguf(model.info()).map_err(|e| e.to_string())?;
+    let mut sampler = Sampler::new(SamplerConfig {
+        temperature: args.or(&["--temp"], 0.8)?,
+        top_k: args.or(&["--top-k"], 40)?,
+        top_p: args.or(&["--top-p"], 0.95)?,
+        min_p: args.or(&["--min-p"], 0.05)?,
+        repeat_penalty: args.or(&["--repeat-penalty"], 1.0)?,
+        repeat_last_n: args.or(&["--repeat-last-n"], 64)?,
+        seed: args.or(&["--seed", "-s"], 0x6b4c_4c4d)?,
+    });
+    let mut session = model
+        .new_session(context, batch)
+        .map_err(|e| e.to_string())?;
+    let mut stdout = io::stdout().lock();
+    let mut history: Vec<u32> = Vec::new();
+    let mut first = true;
+    eprintln!("kllm: chat ready; blank line or Ctrl-D to leave");
+
+    loop {
+        let _ = write!(stdout, "\n> ");
+        let _ = stdout.flush();
+        let mut line = String::new();
+        match io::stdin().read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        let line = line.trim_end_matches(['\n', '\r']);
+        if line.trim().is_empty() {
+            break;
+        }
+        let turn = chatml_turn(first, system.as_deref(), line, think);
+        first = false;
+        // `add_special` only on the first turn: a second BOS mid-stream is
+        // not what the model was trained on.
+        let tokens = tokenizer.encode(&turn, history.is_empty(), true);
+        if session.position() + tokens.len() + 8 >= context {
+            eprintln!(
+                "kllm: context of {context} tokens is full; start again with a larger --context"
+            );
+            break;
+        }
+        history.extend_from_slice(&tokens);
+        let start = Instant::now();
+        let mut logits = session
+            .forward(&tokens, Logits::Last)
+            .map_err(|e| e.to_string())?
+            .to_vec();
+        let prompt_time = start.elapsed();
+        let gen_start = Instant::now();
+        let mut stream = Utf8Stream {
+            pending: Vec::new(),
+        };
+        let mut generated = 0;
+        while generated < n_predict && session.position() < context {
+            let next = sampler.sample(&logits, &history);
+            if tokenizer.is_eog(next) {
+                break;
+            }
+            history.push(next);
+            generated += 1;
+            let piece = stream.push(&tokenizer.token_bytes(next, false));
+            if write!(stdout, "{piece}")
+                .and_then(|_| stdout.flush())
+                .is_err()
+            {
+                return Ok(());
+            }
+            if generated == n_predict || session.position() >= context {
+                break;
+            }
+            logits = session
+                .forward(&[next], Logits::Last)
+                .map_err(|e| e.to_string())?
+                .to_vec();
+        }
+        let _ = writeln!(stdout, "{}", stream.push(&[]));
+        eprintln!(
+            "kllm: {} new prompt tokens in {:.2} s | {generated} generated in {:.2} s ({:.1} tok/s) | {} of {context} used",
+            tokens.len(),
+            prompt_time.as_secs_f64(),
+            gen_start.elapsed().as_secs_f64(),
+            generated.max(1) as f64 / gen_start.elapsed().as_secs_f64().max(1e-9),
+            session.position(),
+        );
+    }
     Ok(())
 }
 
@@ -874,13 +1058,34 @@ fn cmd_devices() -> Result<(), String> {
     Ok(())
 }
 
+/// Default prompt batch. A routed model wants a wide one: tokens are
+/// grouped by the expert they chose, so each expert's weights are read once
+/// per batch rather than once per token that chose it, and a batch of `b`
+/// gives each of `n_expert` experts about `b * n_expert_used / n_expert`
+/// tokens to work on. Measured on Qwen3-30B-A3B (8 of 128 experts), pp256
+/// went 7.1 -> 11.4 -> 16.2 tok/s across batches of 64, 128 and 256 for
+/// exactly that reason. Dense models gain nothing from a wider batch and pay
+/// for it in logits scratch, so they keep 64.
+fn default_batch(config: &Config) -> usize {
+    const DENSE: usize = 64;
+    let Some(moe) = config.moe else { return DENSE };
+    // Aim for ~16 tokens per expert, which is where the measured gain
+    // flattened, and cap it so the logits scratch stays sane.
+    let wanted = 16 * moe.n_expert / moe.n_expert_used.max(1);
+    wanted.clamp(DENSE, 256)
+}
+
 fn cmd_bench(args: &Args) -> Result<(), String> {
     let path = args.positional(1, "GGUF path")?;
     let threads = init_threads(args)?;
     let n_prompt: usize = args.or(&["-p", "--n-prompt"], 128)?;
     let n_gen: usize = args.or(&["-n", "--n-gen"], 64)?;
     let repeats: usize = args.or(&["--repeat", "-r"], 3)?.max(1);
-    let batch: usize = args.or(&["--batch", "-b"], 64)?;
+    let info = inspect_file(path).map_err(|e| e.to_string())?;
+    let batch: usize = args.or(
+        &["--batch", "-b"],
+        default_batch(&Config::from_gguf(&info).map_err(|e| e.to_string())?),
+    )?;
     let context = n_prompt + n_gen + 1;
     let model = load_with_plan(args, gpu_request(args)?, path, context, batch, threads)?;
     let vocab = model.config.n_vocab as u32;

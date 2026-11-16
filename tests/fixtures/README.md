@@ -46,6 +46,18 @@ for t in Q4_1 Q5_0 Q5_1 Q2_K Q5_K_M Q6_K BF16; do
 done
 ```
 
+Q3_K needs a model whose rows are a multiple of 256, which SmolLM2 is not,
+so its coverage comes from Qwen3-0.6B requantized:
+
+```sh
+llama-quantize --allow-requantize Qwen3-0.6B-Q8_0.gguf \
+  Qwen3-0.6B-Q3_K_M.gguf Q3_K_M 4
+```
+
+Quantizing something already quantized makes the absolute perplexity
+meaningless, and leaves the agreement with llama.cpp on the same file
+exactly as meaningful as it was.
+
 `--pure` stops llama.cpp mixing types per tensor, but a K-quant still needs
 rows that are a multiple of 256 wide: SmolLM2 is 576 wide, so in the three
 K-quant builds only `ffn_down` (1536 wide) carries the K-quant and the rest

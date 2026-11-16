@@ -64,6 +64,11 @@
    "ppl_fa_on": 24.5468,
    "stderr": 2.48449,
    "ppl_fa_off": 24.5438
+  },
+  "Qwen3-0.6B-Q3_K_M.gguf": {
+   "ppl_fa_on": 44.7784,
+   "stderr": 5.18804,
+   "ppl_fa_off": 44.4627
   }
  }
 }

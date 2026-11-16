@@ -42,7 +42,9 @@ pub fn dot_input(kind: GgmlType) -> DotInput {
         GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 => {
             DotInput::Q8_0
         }
-        GgmlType::Q2K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => DotInput::Q8K,
+        GgmlType::Q2K | GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K => {
+            DotInput::Q8K
+        }
         _ => DotInput::F32,
     }
 }
@@ -195,6 +197,7 @@ pub fn dot(kind: GgmlType, row: &[u8], x: &Prepared<'_>) -> f32 {
                 (GgmlType::Q5_0, Prepared::Q8_0(x)) => return avx2::q5_0_n(row, [x])[0],
                 (GgmlType::Q5_1, Prepared::Q8_0(x)) => return avx2::q5_1_n(row, [x])[0],
                 (GgmlType::Q2K, Prepared::Q8K(x)) => return avx2::q2k_n(row, [x])[0],
+                (GgmlType::Q3K, Prepared::Q8K(x)) => return avx2::q3k_n(row, [x])[0],
                 (GgmlType::Q4K, Prepared::Q8K(x)) => return avx2::q4k_n(row, [x])[0],
                 (GgmlType::Q5K, Prepared::Q8K(x)) => return avx2::dot_q5k(row, x),
                 (GgmlType::Q6K, Prepared::Q8K(x)) => return avx2::q6k_n(row, [x])[0],
@@ -292,6 +295,7 @@ pub fn dot_multi(
                 GgmlType::Q5_0 => groups!(Q8_0, q5_0_n),
                 GgmlType::Q5_1 => groups!(Q8_0, q5_1_n),
                 GgmlType::Q2K => groups!(Q8K, q2k_n),
+                GgmlType::Q3K => groups!(Q8K, q3k_n),
                 GgmlType::Q4K => groups!(Q8K, q4k_n),
                 GgmlType::Q6K => groups!(Q8K, q6k_n),
                 _ => {}
@@ -407,6 +411,40 @@ pub fn dot_scalar(kind: GgmlType, row: &[u8], x: &Prepared<'_>) -> f32 {
                     mins += (packed >> 4) as i32 * a.bsums[j] as i32;
                 }
                 a.d * (half(w, 80) * main as f32 - half(w, 82) * mins as f32)
+            })
+            .sum(),
+        // Q3_K: sixteen sub-blocks of sixteen 3-bit values. The low two
+        // bits sit in `qs` at a shift per sub-block group, the third bit in
+        // a `hmask` bit plane where *clear* means four lower, and each
+        // sub-block has a 6-bit scale biased by -32.
+        (GgmlType::Q3K, Prepared::Q8K(x)) => row
+            .chunks_exact(110)
+            .zip(x)
+            .map(|(w, a)| {
+                let hmask = &w[0..32];
+                let qs = &w[32..96];
+                let scales = crate::quant::q3k_scales(&w[96..108]);
+                let mut total = 0_i32;
+                let mut is = 0;
+                for n in 0..2 {
+                    let q = &qs[n * 32..n * 32 + 32];
+                    for j in 0..4 {
+                        let plane = 1_u8 << (j + 4 * n);
+                        for half_index in 0..2 {
+                            let mut sum = 0_i32;
+                            let base = (n * 128) + (j * 32) + half_index * 16;
+                            for l in 0..16 {
+                                let at = half_index * 16 + l;
+                                let low = ((q[at] >> (2 * j)) & 3) as i32;
+                                let high = if hmask[at] & plane != 0 { 0 } else { 4 };
+                                sum += (low - high) * a.qs[base + l] as i32;
+                            }
+                            total += scales[is] as i32 * sum;
+                            is += 1;
+                        }
+                    }
+                }
+                a.d * half(w, 108) * total as f32
             })
             .sum(),
         (GgmlType::Q4K, Prepared::Q8K(x)) => row
@@ -598,6 +636,33 @@ pub fn packed_len(kind: GgmlType, len: usize) -> usize {
 /// Repack a row-major matrix eight rows at a time, or `None` if the type or
 /// shape has no x8 layout.
 pub fn repack_x8(kind: GgmlType, data: &[u8], rows: usize, cols: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    repack_x8_into(kind, data, rows, cols, &mut out).then_some(out)
+}
+
+/// [`repack_x8`] into a caller-owned buffer, for repacking the same shape
+/// repeatedly without allocating. Returns false if the type or shape has no
+/// x8 layout, leaving `out` untouched.
+pub fn repack_x8_into(
+    kind: GgmlType,
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    out: &mut Vec<u8>,
+) -> bool {
+    match repack_x8_impl(kind, data, rows, cols, out) {
+        Some(()) => true,
+        None => false,
+    }
+}
+
+fn repack_x8_impl(
+    kind: GgmlType,
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    out: &mut Vec<u8>,
+) -> Option<()> {
     if !packable(kind, rows) {
         return None;
     }
@@ -605,7 +670,8 @@ pub fn repack_x8(kind: GgmlType, data: &[u8], rows: usize, cols: usize) -> Optio
     let bb = kind.block_bytes();
     let pb = packed_block_bytes(kind)?;
     let blocks = row_bytes / bb;
-    let mut out = vec![0_u8; packed_len(kind, data.len())];
+    out.clear();
+    out.resize(packed_len(kind, data.len()), 0);
     for group in 0..rows / 8 {
         for b in 0..blocks {
             let dst = &mut out[(group * blocks + b) * pb..][..pb];
@@ -655,7 +721,7 @@ pub fn repack_x8(kind: GgmlType, data: &[u8], rows: usize, cols: usize) -> Optio
             }
         }
     }
-    Some(out)
+    Some(())
 }
 
 /// Eight rows (one packed group) against `xs.len()` columns:
@@ -749,6 +815,97 @@ pub fn load_f16(src: &[u8], dst: &mut [f32]) {
     }
     for (d, b) in dst[done..].iter_mut().zip(src[done * 2..].chunks_exact(2)) {
         *d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+    }
+}
+
+/// Weight rows widened at once by [`float_matmul`]. Three rows and three
+/// columns need nine accumulators plus four operand registers, which is the
+/// most that fits in sixteen YMM registers without spilling.
+pub const FLOAT_ROW_TILE: usize = 3;
+
+/// `out[r * columns.len() + c] = row (first_row + r) · columns[c]`, for a
+/// block of up to [`FLOAT_ROW_TILE`] rows of a float-typed matrix.
+///
+/// The float types (F32, F16, BF16) have no x8-packed layout, so a row is
+/// widened to f32 and then reduced against every activation column. Doing
+/// that one row at a time streams all the columns past L1 once per row and
+/// spends one FMA per pair of loads. Blocking rows against columns lets each
+/// load feed several FMAs instead -- with a 3x3 tile, nine FMAs per four
+/// loads -- which is where this path's time goes.
+#[allow(clippy::too_many_arguments)]
+pub fn float_matmul(
+    kind: GgmlType,
+    data: &[u8],
+    row_bytes: usize,
+    first_row: usize,
+    rows: usize,
+    cols: usize,
+    columns: &[Prepared<'_>],
+    out: &mut [f32],
+    scratch: &mut Vec<f32>,
+) {
+    debug_assert!(rows <= FLOAT_ROW_TILE);
+    debug_assert_eq!(out.len(), rows * columns.len());
+    let n = columns.len();
+    // Widen this block of rows once. Padding rows are zeroed rather than
+    // left stale so the tile kernel never meets a NaN it would then discard.
+    scratch.clear();
+    scratch.resize(FLOAT_ROW_TILE * cols, 0.0);
+    for r in 0..rows {
+        let row = &data[(first_row + r) * row_bytes..][..row_bytes];
+        let dst = &mut scratch[r * cols..(r + 1) * cols];
+        match kind {
+            GgmlType::F16 => load_f16(row, dst),
+            GgmlType::BF16 => load_bf16(row, dst),
+            _ => crate::quant::dequantize_row(kind, row, dst),
+        }
+    }
+    let column = |c: usize| match &columns[c] {
+        Prepared::F32(v) => *v,
+        _ => unreachable!("float matmul needs f32 activations"),
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        let a = scratch.as_ptr();
+        let mut c = 0;
+        while c + 3 <= n {
+            // SAFETY: `scratch` holds FLOAT_ROW_TILE rows of `cols` floats,
+            // and every column has `cols` of them (checked by the backend).
+            let got = unsafe {
+                avx2::gemm_f32::<FLOAT_ROW_TILE, 3>(
+                    a,
+                    cols,
+                    cols,
+                    [
+                        column(c).as_ptr(),
+                        column(c + 1).as_ptr(),
+                        column(c + 2).as_ptr(),
+                    ],
+                )
+            };
+            for r in 0..rows {
+                out[r * n + c..r * n + c + 3].copy_from_slice(&got[r]);
+            }
+            c += 3;
+        }
+        while c < n {
+            // SAFETY: as above.
+            let got =
+                unsafe { avx2::gemm_f32::<FLOAT_ROW_TILE, 1>(a, cols, cols, [column(c).as_ptr()]) };
+            for r in 0..rows {
+                out[r * n + c] = got[r][0];
+            }
+            c += 1;
+        }
+        return;
+    }
+
+    for r in 0..rows {
+        let widened = &scratch[r * cols..(r + 1) * cols];
+        for c in 0..n {
+            out[r * n + c] = widened.iter().zip(column(c)).map(|(a, b)| a * b).sum();
+        }
     }
 }
 
@@ -1195,6 +1352,84 @@ mod avx2 {
             }
         }
         acc.map(|a| hsum(a))
+    }
+
+    /// Q3_K against Q8_K activations.
+    ///
+    /// A 3-bit value is the two bits in `qs` plus a third from a `hmask` bit
+    /// plane, and it is signed: a clear mask bit means four lower, so the
+    /// range is -4..3. Adding four makes it 0..7 and unsigned, which is what
+    /// `vpmaddubsw` needs, and the correction is exactly
+    /// `4 * sum(y)` over each sixteen-value sub-block -- which Q8_K already
+    /// carries as `bsums`. So the whole block is
+    /// `d * sum_g scale_g * (sum u*y - 4 * bsums_g)`.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn q3k_n<const N: usize>(row: &[u8], xs: [&[BlockQ8K]; N]) -> [f32; N] {
+        let m3 = _mm256_set1_epi8(3);
+        let m1 = _mm256_set1_epi8(1);
+        let mut acc = [_mm256_setzero_ps(); N];
+        let mut acc_m = [_mm256_setzero_ps(); N];
+        let w = row.as_ptr();
+        for b in 0..row.len() / 110 {
+            let block = w.add(b * 110);
+            let hmask = block;
+            let qs = block.add(32);
+            let scales = crate::quant::q3k_scales(std::slice::from_raw_parts(block.add(96), 12));
+            let mut sumi = [_mm256_setzero_si256(); N];
+            macro_rules! pass {
+                ($half:expr, $shift:literal) => {{
+                    // Sub-blocks g and g + 1, whose activations are
+                    // adjacent. Each (half, shift) pair covers two of the
+                    // sixteen, so g steps by two.
+                    let g = $half * 8 + 2 * $shift;
+                    let q = _mm256_loadu_si256(qs.add(32 * $half) as *const __m256i);
+                    let hm = _mm256_loadu_si256(hmask as *const __m256i);
+                    let low = _mm256_and_si256(_mm256_srli_epi16::<{ 2 * $shift }>(q), m3);
+                    // Bit (shift + 4 * half) of each mask byte, as a 0 or 4.
+                    let bit = _mm256_and_si256(_mm256_srli_epi16::<{ $shift + 4 * $half }>(hm), m1);
+                    let u = _mm256_or_si256(low, _mm256_slli_epi16::<2>(bit));
+                    let s = _mm256_inserti128_si256::<1>(
+                        _mm256_castsi128_si256(_mm_set1_epi16(scales[g] as i16)),
+                        _mm_set1_epi16(scales[g + 1] as i16),
+                    );
+                    for c in 0..N {
+                        let a = xs[c].get_unchecked(b);
+                        let y = _mm256_loadu_si256(a.qs.as_ptr().add(g * 16) as *const __m256i);
+                        let p = _mm256_maddubs_epi16(u, y);
+                        sumi[c] = _mm256_add_epi32(sumi[c], _mm256_madd_epi16(p, s));
+                    }
+                }};
+            }
+            pass!(0, 0);
+            pass!(0, 1);
+            pass!(0, 2);
+            pass!(0, 3);
+            pass!(1, 0);
+            pass!(1, 1);
+            pass!(1, 2);
+            pass!(1, 3);
+
+            let d = half8(block.add(108));
+            // The +4 correction: 4 * sum_g scale_g * bsums_g.
+            let sc16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(scales.as_ptr() as *const __m128i));
+            for c in 0..N {
+                let a = xs[c].get_unchecked(b);
+                let ad = _mm256_set1_ps(a.d);
+                acc[c] = _mm256_fmadd_ps(_mm256_mul_ps(ad, d), _mm256_cvtepi32_ps(sumi[c]), acc[c]);
+                let bsums = _mm256_loadu_si256(a.bsums.as_ptr() as *const __m256i);
+                let folded = _mm256_madd_epi16(sc16, bsums);
+                let folded = _mm256_hadd_epi32(folded, folded);
+                let folded = _mm256_hadd_epi32(folded, folded);
+                let total = (_mm256_extract_epi32(folded, 0) + _mm256_extract_epi32(folded, 4)) * 4;
+                acc_m[c] =
+                    _mm256_fmadd_ps(_mm256_mul_ps(ad, d), _mm256_set1_ps(total as f32), acc_m[c]);
+            }
+        }
+        let mut out = [0.0_f32; N];
+        for c in 0..N {
+            out[c] = hsum(acc[c]) - _mm256_cvtss_f32(acc_m[c]);
+        }
+        out
     }
 
     /// Q2_K against Q8_K activations.
@@ -1880,6 +2115,41 @@ mod avx2 {
         sum
     }
 
+    /// `R` widened weight rows (stride `lda`) against `N` activation
+    /// columns, as `R * N` independent accumulators over the shared `k`
+    /// loop. Each of the `R + N` loads per step feeds `N` or `R` FMAs.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn gemm_f32<const R: usize, const N: usize>(
+        a: *const f32,
+        lda: usize,
+        cols: usize,
+        xs: [*const f32; N],
+    ) -> [[f32; N]; R] {
+        let mut acc = [[_mm256_setzero_ps(); N]; R];
+        let mut i = 0;
+        while i + 8 <= cols {
+            let bs: [__m256; N] = std::array::from_fn(|c| _mm256_loadu_ps(xs[c].add(i)));
+            for (r, row) in acc.iter_mut().enumerate() {
+                let av = _mm256_loadu_ps(a.add(r * lda + i));
+                for (c, slot) in row.iter_mut().enumerate() {
+                    *slot = _mm256_fmadd_ps(av, bs[c], *slot);
+                }
+            }
+            i += 8;
+        }
+        let mut out = [[0.0_f32; N]; R];
+        for (r, row) in acc.iter().enumerate() {
+            for (c, slot) in row.iter().enumerate() {
+                let mut sum = hsum(*slot);
+                for k in i..cols {
+                    sum += *a.add(r * lda + k) * *xs[c].add(k);
+                }
+                out[r][c] = sum;
+            }
+        }
+        out
+    }
+
     /// f32 · f32 (used after dequantizing a row once for several columns).
     #[target_feature(enable = "avx2,fma,f16c")]
     pub unsafe fn dot_f32_f32(a: &[f32], x: &[f32]) -> f32 {
@@ -1932,6 +2202,8 @@ mod tests {
             GgmlType::Q6K => &[208],
             // Q2_K keeps its scale and minimum at the end of the block.
             GgmlType::Q2K => &[80, 82],
+            // Q3_K keeps a single scale at the very end.
+            GgmlType::Q3K => &[108],
             _ => &[],
         };
         for &at in scale_offsets {
@@ -1942,8 +2214,9 @@ mod tests {
     }
 
     /// Types whose blocks can be filled with random bytes (finite scales).
-    const RANDOM_TYPES: [GgmlType; 7] = [
+    const RANDOM_TYPES: [GgmlType; 8] = [
         GgmlType::Q2K,
+        GgmlType::Q3K,
         GgmlType::Q4K,
         GgmlType::Q5K,
         GgmlType::Q6K,

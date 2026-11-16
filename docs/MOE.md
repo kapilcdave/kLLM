@@ -1,0 +1,369 @@
+# Mixture-of-Experts in kLLM
+
+A design note, not a plan of record. It exists because MoE is the strongest
+case kLLM has for its own thesis, and because most of the work is not the
+part that looks hard.
+
+## Why this matters more to kLLM than to a server engine
+
+A dense decoder reads every weight once per token. An MoE reads the router,
+the shared expert if there is one, and `k` of `N` experts. The ratio is the
+whole argument:
+
+| Model | Total | Active/token | Q4_K total | Q4_K active |
+|---|---|---|---|---|
+| Qwen3-30B-A3B | 30B | 3.3B | ~18 GiB | ~1.9 GiB |
+| Qwen3.5-35B-A3B | 35B | ~3B | (IQ2_XXS: 9.9 GiB) | ~0.9 GiB |
+
+On a 16 GiB machine a dense 30B is simply out of reach: every token needs all
+18 GiB, so a disk tier streams 18 GiB per token and the thing runs at
+one token every several seconds. An MoE needs ~1.9 GiB per token, and *which*
+1.9 GiB is data-dependent but repeats. That is the difference between
+"impossible" and "a caching problem", and caching problems are what kLLM's
+planner and disk tier already exist for.
+
+So the interesting claim is not "kLLM runs MoE" — it is "kLLM runs a 30B MoE
+on a 16 GiB laptop at a useful rate, because it only resides the experts that
+get used."
+
+## What the format actually requires
+
+Metadata, under the `{arch}.` prefix (verified against llama.cpp b12099):
+
+| Key | Meaning |
+|---|---|
+| `expert_count` | `N`, experts per layer |
+| `expert_used_count` | `k`, experts chosen per token |
+| `expert_feed_forward_length` | each expert's FFN width, *not* `feed_forward_length` |
+| `expert_shared_count`, `expert_shared_feed_forward_length` | an always-on expert alongside the routed ones |
+| `expert_weights_norm` | renormalize the top-`k` router weights to sum 1 |
+| `expert_weights_scale` | scale applied to the router weights |
+| `expert_gating_func` | softmax or sigmoid (DeepSeek-V3 uses sigmoid) |
+
+Tensors, per block:
+
+| Tensor | Shape (GGML order) |
+|---|---|
+| `ffn_gate_inp.weight` | `[n_embd, n_expert]` — the router |
+| `ffn_gate_exps.weight`, `ffn_up_exps.weight` | `[n_embd, n_ff_exp, n_expert]` |
+| `ffn_down_exps.weight` | `[n_ff_exp, n_embd, n_expert]` |
+| `ffn_{gate,up,down}_shexp.weight`, `ffn_gate_inp_shexp.weight` | the shared expert |
+
+**The 3-D tensors are the good news.** `[n_embd, n_ff_exp, n_expert]` is
+`n_expert` contiguous 2-D matrices of `[n_embd, n_ff_exp]`, so expert `e` is a
+byte offset: `e * n_ff_exp * row_bytes(n_embd)`. `src/gguf.rs` already parses
+3-D tensors and `TensorInfo::byte_size` already computes their size
+correctly. Nothing in the parser needs touching, and the existing `Matrix`
+type describes an expert slice unchanged.
+
+What does need changing is small and well-bounded:
+
+- `Loader::matrix` requires `dimensions == [cols, rows]` exactly. It needs a
+  sibling that accepts a third dimension and returns the per-expert stride.
+- `Layer` grows a variant: routed FFN (router + three expert blocks +
+  optional shared expert) instead of the three dense matrices.
+- `Model::weight_bytes` and `layer_bytes` currently assume every weight is
+  read every token, which is exactly what stops being true. They feed the
+  planner and the bench bandwidth figure, so both need an "active bytes"
+  notion distinct from "resident bytes".
+
+## The forward pass
+
+Per token, per layer: `logits = ffn_gate_inp · x`; softmax or sigmoid; top-`k`;
+optionally renormalize and scale; then `y = Σ_e w_e · SwiGLU_e(x)`, plus the
+shared expert's unweighted contribution.
+
+Two things here are easy to get quietly wrong, and both change output without
+failing anything: the order of (top-k, normalize, scale) differs between
+architectures, and ties in top-k selection have to break the same way
+llama.cpp breaks them. This is precisely what `kllm compare` is for — a
+router that picks a different 8th expert on 2% of tokens will show up as a KL
+divergence against llama.cpp on the same file, and as nothing at all in a
+perplexity check.
+
+## The two real engineering problems
+
+**Decode is a latency problem, not a bandwidth one.** Qwen3-30B-A3B has
+`n_ff_exp = 768`, so one expert's `gate` is 768x2048 — about 0.8 MiB at Q4_K.
+Per layer the engine does one router matvec plus 8 experts x 3 matvecs = 25
+matmul calls where a dense model does 3. Over 48 layers that is ~1200 parallel
+regions per token against a dense model's ~150. kLLM's pool dispatch is
+0.47 µs, so that alone is sub-millisecond, but `MIN_TASK_BYTES` (48 KiB) would
+carve each 0.8 MiB expert into ~16 tasks and the scheduler would spend its
+time on bookkeeping. The right shape is one parallel region per layer over all
+`k x rows` expert rows, not `k` separate `matmul_many` calls — i.e. the
+`Job` list already supported by `matmul_many`, extended to let each job carry
+its own input scaling.
+
+**Prefill needs tokens sorted by expert** -- done, and worth 52%. Each of
+`B` tokens picks its own `k` experts, so a per-token loop reads an expert's
+weights once per token that chose it. Sorting gathers the tokens that chose
+each expert, runs one matmul over that group, and scatters the results back
+weighted, so each expert is read once per batch: at batch 64 with 8 of 128
+experts a layer reads `64 x 8` expert copies naively against 128 sorted.
+Measured on Qwen3-30B-A3B, pp64 over three interleaved rounds: 16.2, 13.9,
+13.9 tok/s per-token against 19.3, 24.7, 22.7 sorted.
+
+Sorting then makes the batch width matter, where it did not before, because
+a batch of `b` gives each expert about `b * k / N` tokens to work on. At
+pp256: 7.1 tok/s at batch 64 (4 tokens an expert), 11.4 at 128 (8), and 16.2
+at 256 (16). So the default batch is now expert-aware --
+`16 * n_expert / n_expert_used`, capped at 256 -- while dense models keep 64,
+since they gain nothing from a wider batch and pay for it in logits scratch.
+
+Tried and rejected: repacking each expert's slice eight rows at a time into
+a reusable buffer, so the sorted groups could use the batched kernels. An
+expert is used once per sorted batch, which makes it look free, but the
+repack is a read and a write over the slice -- about 8 MiB of traffic
+against 2.65 for reducing it in place -- and a group of ~16 columns cannot
+amortize that. It cost prefill a third (pp256 6.7 and 8.3 tok/s against 10.7
+and 10.3). It would only pay if the repacked form were cached across
+batches, which is a second copy of the model again, which is the thing that
+does not fit.
+
+That scratch is the catch, and it is why the batch is also capped by the
+prompt. At batch 256 a 151936-token vocabulary needs 155 MiB of logits
+scratch for the whole session, and that competes with the page cache the
+experts live in: measured, a batch of 256 against 64 is neutral to slightly
+worse for decode (warm, 10.0 and 10.7 against 9.3 and 10.1 tok/s). `run`
+therefore tokenizes before loading and asks for
+`min(default, prompt_tokens)`, so a twenty-token prompt allocates 14 MiB and
+a 463-token one allocates 208 MiB and prefills at 12.1 tok/s.
+
+Perplexity moves from 13.0682 to 12.9472, which is within llama.cpp's own
+1.23% band (+0.38% from its flash-attention-off figure): summing a token's
+experts in expert-index order rather than router-rank order is a different
+summation order, amplified as everything here is by routing.
+
+But note the arithmetic: the average tokens-per-expert is `B x k / N`. For
+Qwen3-30B-A3B at the current default batch of 64, that is `64 x 8 / 128 = 4`
+— still too narrow to tile well. MoE prefill wants a much larger batch (512
+gives 32 per expert), which interacts with the planner's scratch budget. The
+batch default should become architecture-aware.
+
+And one correction to the obvious reading of "token sorting saves traffic".
+It does not change *which* experts a batch reads — across 256 tokens picking
+8 of 128, essentially all 128 get touched — only *how many times* each is
+read. Naive, a 256-token chunk makes `256 x 8 = 2048` expert visits per layer
+against ~128 distinct ones: 16x redundant. Sorted, it makes 128.
+
+Whether that redundancy costs anything depends on a number worth having to
+hand for Qwen3-30B-A3B at Q4_K: an expert is `3 x 768 x 2048` parameters,
+about 2.6 MiB, so one layer's 128 experts are ~337 MiB and the whole model is
+~16 GiB of experts. A single layer's expert set therefore fits in RAM *even
+when the model does not*, which means the 16x redundancy lands on the page
+cache rather than the disk, and sorting mainly buys back dispatch and compute
+rather than bandwidth. That is a much weaker reason to do it than it first
+appears, and it should be measured before being built — the same discipline
+this note asks for everywhere else.
+
+## The decisive unknown: expert locality
+
+Everything above is ordinary work. The thing that decides whether the
+headline claim is true is a question about data, not code: **across
+single-stream decode, how concentrated is expert selection?**
+
+If the hot working set is small and stable, an LRU over experts serves most
+reads from RAM and a 30B MoE runs at a useful rate on this laptop. If
+selection is close to uniform and shifts every token, then every token needs
+~1.9 GiB from disk, NVMe gives ~2-3 GiB/s, and the answer is ~1 token/s no
+matter how good the cache is.
+
+Published routing analyses report real skew, but skew measured over a corpus
+with large batches is not the same as temporal locality in one stream, and
+the second is what a cache sees. So this should be measured, and it is cheap
+to measure the moment the router works:
+
+1. Implement the router and the MoE FFN with no caching at all, on a model
+   that fits in RAM.
+2. Log `(layer, token, expert[k])` for a few thousand tokens of real text.
+3. Offline, replay the trace against LRU caches of various sizes and plot hit
+   rate against cache bytes.
+
+That is a day's work and it decides whether to build the expert cache at all.
+Doing it before the cache, rather than after, is the whole point — the cache
+is the expensive part and it is worthless if the hit rate is flat.
+
+### Measured, 2026-11-15
+
+Qwen3-30B-A3B Q4_K_M, 146 decode positions of ordinary prose, 48 layers,
+8 of 128 experts per token (`KLLM_ROUTER_TRACE` plus
+`scripts/expert_locality.py`):
+
+| LRU over (layer, expert) | hit rate |
+|---|---|
+| 0.95 GiB | 13.6% |
+| 1.91 GiB | 61.3% |
+| 4.78 GiB | 84.6% |
+| 7.17 GiB | 92.1% |
+| 9.56 GiB (everything touched) | 93.4% |
+
+The curve is not flat, so the idea holds. Selection is genuinely skewed --
+the hottest 10% of a layer's experts take 38.3% of its reads against 10% for
+a uniform distribution -- and the reuse is across tokens rather than trivial:
+only 21 of 56,064 reads repeat the same (layer, expert) consecutively. Over
+146 positions just 3,688 of the 6,144 possible (layer, expert) pairs were
+ever touched, 9.56 GiB of the model's ~16 GiB of experts.
+
+**The actionable finding is about granularity, not caching per se.** The
+residency planner holds *whole blocks*: on this machine it resides 24 of 48
+and streams the rest, so roughly half the layers hit in RAM always and the
+other half depend on the page cache. But the table says an expert-granular
+cache of the same size reaches 85-92%. The hot experts are spread across all
+48 layers, and block residency cannot express "the hottest experts
+everywhere" — so the same RAM buys a worse hit rate. Making residency
+expert-granular for routed models is the next step, and it is now a measured
+step rather than a guessed one.
+
+One honest caveat about the `est. tok/s` column the script prints: it counts
+only the disk misses. This model needs about 2.1 G MAC per token, which at
+the batch-one matvec rate this machine sustains is a ceiling near 10-14
+tok/s regardless of the cache. So the realistic target is around 10 tok/s,
+not the 38 the disk arithmetic alone suggests. Against the 2.7 tok/s measured
+today that is still worth having, and it also says the compute path (one
+parallel region per layer rather than `k` separate matmuls, see above) has to
+improve alongside the cache or it becomes the wall.
+
+A secondary measurement from the same trace: whether the top-`k` set for
+layer `L+1` is predictable from layer `L`'s hidden state early enough to
+prefetch. If it is, the disk tier can issue reads ahead of need, which is
+worth more than cache size.
+
+## What to target first
+
+**Not the file already on disk.** `Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf` looks
+tempting but needs four new things at once: MoE, `IQ2_XXS` (a codebook quant,
+unlike every type kLLM has), M-RoPE (`rope.dimension_sections = [11,11,10,0]`),
+and whatever Qwen3.5's hybrid attention layers need. Its 120 expert tensors
+are all IQ2_XXS, so it cannot run until that kernel exists.
+
+**Qwen3-30B-A3B Q4_K_M is the smallest code delta.** The arch is `qwen3moe`,
+whose attention is identical to the `qwen3` kLLM already runs — per-head q/k
+RMSNorm, NeoX rotary — so the only new code is the FFN. 128 experts, 8 used,
+and standard K-quants throughout. It is ~18 GiB, which means it exercises the
+disk tier from day one; that is the demo, but it makes the correctness loop
+slow.
+
+So, pick one of two openings:
+
+- **Correctness-first:** add `qwen3moe` and validate on Qwen3-30B-A3B via
+  perplexity and greedy fixtures against llama.cpp (one model resident at a
+  time, so `kllm compare`'s two-model requirement does not apply). ~18 GiB
+  download, slow iteration, but it is the model the thesis is about.
+- **Loop-speed-first:** add `olmoe` (OLMoE-1B-7B, 64 experts, 8 used, ~4 GiB
+  at Q4_K_M) which fits in RAM, get the router and the locality trace quickly,
+  then add `qwen3moe`. Costs one extra architecture, buys a fast iteration
+  loop and an early answer on locality.
+
+Either way the staging is: router and routed FFN correct on a RAM-resident
+model → locality trace → expert-granularity residency in the planner and
+disk tier → prefill token sorting.
+
+**Status, 2026-11-16.** `qwen3moe` runs Qwen3-30B-A3B Q4_K_M -- a 17.3 GiB
+model on a machine with 16 GiB -- at 11.3 tok/s decode against llama.cpp's
+1.81, from a starting point of 1.4, and 24.7 tok/s prefill against 16.2
+before sorting (12.1 tok/s on a real 463-token prompt). Decode is now at memory bandwidth; prefill got the 52%. None
+of it was kernel work.
+
+## Routing amplifies numerical noise, and that sets the tolerance
+
+Validating an MoE against another implementation is harder than validating a
+dense model, for a reason specific to routing: **expert selection is a
+discrete function of the router's logits.** Two legitimate summation orders
+that differ in the last bits will occasionally rank the 8th and 9th experts
+differently, and then a whole different expert's feed-forward runs.
+
+Measured, between kLLM's own two kernel paths (x8-repacked and row-major,
+same model, same prompt): **12.3% of routing decisions select a different set
+of experts.** The flip is nearly always the marginal last pick --
+`...109,92` against `...109,70` -- exactly where two logits are nearly tied.
+
+So a 1% perplexity bound of the kind the dense models are held to is not
+achievable here, and chasing one would mean chasing noise. The honest
+reference is the implementation's own spread, which is what
+`tests/perplexity.rs` already uses for quantized models. On Qwen3-30B-A3B
+Q4_K_M over 508 scored tokens:
+
+| | perplexity |
+|---|---|
+| llama.cpp, flash attention on | 13.0579 |
+| llama.cpp, flash attention off | 12.8979 |
+| *llama.cpp against itself* | *1.23%* |
+| kLLM | 12.9014 (+0.03% from fa off) |
+
+kLLM lands inside llama.cpp's own band, nearly exactly on one end of it.
+That is the claim the evidence supports.
+
+Two corrections to what this note said before the measurement. An earlier
+figure of "+0.236%" came from a single 256-token chunk -- 127 scored tokens,
+stderr +/-31% -- and was partly luck: at that sample size kLLM's repacked
+path reads 13.4831 and its row-major path 13.9309, straddling llama.cpp's
+13.7109, and the mixed residency in force at the time happened to land
+between them. Small-sample perplexity cannot discriminate at the 1% level on
+a model this deep. And the repacked and row-major paths differing by 3.3% is
+not a bug in either: it is the same routing amplification, measured a second
+way.
+
+## Residency: the planner was charging for pages it never fetched
+
+The first working version ran at 1.4 tok/s, and the cause was accounting.
+`Residency::plan` summed *all* of a block's bytes, experts included, to
+decide what could stay resident. But experts are demand-paged and never
+prefetched (see `stream_ahead`), so the plan reserved budget for pages it
+would never fetch, concluded that only 17 of 48 blocks fit, and then
+streamed the other 31 -- releasing their attention weights with `DontNeed`
+every token and re-reading them, while the read-ahead competed for the page
+cache the experts actually needed.
+
+Excluding expert tensors from the plan makes the managed set about 1 GiB for
+this model, so every block stays resident, nothing streams, and all the
+remaining RAM serves as expert page cache. Measured, same prompt:
+
+| residency | tok/s |
+|---|---|
+| whole-block accounting (17 of 48 resident, 31 streamed) | 1.4 |
+| expert bytes excluded (nothing streamed) | 8.0 - 10.9 |
+
+That is 6-7x, and it lands at the ~10-14 tok/s compute ceiling this model
+implies, so decode is now compute-bound rather than traffic-bound. The
+kernel's page-cache LRU is doing the expert caching, which is what the
+locality curve above said would work.
+
+A second, related finding from the same reasoning: **x8 repacking stands
+down when the experts are demand-paged.** A repacked copy is a second copy,
+on the heap, about a gigabyte for this model -- and against a locality curve
+that is still climbing steeply at 5-7 GiB, that gigabyte is worth more as
+page cache than as a faster layout for the 28% of the token that is not
+expert work. Measured over four interleaved rounds:
+
+| | decode tok/s | prefill tok/s |
+|---|---|---|
+| repacked | 7.8, 9.8, 9.2, 8.9 | 7.2, 8.1 |
+| not repacked | 11.2, 10.0, 10.2, 11.0 | 9.1, 14.7 |
+
+Not repacking wins both, by about 19% on decode. (An earlier single
+comparison suggested repacking won on prefill; it was confounded by page
+cache state, which is the standing hazard in every measurement on this
+page.) The rule is conditional on pressure rather than on being an MoE: a
+routed model small enough to hold entirely still repacks.
+
+Perplexity under this default is 13.0682 against llama.cpp's 13.0579 with
+flash attention on, +0.08%.
+
+An explicit expert cache is therefore *not* the next thing to build: the
+free one already gets us there.
+
+And "there" turns out to be memory bandwidth, not compute. Decode streams
+20.0 GiB/s of weights at 11.2 tok/s, against 20.7 GB/s for a Q4_0 matvec and
+27.3 for F16 on this machine (`examples/kernel_bench`, 4096x4096, four
+threads) -- so roughly 80-100% of what the hardware gives, depending on
+which ceiling is fair for Q4_K. A token reads about 1.79 GiB: 1.02 of
+experts, 283 MiB of qkv, 226 of the output projection and 255 of the head.
+Fusing the per-expert matmuls into one parallel region, sharing the
+activation quantization, better tiling -- all of it is worth a few percent
+against that. **Decode has no headroom left in the compute path**, and the
+only remaining lever for it is reading fewer bytes, which means trading
+quality (fewer experts) rather than engineering.
+
+Prefill was the opposite case and is where the work went: see the sorting
+above.
