@@ -227,9 +227,10 @@ Either way the staging is: router and routed FFN correct on a RAM-resident
 model → locality trace → expert-granularity residency in the planner and
 disk tier → prefill token sorting.
 
-**Status, 2026-11-15.** `qwen3moe` runs, at 10.9 tok/s against llama.cpp's
+**Status, 2026-11-15.** `qwen3moe` runs, at 11.3 tok/s against llama.cpp's
 1.81 on Qwen3-30B-A3B Q4_K_M -- 6x, on a machine with 16 GiB for a 17.3 GiB
-model. See "Residency" below for where that came from.
+model, and from a starting point of 1.4. See "Residency" below for where
+that came from; none of it was kernel work.
 
 ## Routing amplifies numerical noise, and that sets the tolerance
 
@@ -294,6 +295,27 @@ That is 6-7x, and it lands at the ~10-14 tok/s compute ceiling this model
 implies, so decode is now compute-bound rather than traffic-bound. The
 kernel's page-cache LRU is doing the expert caching, which is what the
 locality curve above said would work.
+
+A second, related finding from the same reasoning: **x8 repacking stands
+down when the experts are demand-paged.** A repacked copy is a second copy,
+on the heap, about a gigabyte for this model -- and against a locality curve
+that is still climbing steeply at 5-7 GiB, that gigabyte is worth more as
+page cache than as a faster layout for the 28% of the token that is not
+expert work. Measured over four interleaved rounds:
+
+| | decode tok/s | prefill tok/s |
+|---|---|---|
+| repacked | 7.8, 9.8, 9.2, 8.9 | 7.2, 8.1 |
+| not repacked | 11.2, 10.0, 10.2, 11.0 | 9.1, 14.7 |
+
+Not repacking wins both, by about 19% on decode. (An earlier single
+comparison suggested repacking won on prefill; it was confounded by page
+cache state, which is the standing hazard in every measurement on this
+page.) The rule is conditional on pressure rather than on being an MoE: a
+routed model small enough to hold entirely still repacks.
+
+Perplexity under this default is 13.0682 against llama.cpp's 13.0579 with
+flash attention on, +0.08%.
 
 An explicit expert cache is therefore *not* the next thing to build: the
 free one already gets us to the compute ceiling. The next lever is the

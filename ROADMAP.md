@@ -27,9 +27,9 @@ and execute Llama-family models without exceeding a configured budget.
 
 1. **Routed decode compute.** Mixture-of-experts runs (`qwen3moe`, designed
    in [docs/MOE.md](docs/MOE.md)): Qwen3-30B-A3B Q4_K_M, a 17.3 GiB model on
-   a 16 GiB laptop, at **10.9 tok/s against llama.cpp's 1.81** -- 6x -- and
-   inside llama.cpp's own perplexity spread (12.9014 against its 12.8979
-   with flash attention off and 13.0579 with it on, a 1.23% band).
+   a 16 GiB laptop, at **11.3 tok/s against llama.cpp's 1.81** -- 6x, up from
+   1.4 -- with perplexity 13.0682 against llama.cpp's 13.0579 (+0.08%, and
+   its own flash-attention spread on this model is 1.23%).
 
    Decode is now compute-bound, not traffic-bound, so the next lever is the
    routed path itself: one parallel region per layer instead of `k` separate

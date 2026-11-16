@@ -407,6 +407,9 @@ pub struct Residency {
     /// budget for pages that are never prefetched, which is what made an
     /// MoE stream blocks it had no need to.
     pub demand_bytes: u64,
+    /// True when those expert pages cannot all be held: every byte of RAM
+    /// is then worth more as page cache for them than as anything else.
+    pub demand_paged: bool,
 }
 
 impl Residency {
@@ -432,12 +435,14 @@ impl Residency {
             }
         }
         let total: u64 = layer.iter().sum::<u64>() + head + other;
+        let contended = budget.is_some_and(|b| total + demand > b);
         let all = Self {
             first_streamed: n_layer,
             head_streamed: false,
             streamed_bytes: 0,
             resident_bytes: total,
             demand_bytes: demand,
+            demand_paged: demand > 0 && contended,
         };
         let Some(budget) = budget else { return all };
         if total <= budget {
@@ -463,6 +468,7 @@ impl Residency {
             streamed_bytes,
             resident_bytes: total - streamed_bytes,
             demand_bytes: demand,
+            demand_paged: demand > 0,
         }
     }
 }
@@ -505,7 +511,12 @@ impl Model {
         let loader = Loader {
             file: &file,
             packed: std::cell::RefCell::new(Vec::new()),
-            repack: std::env::var_os("KLLM_NO_REPACK").is_none(),
+            // An x8-repacked copy is a second copy, on the heap. When the
+            // experts have to be demand-paged, that gigabyte is worth more
+            // as page cache for them: measured on Qwen3-30B-A3B, repacking
+            // costs 19% of decode (mean 8.9 against 10.6 tok/s over four
+            // interleaved rounds) and prefill too.
+            repack: std::env::var_os("KLLM_NO_REPACK").is_none() && !residency.demand_paged,
             streaming: std::cell::Cell::new(false),
             released: std::cell::RefCell::new(Vec::new()),
         };
@@ -581,10 +592,7 @@ impl Model {
             });
         }
         // Read ahead only what stays resident; streamed blocks are read
-        // block by block during the forward pass. With demand-paged experts
-        // the mapping is far larger than RAM, and advising the whole of it
-        // would have the kernel read pages it must immediately drop --
-        // competing with the page cache the experts depend on.
+        // block by block during the forward pass.
         if residency.first_streamed == c.n_layer
             && !residency.head_streamed
             && residency.demand_bytes == 0
@@ -597,7 +605,7 @@ impl Model {
             file.release(w.offset, w.len);
         }
         let packed = loader.packed.into_inner();
-        Ok(Self {
+        let model = Self {
             file,
             config,
             token_embd,
@@ -610,7 +618,37 @@ impl Model {
             residency,
             #[cfg(feature = "cuda")]
             gpu: None,
-        })
+        };
+        model.pin_managed_weights();
+        Ok(model)
+    }
+
+    /// Read ahead everything a routed model touches every token, which is
+    /// everything except the experts.
+    ///
+    /// Without this the attention and head weights are demand-paged like the
+    /// experts, and the experts evict them: there are sixteen gigabytes of
+    /// expert pages competing for the cache against one gigabyte that every
+    /// single token needs. It showed up as `qkv proj` costing 10% of a token
+    /// to move six megabytes of weights -- 0.8 G MAC/s where the experts
+    /// managed 20.
+    fn pin_managed_weights(&self) {
+        if self.residency.demand_bytes == 0 {
+            return; // a dense model is already handled by `advise_willneed`.
+        }
+        for layer in &self.layers {
+            if layer.streamed {
+                continue; // deliberately read block by block instead.
+            }
+            for w in layer.matrices() {
+                self.file.prefetch(w.offset, w.len);
+            }
+        }
+        if !self.residency.head_streamed {
+            self.file.prefetch(self.output.offset, self.output.len);
+        }
+        self.file
+            .prefetch(self.token_embd.offset, self.token_embd.len);
     }
 
     pub fn info(&self) -> &GgufInfo {
