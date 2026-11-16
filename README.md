@@ -1,37 +1,121 @@
-# kLLM
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="kLLM" width="100%">
+</p>
 
-kLLM (Kapil LLM) is a memory-first LLM inference engine in Rust for quantized
-models on older, memory-constrained machines. Its reference machine is a Dell
-Precision 5520 (Xeon E3-1505M v6, 16 GiB RAM, 4 GiB Quadro M1200).
+<h3 align="center">Memory-first LLM inference in Rust, for the machine you already own</h3>
 
-It reads GGUF files in place (memory-mapped, never copied), plans every large
-allocation before making it, and runs Llama-family decoders on the CPU with
-AVX2 kernels whose output is checked against llama.cpp.
+<p align="center">
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/license-Apache--2.0%20%2F%20MIT-blue" alt="license"></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/version-v0.1.0-green" alt="version"></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-2024%20edition-f74c00?logo=rust&logoColor=white" alt="rust"></a>
+  <img src="https://img.shields.io/badge/CPU-AVX2%20%7C%20scalar-lightgrey" alt="cpu">
+  <img src="https://img.shields.io/badge/CUDA-optional,%20no%20toolkit-76b900?logo=nvidia&logoColor=white" alt="cuda">
+  <img src="https://img.shields.io/badge/format-GGUF-8a2be2" alt="gguf">
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick start</a> |
+  <a href="#supported-models">Models</a> |
+  <a href="#a-30b-model-on-a-16-gib-laptop">30B on 16 GiB</a> |
+  <a href="#correctness">Correctness</a> |
+  <a href="#performance">Performance</a> |
+  <a href="docs/MOE.md">MoE design</a> |
+  <a href="SPEC.md">Spec</a> |
+  <a href="ROADMAP.md">Roadmap</a>
+</p>
+
+---
+
+## About
+
+kLLM (Kapil LLM) is an inference engine for quantized models on older,
+memory-constrained machines. It reads GGUF files in place (memory-mapped,
+never copied), plans every large allocation before making it, and runs
+Llama- and Qwen-family decoders with AVX2 kernels whose output is checked
+against llama.cpp.
+
+Its reference machine is a Dell Precision 5520: a Xeon E3-1505M v6, 16 GiB of
+RAM and a 4 GiB Quadro M1200. On it, kLLM runs **Qwen3-30B-A3B at 10-11 tok/s,
+6x llama.cpp** on the same file.
+
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <h4>🧠 Memory-first</h4>
+      Every large allocation is planned from real tensor sizes and KV costs
+      before it happens. <code>run</code> prints its plan and refuses a
+      context that will not fit, instead of swapping the machine to death.
+    </td>
+    <td width="33%" valign="top">
+      <h4>💽 Three weight tiers</h4>
+      VRAM, RAM, and the file itself. Models bigger than RAM stream blocks
+      from disk with read-ahead and immediate release, so the stream never
+      evicts the resident set.
+    </td>
+    <td width="33%" valign="top">
+      <h4>🧩 Mixture of experts</h4>
+      Experts are demand-paged, and the kernel page cache becomes the expert
+      cache for free. A 17.3 GiB 30B MoE runs on a 16 GiB laptop.
+    </td>
+  </tr>
+  <tr>
+    <td width="33%" valign="top">
+      <h4>⚡ Faster prefill than llama.cpp</h4>
+      1.15-1.61x on every weight type measured, float types included. Decode is
+      at parity or better on most types.
+    </td>
+    <td width="33%" valign="top">
+      <h4>✅ Checked against llama.cpp</h4>
+      Perplexity <i>and</i> KL divergence on real models, for 11 weight types.
+      Within 2% of llama.cpp on every one, and lower on eight of ten.
+    </td>
+    <td width="33%" valign="top">
+      <h4>🎮 CUDA without a toolkit</h4>
+      Whole blocks and the output head offload with
+      <code>--gpu-layers N|auto</code>. Kernels ship as PTX and load through the
+      driver, so building needs no CUDA install.
+    </td>
+  </tr>
+</table>
+
+## Quick start
 
 ```sh
+git clone https://github.com/kapilcdave/kLLM.git && cd kLLM
 cargo build --release
+
+# one-shot
 ./target/release/kllm run model.gguf --chat --prompt "Explain RoPE in one paragraph." -n 200
+
+# a conversation (ChatML models): keeps the session, so each turn feeds only what is new
+./target/release/kllm chat model.gguf
+
+# what fits where, for any GGUF
+./target/release/kllm plan-model model.gguf --vram-gib 3.7 --context 8192
 ```
 
-## What works today
+Building without the GPU backend: `cargo build --release --no-default-features`.
 
-| Area | Status |
+## Supported models
+
+| | |
 |---|---|
-| GGUF parsing | Full metadata and tensor directory; every length is bounds-checked against the file before allocation; payloads are memory-mapped |
-| Architectures | `llama` (Llama 1–3, Mistral, SmolLM, TinyLlama), `qwen2`, `qwen3`, `qwen3moe`. A 30B mixture of experts runs on a 16 GiB machine at 6x llama.cpp: see [docs/MOE.md](docs/MOE.md) |
-| Weight types | Validated end to end against llama.cpp on real models, by perplexity *and* KL divergence: F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q4_K, Q5_K, Q6_K. F32 is kernel-tested only |
-| Tokenizers | GPT-2 byte-level BPE (gpt2, smollm, llama3, qwen2 pre-tokenizers) and SentencePiece; special tokens; byte-exact with llama.cpp on the fixtures |
-| Execution | CPU: batched prefill, f16 KV cache, AVX2/FMA/F16C kernels with a portable scalar fallback |
-| Sampling | Greedy, temperature, top-k, top-p, min-p, repetition penalty, seeded |
-| Planning | Per-layer VRAM/RAM placement from real tensor sizes and KV costs |
-| CUDA | Whole transformer blocks and the output head run on the GPU with `--gpu-layers N|auto` (M6): kernels for all 12 weight types, coalesced struct-of-arrays matvecs for Q4_0/Q8_0/Q4_K/Q6_K, KV cache in VRAM. Loaded as PTX through the driver API, so no CUDA toolkit is needed. Perplexity matches llama.cpp on the GPU as closely as on the CPU (`tests/gpu.rs`) |
+| **Architectures** | `llama` (Llama 1–3, Mistral, SmolLM, TinyLlama), `qwen2`, `qwen3`, `qwen3moe`. A 30B mixture of experts runs on a 16 GiB machine at 6x llama.cpp: see [docs/MOE.md](docs/MOE.md) |
+| **Weight types** | Validated end to end against llama.cpp on real models, by perplexity *and* KL divergence: F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K. F32 is kernel-tested only |
+| **Tokenizers** | GPT-2 byte-level BPE (gpt2, smollm, llama3, qwen2 pre-tokenizers) and SentencePiece; special tokens; byte-exact with llama.cpp on the fixtures |
+| **GGUF parsing** | Full metadata and tensor directory; every length is bounds-checked against the file before allocation; payloads are memory-mapped |
+| **Execution** | CPU: batched prefill, f16 KV cache, AVX2/FMA/F16C kernels with a portable scalar fallback |
+| **Sampling** | Greedy, temperature, top-k, top-p, min-p, repetition penalty, seeded |
+| **CUDA** | Kernels for all weight types, coalesced struct-of-arrays matvecs for Q4_0/Q8_0/Q4_K/Q6_K, KV cache in VRAM. Perplexity matches llama.cpp on the GPU as closely as on the CPU (`tests/gpu.rs`) |
+| **In progress** | `qwen35` (Qwen3.5 hybrid attention / gated DeltaNet) loads every tensor; the recurrence is next. See [docs/QWEN35.md](docs/QWEN35.md) |
 
 ## Commands
 
 ```text
 kllm inspect MODEL.gguf [--tensors]
 kllm plan-model MODEL.gguf --vram-gib N [--context N]
-kllm run MODEL.gguf --prompt TEXT [-n N] [--chat] [--system TEXT] [--temp T] ...
+kllm run MODEL.gguf --prompt TEXT [-n N] [--chat] [--system TEXT] [--temp T] [--no-think] ...
+kllm chat MODEL.gguf
 kllm perplexity MODEL.gguf --file TEXT [--context 512] [--chunks N]
 kllm compare REFERENCE.gguf TEST.gguf --file TEXT [--context 512] [--chunks N]
 kllm bench MODEL.gguf [-p 128] [-n 64] [--profile]

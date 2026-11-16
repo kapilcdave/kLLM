@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="400" viewBox="0 0 1280 400">
+  <rect width="1280" height="400" fill="#121212"/>
+  <!-- mark: three memory tiers (VRAM / RAM / disk), stacked and slanted -->
+  <g transform="translate(372 132)">
+    <polygon points="34,0 150,0 128,36 12,36" fill="#ffffff"/>
+    <polygon points="22,50 138,50 116,86 0,86" fill="#ffffff" opacity="0.72"/>
+    <polygon points="10,100 126,100 104,136 -12,136" fill="#f74c00"/>
+  </g>
+  <text x="560" y="246" font-family="'JetBrains Mono','Fira Code','SFMono-Regular',Menlo,Consolas,'DejaVu Sans Mono',monospace"
+        font-size="148" font-weight="700" letter-spacing="-4"><tspan fill="#f74c00">k</tspan><tspan fill="#ffffff">LLM</tspan></text>
+</svg>
