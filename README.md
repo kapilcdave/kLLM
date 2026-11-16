@@ -146,15 +146,16 @@ is in [evals/](evals/); regenerate it with `scripts/eval_report.py`.
 | SmolLM2-135M Q6_K | 988 / 667 | 1.48x | 165 / 145 | 1.14x |
 | SmolLM2-135M Q2_K | 1089 / 814 | 1.34x | 247 / 244 | 1.01x |
 | SmolLM2-135M Q5_K_M | 462 / 352 | 1.31x | 157 / 167 | 0.94x |
-| SmolLM2-135M f16 | 282 / 484 | 0.58x | 85 / 82 | 1.04x |
+| SmolLM2-135M f16 | 629 / 547 | 1.15x | 85.5 / 82.3 | 1.04x |
 | Qwen3-0.6B Q4_K_M | 324 / 266 | 1.22x | 48.3 / 55.2 | 0.88x |
 | Qwen3-0.6B Q8_0 | 284 / 184 | 1.54x | 36.4 / 37.0 | 0.98x |
 
-Prefill is ahead of llama.cpp on every quantized type (1.22-1.65x) and behind
-on the two float types (0.58-0.61x), which have no x8-packed layout and so get
-a row dequantized to f32 and reduced once per activation column. Decode is
-parity or better on most types and trails on the K-quants (Q4_K 0.88x); it is
-memory-bandwidth-bound, where prefill is compute-bound.
+Prefill is ahead of llama.cpp on every weight type, float ones included
+(1.11-1.65x). Decode is parity or better on most types and trails on the
+K-quants (Q4_K 0.88x); it is memory-bandwidth-bound, where prefill is
+compute-bound, which is why the two respond to different things -- a register
+tile doubled float prefill and *cost* float decode until it was gated on
+batch size.
 
 Two notes on reading these numbers. Prefill was at 65% of llama.cpp until the
 real bottleneck turned up, and it was not the kernels: at *one* thread kLLM

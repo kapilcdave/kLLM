@@ -53,16 +53,10 @@ and execute Llama-family models without exceeding a configured budget.
    further (the Q4_0 kernel costs about what F16's does per element, so it
    is ALU-bound here); then fuse the small per-layer kernels (about 15
    launches per block at ~5 µs each).
-3. **Prefill for the float types.** F16 and BF16 prefill run at 0.58-0.61x
-   of llama.cpp while every quantized type is now ahead of it (1.22-1.65x). The x8 packing
-   covers only Q4_0, Q8_0, Q4_K and Q6_K, so a float row is dequantized to f32
-   and then reduced once per activation column; llama.cpp runs an f16 GEMM at
-   half the bytes with register tiling. Decode for these types is fine
-   (1.0x), so this is specifically the batched path.
-4. **Q3_K kernels**, the remaining common K-quant.
-5. **More architectures**: Gemma, Phi-3, and the hybrid Qwen3.5, whose
+3. **Q3_K kernels**, the remaining common K-quant.
+4. **More architectures**: Gemma, Phi-3, and the hybrid Qwen3.5, whose
    linear-attention layers need new kernels.
-6. `serve`: an OpenAI-compatible local HTTP endpoint (spec milestone 8).
+5. `serve`: an OpenAI-compatible local HTTP endpoint (spec milestone 8).
 
 ## Closed
 
@@ -73,6 +67,14 @@ and execute Llama-family models without exceeding a configured budget.
   any worker woke: 48% of a 1536x576 matmul and 71% of a 576x1536 one. Making
   it parallel and then vectorizing it took prefill to 1.22-1.65x llama.cpp on
   every quantized type. See `evals/` for the full table.
+- **Prefill for the float types.** F16 and BF16 prefill were the last place
+  kLLM lost to llama.cpp (0.58-0.61x). A float row has no x8-packed layout,
+  so it was widened to f32 and reduced against one column at a time: one FMA
+  per two loads. A 3x3 register tile (nine accumulators, 13 of 16 YMM
+  registers; 4x3 spills) made it 1.11-1.15x. The tile only pays once there
+  are columns to fill it -- at batch one, widening a row block to f32 is 3x
+  the bytes of the f16 it came from, and it cost bandwidth-bound decode
+  1.04x -> 0.82x before being gated on batch size.
 - **Real-model checks** for every weight type, by perplexity and KL
   divergence (`tests/divergence.rs`). This is what found the two weight types
   that were quietly running on scalar code -- BF16 (no entry in the AVX2

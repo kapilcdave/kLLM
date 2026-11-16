@@ -752,6 +752,97 @@ pub fn load_f16(src: &[u8], dst: &mut [f32]) {
     }
 }
 
+/// Weight rows widened at once by [`float_matmul`]. Three rows and three
+/// columns need nine accumulators plus four operand registers, which is the
+/// most that fits in sixteen YMM registers without spilling.
+pub const FLOAT_ROW_TILE: usize = 3;
+
+/// `out[r * columns.len() + c] = row (first_row + r) · columns[c]`, for a
+/// block of up to [`FLOAT_ROW_TILE`] rows of a float-typed matrix.
+///
+/// The float types (F32, F16, BF16) have no x8-packed layout, so a row is
+/// widened to f32 and then reduced against every activation column. Doing
+/// that one row at a time streams all the columns past L1 once per row and
+/// spends one FMA per pair of loads. Blocking rows against columns lets each
+/// load feed several FMAs instead -- with a 3x3 tile, nine FMAs per four
+/// loads -- which is where this path's time goes.
+#[allow(clippy::too_many_arguments)]
+pub fn float_matmul(
+    kind: GgmlType,
+    data: &[u8],
+    row_bytes: usize,
+    first_row: usize,
+    rows: usize,
+    cols: usize,
+    columns: &[Prepared<'_>],
+    out: &mut [f32],
+    scratch: &mut Vec<f32>,
+) {
+    debug_assert!(rows <= FLOAT_ROW_TILE);
+    debug_assert_eq!(out.len(), rows * columns.len());
+    let n = columns.len();
+    // Widen this block of rows once. Padding rows are zeroed rather than
+    // left stale so the tile kernel never meets a NaN it would then discard.
+    scratch.clear();
+    scratch.resize(FLOAT_ROW_TILE * cols, 0.0);
+    for r in 0..rows {
+        let row = &data[(first_row + r) * row_bytes..][..row_bytes];
+        let dst = &mut scratch[r * cols..(r + 1) * cols];
+        match kind {
+            GgmlType::F16 => load_f16(row, dst),
+            GgmlType::BF16 => load_bf16(row, dst),
+            _ => crate::quant::dequantize_row(kind, row, dst),
+        }
+    }
+    let column = |c: usize| match &columns[c] {
+        Prepared::F32(v) => *v,
+        _ => unreachable!("float matmul needs f32 activations"),
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        let a = scratch.as_ptr();
+        let mut c = 0;
+        while c + 3 <= n {
+            // SAFETY: `scratch` holds FLOAT_ROW_TILE rows of `cols` floats,
+            // and every column has `cols` of them (checked by the backend).
+            let got = unsafe {
+                avx2::gemm_f32::<FLOAT_ROW_TILE, 3>(
+                    a,
+                    cols,
+                    cols,
+                    [
+                        column(c).as_ptr(),
+                        column(c + 1).as_ptr(),
+                        column(c + 2).as_ptr(),
+                    ],
+                )
+            };
+            for r in 0..rows {
+                out[r * n + c..r * n + c + 3].copy_from_slice(&got[r]);
+            }
+            c += 3;
+        }
+        while c < n {
+            // SAFETY: as above.
+            let got =
+                unsafe { avx2::gemm_f32::<FLOAT_ROW_TILE, 1>(a, cols, cols, [column(c).as_ptr()]) };
+            for r in 0..rows {
+                out[r * n + c] = got[r][0];
+            }
+            c += 1;
+        }
+        return;
+    }
+
+    for r in 0..rows {
+        let widened = &scratch[r * cols..(r + 1) * cols];
+        for c in 0..n {
+            out[r * n + c] = widened.iter().zip(column(c)).map(|(a, b)| a * b).sum();
+        }
+    }
+}
+
 /// Widen bf16 bits to f32 in bulk.
 pub fn load_bf16(src: &[u8], dst: &mut [f32]) {
     debug_assert_eq!(src.len(), dst.len() * 2);
@@ -1878,6 +1969,41 @@ mod avx2 {
             i += 1;
         }
         sum
+    }
+
+    /// `R` widened weight rows (stride `lda`) against `N` activation
+    /// columns, as `R * N` independent accumulators over the shared `k`
+    /// loop. Each of the `R + N` loads per step feeds `N` or `R` FMAs.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn gemm_f32<const R: usize, const N: usize>(
+        a: *const f32,
+        lda: usize,
+        cols: usize,
+        xs: [*const f32; N],
+    ) -> [[f32; N]; R] {
+        let mut acc = [[_mm256_setzero_ps(); N]; R];
+        let mut i = 0;
+        while i + 8 <= cols {
+            let bs: [__m256; N] = std::array::from_fn(|c| _mm256_loadu_ps(xs[c].add(i)));
+            for (r, row) in acc.iter_mut().enumerate() {
+                let av = _mm256_loadu_ps(a.add(r * lda + i));
+                for (c, slot) in row.iter_mut().enumerate() {
+                    *slot = _mm256_fmadd_ps(av, bs[c], *slot);
+                }
+            }
+            i += 8;
+        }
+        let mut out = [[0.0_f32; N]; R];
+        for (r, row) in acc.iter().enumerate() {
+            for (c, slot) in row.iter().enumerate() {
+                let mut sum = hsum(*slot);
+                for k in i..cols {
+                    sum += *a.add(r * lda + k) * *xs[c].add(k);
+                }
+                out[r][c] = sum;
+            }
+        }
+        out
     }
 
     /// f32 · f32 (used after dequantizing a row once for several columns).

@@ -174,11 +174,48 @@ impl CpuBackend {
                 }
                 return;
             }
-            let tile = if format == kernels::DotInput::F32 {
-                batch
-            } else {
-                COLUMN_TILE
-            };
+            // Float types take every column against a block of rows at once
+            // (see `kernels::float_matmul`); the quantized row-major types
+            // walk rows once per group of COLUMN_TILE columns.
+            //
+            // Only once there are enough columns to fill a tile, though.
+            // Tiling first widens a block of rows into f32, which is 3x the
+            // bytes of the f16 they came from, and decoding is
+            // bandwidth-bound: at batch one that materialization is pure
+            // cost and reducing straight from the stored row wins (it took
+            // f16 decode from 1.04x of llama.cpp to 0.82x before this
+            // bound).
+            if format == kernels::DotInput::F32 && batch >= 3 {
+                let rows_per_tile = kernels::FLOAT_ROW_TILE;
+                let mut values = vec![0.0_f32; rows_per_tile * batch];
+                SCRATCH.with_borrow_mut(|scratch| {
+                    let end = task.first_row + task.rows;
+                    for first in (task.first_row..end).step_by(rows_per_tile) {
+                        let rows = rows_per_tile.min(end - first);
+                        let values = &mut values[..rows * batch];
+                        kernels::float_matmul(
+                            matrix.kind,
+                            matrix.data,
+                            matrix.row_bytes(),
+                            first,
+                            rows,
+                            matrix.cols,
+                            columns,
+                            values,
+                            scratch,
+                        );
+                        for r in 0..rows {
+                            for (b, v) in values[r * batch..(r + 1) * batch].iter().enumerate() {
+                                // SAFETY: rows `first..first + rows` belong
+                                // to this task alone.
+                                unsafe { *out.0.add(b * matrix.rows + first + r) = *v };
+                            }
+                        }
+                    }
+                });
+                return;
+            }
+            let tile = COLUMN_TILE;
             let mut values = vec![0.0_f32; tile.min(batch)];
             SCRATCH.with_borrow_mut(|scratch| {
                 for (group, chunk) in columns.chunks(tile).enumerate() {
@@ -342,6 +379,53 @@ mod tests {
                 .matvec(m, &inputs[b * 64..(b + 1) * 64], &mut single)
                 .unwrap();
             close(&batched[b * 96..(b + 1) * 96], &single, 0.0);
+        }
+    }
+
+    /// The float types take a register-tiled block of rows against every
+    /// column at once (`kernels::float_matmul`), which is a different code
+    /// path from the single-column reduction. Batch sizes are chosen to land
+    /// on and off the 3x3 tile, and row counts to exercise a partial final
+    /// row block.
+    #[test]
+    fn float_matmul_equals_repeated_matvec() {
+        use crate::quant::{encode_f16, encode_f32};
+        for rows in [7, 8, 96] {
+            let cols = 64;
+            let values: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 60.0)
+                .collect();
+            let bf16: Vec<u8> = values
+                .iter()
+                .flat_map(|v| {
+                    // Round-to-nearest-even into the top half of the f32.
+                    let bits = v.to_bits();
+                    let round = ((bits >> 16) & 1) + 0x7fff;
+                    (((bits + round) >> 16) as u16).to_le_bytes()
+                })
+                .collect();
+            for (kind, data) in [
+                (GgmlType::F32, encode_f32(&values)),
+                (GgmlType::F16, encode_f16(&values)),
+                (GgmlType::BF16, bf16.clone()),
+            ] {
+                let m = Matrix::new(kind, rows, cols, &data).unwrap();
+                for batch in [1, 2, 3, 4, 7] {
+                    let inputs: Vec<f32> =
+                        (0..cols * batch).map(|i| (i as f32 * 0.21).cos()).collect();
+                    let mut batched = vec![0.0; rows * batch];
+                    CpuBackend.matmul(m, &inputs, &mut batched, batch).unwrap();
+                    for b in 0..batch {
+                        let mut single = vec![0.0; rows];
+                        CpuBackend
+                            .matvec(m, &inputs[b * cols..(b + 1) * cols], &mut single)
+                            .unwrap();
+                        // Not bit-identical: the tiled kernel accumulates in
+                        // a different order from the single-column one.
+                        close(&batched[b * rows..(b + 1) * rows], &single, 1e-5);
+                    }
+                }
+            }
         }
     }
 
