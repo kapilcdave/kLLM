@@ -20,16 +20,31 @@ and execute Llama-family models without exceeding a configured budget.
 0. **Disk tier: done.** Models larger than the RAM budget keep the head and a
    block prefix resident and stream the rest, with read-ahead and immediate
    release (README, "Models bigger than RAM"). It is 1.45x llama.cpp on
-   Qwen3-14B Q4_K_M in a 6 GiB cgroup, running at 95% of disk bandwidth. Next
-   on this line: Mixture-of-Experts, where a token reads only its active
-   experts, so streaming cold experts from disk while caching hot ones costs
-   a fraction of a dense model's traffic. kLLM does not run any MoE
-   architecture yet (Qwen3-MoE would be the first). An open question: near
-   the edge (a model barely over MemAvailable), streaming loses to plain
-   mmap because the kernel can reclaim other caches. Deciding that at run
-   time, from observed major faults, would beat a static budget.
+   Qwen3-14B Q4_K_M in a 6 GiB cgroup, running at 95% of disk bandwidth. An
+   open question: near the edge (a model barely over MemAvailable), streaming
+   loses to plain mmap because the kernel can reclaim other caches. Deciding
+   that at run time, from observed major faults, would beat a static budget.
 
-1. **GPU speed.** M6 works (`tests/gpu.rs`: perplexity matches llama.cpp
+1. **Expert-granular residency.** Mixture-of-experts runs (`qwen3moe`,
+   designed in [docs/MOE.md](docs/MOE.md)): Qwen3-30B-A3B Q4_K_M on this
+   16 GiB laptop at 2.7 tok/s against llama.cpp's 0.97, perplexity 13.7433
+   against its 13.7109 (+0.236%, the same agreement the dense Qwen3-0.6B
+   Q4_K_M shows). A token reads 8 of 128 experts, so 6.2% of the expert
+   weights.
+
+   The locality question that decided whether to go further is answered: an
+   LRU over (layer, expert) reaches 61% at 1.9 GiB and 92% at 7.2 GiB, and
+   the hottest 10% of a layer's experts take 38% of its reads against 10%
+   for a uniform distribution. So caching pays -- but the residency planner
+   holds *whole blocks*, which cannot express "the hottest experts across all
+   48 layers", and therefore buys a worse hit rate than the same RAM allows.
+   That is the next step, and it is now measured rather than assumed.
+
+   After it, the routed decode path needs one parallel region per layer
+   instead of `k` separate matmuls: this model wants ~2.1 G MAC per token,
+   which caps it near 10-14 tok/s however good the cache gets.
+
+2. **GPU speed.** M6 works (`tests/gpu.rs`: perplexity matches llama.cpp
    on the GPU as on the CPU), and the quantized matvecs were rewritten to be
    coalesced over a struct-of-arrays layout (Q4_0 0.80 -> 5.9 GB/s, Q8_0
    0.92 -> 10.2 GB/s, batch-64 matmul 1.8 -> 22 GOP/s). But this laptop's
@@ -41,10 +56,10 @@ and execute Llama-family models without exceeding a configured budget.
    further (the Q4_0 kernel costs about what F16's does per element, so it
    is ALU-bound here); then fuse the small per-layer kernels (about 15
    launches per block at ~5 µs each).
-2. **Q3_K kernels**, the remaining common K-quant.
-3. **More architectures**: Gemma, Phi-3, and the hybrid Qwen3.5, whose
+3. **Q3_K kernels**, the remaining common K-quant.
+4. **More architectures**: Gemma, Phi-3, and the hybrid Qwen3.5, whose
    linear-attention layers need new kernels.
-4. `serve`: an OpenAI-compatible local HTTP endpoint (spec milestone 8).
+5. `serve`: an OpenAI-compatible local HTTP endpoint (spec milestone 8).
 
 ## Closed
 

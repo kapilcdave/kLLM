@@ -544,8 +544,22 @@ fn load_with_plan(
             } else {
                 ""
             },
-            residency.streamed_bytes as f64 / MIB
+            // A routed model reads only its selected experts, so the
+            // streamed figure has to be the active bytes or it overstates
+            // the traffic by 1/active_fraction -- 16x for Qwen3-30B-A3B.
+            config.moe.map_or(residency.streamed_bytes as f64, |m| {
+                residency.streamed_bytes as f64 * m.active_fraction()
+            }) / MIB
         );
+        if let Some(moe) = config.moe {
+            eprintln!(
+                "kllm: {} of {} experts per token, so a streamed block costs \
+                 {:.0}% of its bytes",
+                moe.n_expert_used,
+                moe.n_expert,
+                moe.active_fraction() * 100.0
+            );
+        }
     }
     let start = Instant::now();
     #[allow(unused_mut)]

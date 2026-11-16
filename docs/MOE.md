@@ -152,6 +152,46 @@ That is a day's work and it decides whether to build the expert cache at all.
 Doing it before the cache, rather than after, is the whole point — the cache
 is the expensive part and it is worthless if the hit rate is flat.
 
+### Measured, 2026-11-15
+
+Qwen3-30B-A3B Q4_K_M, 146 decode positions of ordinary prose, 48 layers,
+8 of 128 experts per token (`KLLM_ROUTER_TRACE` plus
+`scripts/expert_locality.py`):
+
+| LRU over (layer, expert) | hit rate |
+|---|---|
+| 0.95 GiB | 13.6% |
+| 1.91 GiB | 61.3% |
+| 4.78 GiB | 84.6% |
+| 7.17 GiB | 92.1% |
+| 9.56 GiB (everything touched) | 93.4% |
+
+The curve is not flat, so the idea holds. Selection is genuinely skewed --
+the hottest 10% of a layer's experts take 38.3% of its reads against 10% for
+a uniform distribution -- and the reuse is across tokens rather than trivial:
+only 21 of 56,064 reads repeat the same (layer, expert) consecutively. Over
+146 positions just 3,688 of the 6,144 possible (layer, expert) pairs were
+ever touched, 9.56 GiB of the model's ~16 GiB of experts.
+
+**The actionable finding is about granularity, not caching per se.** The
+residency planner holds *whole blocks*: on this machine it resides 24 of 48
+and streams the rest, so roughly half the layers hit in RAM always and the
+other half depend on the page cache. But the table says an expert-granular
+cache of the same size reaches 85-92%. The hot experts are spread across all
+48 layers, and block residency cannot express "the hottest experts
+everywhere" — so the same RAM buys a worse hit rate. Making residency
+expert-granular for routed models is the next step, and it is now a measured
+step rather than a guessed one.
+
+One honest caveat about the `est. tok/s` column the script prints: it counts
+only the disk misses. This model needs about 2.1 G MAC per token, which at
+the batch-one matvec rate this machine sustains is a ceiling near 10-14
+tok/s regardless of the cache. So the realistic target is around 10 tok/s,
+not the 38 the disk arithmetic alone suggests. Against the 2.7 tok/s measured
+today that is still worth having, and it also says the compute path (one
+parallel region per layer rather than `k` separate matmuls, see above) has to
+improve alongside the cache or it becomes the wall.
+
 A secondary measurement from the same trace: whether the top-`k` set for
 layer `L+1` is predictable from layer `L`'s hidden state early enough to
 prefetch. If it is, the disk tier can issue reads ahead of need, which is
@@ -186,3 +226,10 @@ So, pick one of two openings:
 Either way the staging is: router and routed FFN correct on a RAM-resident
 model → locality trace → expert-granularity residency in the planner and
 disk tier → prefill token sorting.
+
+**Status, 2026-11-15.** `qwen3moe` runs. Qwen3-30B-A3B Q4_K_M perplexity is
+13.7433 against llama.cpp's 13.7109 on the same chunk, +0.236% -- the same
+agreement the dense Qwen3-0.6B Q4_K_M shows (+0.233%), so the routed path
+adds nothing beyond the Q4_K activation noise already there. Decode is
+2.7 tok/s warm against llama.cpp's 0.97. The locality measurement above is
+done; expert-granular residency is next.
