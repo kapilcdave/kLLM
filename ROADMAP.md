@@ -33,7 +33,10 @@ and execute Llama-family models without exceeding a configured budget.
 
    Prefill sorts tokens by expert so each expert is read once per batch
    rather than once per token that chose it: pp64 22.2 tok/s against 14.7,
-   a 52% gain.
+   a 52% gain. That makes batch width matter, so the default is now
+   expert-aware (pp256 goes 7.1 -> 11.4 -> 16.2 across batches 64, 128,
+   256) and capped by the prompt, because the logits scratch a wide batch
+   needs competes with the experts' page cache.
 
    Decode, measured, is memory-bandwidth-bound and not compute-bound as this
    entry previously claimed: 20.0 GiB/s of weights against 20.7-27.3 GB/s for

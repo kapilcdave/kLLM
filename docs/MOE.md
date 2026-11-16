@@ -102,9 +102,23 @@ each expert, runs one matmul over that group, and scatters the results back
 weighted, so each expert is read once per batch: at batch 64 with 8 of 128
 experts a layer reads `64 x 8` expert copies naively against 128 sorted.
 Measured on Qwen3-30B-A3B, pp64 over three interleaved rounds: 16.2, 13.9,
-13.9 tok/s per-token against 19.3, 24.7, 22.7 sorted. Raising the batch to
-128 did not compound it (15.2 against 15.6 at pp128), so the gain is in
-reading each expert once rather than in wider tiles.
+13.9 tok/s per-token against 19.3, 24.7, 22.7 sorted.
+
+Sorting then makes the batch width matter, where it did not before, because
+a batch of `b` gives each expert about `b * k / N` tokens to work on. At
+pp256: 7.1 tok/s at batch 64 (4 tokens an expert), 11.4 at 128 (8), and 16.2
+at 256 (16). So the default batch is now expert-aware --
+`16 * n_expert / n_expert_used`, capped at 256 -- while dense models keep 64,
+since they gain nothing from a wider batch and pay for it in logits scratch.
+
+That scratch is the catch, and it is why the batch is also capped by the
+prompt. At batch 256 a 151936-token vocabulary needs 155 MiB of logits
+scratch for the whole session, and that competes with the page cache the
+experts live in: measured, a batch of 256 against 64 is neutral to slightly
+worse for decode (warm, 10.0 and 10.7 against 9.3 and 10.1 tok/s). `run`
+therefore tokenizes before loading and asks for
+`min(default, prompt_tokens)`, so a twenty-token prompt allocates 14 MiB and
+a 463-token one allocates 208 MiB and prefills at 12.1 tok/s.
 
 Perplexity moves from 13.0682 to 12.9472, which is within llama.cpp's own
 1.23% band (+0.38% from its flash-attention-off figure): summing a token's
@@ -238,7 +252,7 @@ disk tier → prefill token sorting.
 **Status, 2026-11-16.** `qwen3moe` runs Qwen3-30B-A3B Q4_K_M -- a 17.3 GiB
 model on a machine with 16 GiB -- at 11.3 tok/s decode against llama.cpp's
 1.81, from a starting point of 1.4, and 24.7 tok/s prefill against 16.2
-before sorting. Decode is now at memory bandwidth; prefill got the 52%. None
+before sorting (12.1 tok/s on a real 463-token prompt). Decode is now at memory bandwidth; prefill got the 52%. None
 of it was kernel work.
 
 ## Routing amplifies numerical noise, and that sets the tolerance
