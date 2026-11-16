@@ -227,9 +227,76 @@ Either way the staging is: router and routed FFN correct on a RAM-resident
 model → locality trace → expert-granularity residency in the planner and
 disk tier → prefill token sorting.
 
-**Status, 2026-11-15.** `qwen3moe` runs. Qwen3-30B-A3B Q4_K_M perplexity is
-13.7433 against llama.cpp's 13.7109 on the same chunk, +0.236% -- the same
-agreement the dense Qwen3-0.6B Q4_K_M shows (+0.233%), so the routed path
-adds nothing beyond the Q4_K activation noise already there. Decode is
-2.7 tok/s warm against llama.cpp's 0.97. The locality measurement above is
-done; expert-granular residency is next.
+**Status, 2026-11-15.** `qwen3moe` runs, at 10.9 tok/s against llama.cpp's
+1.81 on Qwen3-30B-A3B Q4_K_M -- 6x, on a machine with 16 GiB for a 17.3 GiB
+model. See "Residency" below for where that came from.
+
+## Routing amplifies numerical noise, and that sets the tolerance
+
+Validating an MoE against another implementation is harder than validating a
+dense model, for a reason specific to routing: **expert selection is a
+discrete function of the router's logits.** Two legitimate summation orders
+that differ in the last bits will occasionally rank the 8th and 9th experts
+differently, and then a whole different expert's feed-forward runs.
+
+Measured, between kLLM's own two kernel paths (x8-repacked and row-major,
+same model, same prompt): **12.3% of routing decisions select a different set
+of experts.** The flip is nearly always the marginal last pick --
+`...109,92` against `...109,70` -- exactly where two logits are nearly tied.
+
+So a 1% perplexity bound of the kind the dense models are held to is not
+achievable here, and chasing one would mean chasing noise. The honest
+reference is the implementation's own spread, which is what
+`tests/perplexity.rs` already uses for quantized models. On Qwen3-30B-A3B
+Q4_K_M over 508 scored tokens:
+
+| | perplexity |
+|---|---|
+| llama.cpp, flash attention on | 13.0579 |
+| llama.cpp, flash attention off | 12.8979 |
+| *llama.cpp against itself* | *1.23%* |
+| kLLM | 12.9014 (+0.03% from fa off) |
+
+kLLM lands inside llama.cpp's own band, nearly exactly on one end of it.
+That is the claim the evidence supports.
+
+Two corrections to what this note said before the measurement. An earlier
+figure of "+0.236%" came from a single 256-token chunk -- 127 scored tokens,
+stderr +/-31% -- and was partly luck: at that sample size kLLM's repacked
+path reads 13.4831 and its row-major path 13.9309, straddling llama.cpp's
+13.7109, and the mixed residency in force at the time happened to land
+between them. Small-sample perplexity cannot discriminate at the 1% level on
+a model this deep. And the repacked and row-major paths differing by 3.3% is
+not a bug in either: it is the same routing amplification, measured a second
+way.
+
+## Residency: the planner was charging for pages it never fetched
+
+The first working version ran at 1.4 tok/s, and the cause was accounting.
+`Residency::plan` summed *all* of a block's bytes, experts included, to
+decide what could stay resident. But experts are demand-paged and never
+prefetched (see `stream_ahead`), so the plan reserved budget for pages it
+would never fetch, concluded that only 17 of 48 blocks fit, and then
+streamed the other 31 -- releasing their attention weights with `DontNeed`
+every token and re-reading them, while the read-ahead competed for the page
+cache the experts actually needed.
+
+Excluding expert tensors from the plan makes the managed set about 1 GiB for
+this model, so every block stays resident, nothing streams, and all the
+remaining RAM serves as expert page cache. Measured, same prompt:
+
+| residency | tok/s |
+|---|---|
+| whole-block accounting (17 of 48 resident, 31 streamed) | 1.4 |
+| expert bytes excluded (nothing streamed) | 8.0 - 10.9 |
+
+That is 6-7x, and it lands at the ~10-14 tok/s compute ceiling this model
+implies, so decode is now compute-bound rather than traffic-bound. The
+kernel's page-cache LRU is doing the expert caching, which is what the
+locality curve above said would work.
+
+An explicit expert cache is therefore *not* the next thing to build: the
+free one already gets us to the compute ceiling. The next lever is the
+compute path -- one parallel region per layer instead of `k` separate
+matmuls, which also shares the activation quantization across experts
+instead of repeating it 16 times per layer.

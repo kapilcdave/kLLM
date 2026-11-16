@@ -25,24 +25,25 @@ and execute Llama-family models without exceeding a configured budget.
    loses to plain mmap because the kernel can reclaim other caches. Deciding
    that at run time, from observed major faults, would beat a static budget.
 
-1. **Expert-granular residency.** Mixture-of-experts runs (`qwen3moe`,
-   designed in [docs/MOE.md](docs/MOE.md)): Qwen3-30B-A3B Q4_K_M on this
-   16 GiB laptop at 2.7 tok/s against llama.cpp's 0.97, perplexity 13.7433
-   against its 13.7109 (+0.236%, the same agreement the dense Qwen3-0.6B
-   Q4_K_M shows). A token reads 8 of 128 experts, so 6.2% of the expert
-   weights.
+1. **Routed decode compute.** Mixture-of-experts runs (`qwen3moe`, designed
+   in [docs/MOE.md](docs/MOE.md)): Qwen3-30B-A3B Q4_K_M, a 17.3 GiB model on
+   a 16 GiB laptop, at **10.9 tok/s against llama.cpp's 1.81** -- 6x -- and
+   inside llama.cpp's own perplexity spread (12.9014 against its 12.8979
+   with flash attention off and 13.0579 with it on, a 1.23% band).
 
-   The locality question that decided whether to go further is answered: an
-   LRU over (layer, expert) reaches 61% at 1.9 GiB and 92% at 7.2 GiB, and
-   the hottest 10% of a layer's experts take 38% of its reads against 10%
-   for a uniform distribution. So caching pays -- but the residency planner
-   holds *whole blocks*, which cannot express "the hottest experts across all
-   48 layers", and therefore buys a worse hit rate than the same RAM allows.
-   That is the next step, and it is now measured rather than assumed.
+   Decode is now compute-bound, not traffic-bound, so the next lever is the
+   routed path itself: one parallel region per layer instead of `k` separate
+   matmuls, which also shares the activation quantization across experts
+   rather than repeating it 16 times per layer. This model wants ~2.1 G MAC
+   per token, which is where the ~10-14 tok/s ceiling comes from.
 
-   After it, the routed decode path needs one parallel region per layer
-   instead of `k` separate matmuls: this model wants ~2.1 G MAC per token,
-   which caps it near 10-14 tok/s however good the cache gets.
+   An explicit expert cache is deliberately *not* next. The locality curve
+   (an LRU over (layer, expert) reaching 61% at 1.9 GiB and 92% at 7.2 GiB,
+   with the hottest 10% of a layer's experts taking 38% of its reads) said
+   caching pays -- and the kernel's own page-cache LRU already delivers it,
+   once the planner stopped reserving budget for expert pages it never
+   prefetched. Building a second cache on top would be replacing a free one
+   that already reaches the compute ceiling.
 
 2. **GPU speed.** M6 works (`tests/gpu.rs`: perplexity matches llama.cpp
    on the GPU as on the CPU), and the quantized matvecs were rewritten to be

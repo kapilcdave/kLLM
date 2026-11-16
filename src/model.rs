@@ -401,16 +401,28 @@ pub struct Residency {
     /// Weight bytes read from disk per token.
     pub streamed_bytes: u64,
     pub resident_bytes: u64,
+    /// Bytes the plan does not manage at all: a routed model's expert
+    /// tensors, which are demand-paged because only a routed fraction of
+    /// them is touched per token. Planning them as resident would reserve
+    /// budget for pages that are never prefetched, which is what made an
+    /// MoE stream blocks it had no need to.
+    pub demand_bytes: u64,
 }
 
 impl Residency {
     /// Plan residency from the tensor directory alone, before loading.
     pub fn plan(info: &GgufInfo, n_layer: usize, budget: Option<u64>) -> Self {
         let mut layer = vec![0u64; n_layer];
-        let (mut head, mut other) = (0u64, 0u64);
+        let (mut head, mut other, mut demand) = (0u64, 0u64, 0u64);
         let tied = info.tensor("output.weight").is_none();
         for t in &info.tensors {
             let size = t.byte_size().unwrap_or(0);
+            // Expert tensors are demand-paged, not planned: see `demand_bytes`
+            // and `Model::stream_ahead`.
+            if t.name.ends_with("_exps.weight") {
+                demand += size;
+                continue;
+            }
             match t.block_index() {
                 Some(i) if (i as usize) < n_layer => layer[i as usize] += size,
                 _ if t.name == "output.weight" || (tied && t.name == "token_embd.weight") => {
@@ -425,6 +437,7 @@ impl Residency {
             head_streamed: false,
             streamed_bytes: 0,
             resident_bytes: total,
+            demand_bytes: demand,
         };
         let Some(budget) = budget else { return all };
         if total <= budget {
@@ -449,6 +462,7 @@ impl Residency {
             head_streamed,
             streamed_bytes,
             resident_bytes: total - streamed_bytes,
+            demand_bytes: demand,
         }
     }
 }
@@ -567,8 +581,14 @@ impl Model {
             });
         }
         // Read ahead only what stays resident; streamed blocks are read
-        // block by block during the forward pass.
-        if residency.first_streamed == c.n_layer && !residency.head_streamed {
+        // block by block during the forward pass. With demand-paged experts
+        // the mapping is far larger than RAM, and advising the whole of it
+        // would have the kernel read pages it must immediately drop --
+        // competing with the page cache the experts depend on.
+        if residency.first_streamed == c.n_layer
+            && !residency.head_streamed
+            && residency.demand_bytes == 0
+        {
             file.advise_willneed();
         }
         // Repacked weights never read their row-major pages again (except the

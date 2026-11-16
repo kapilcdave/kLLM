@@ -525,6 +525,16 @@ fn load_with_plan(
     }
     let budget = ram_budget(args, kv + scratch)?;
     let residency = kllm::model::Residency::plan(&info, config.n_layer, budget);
+    if let Some(moe) = config.moe {
+        eprintln!(
+            "kllm: {} of {} experts per token ({:.0}% of {:.0} MiB of expert weights), \
+             demand-paged",
+            moe.n_expert_used,
+            moe.n_expert,
+            moe.active_fraction() * 100.0,
+            residency.demand_bytes as f64 / MIB,
+        );
+    }
     if residency.first_streamed < config.n_layer || residency.head_streamed {
         let streamed = config.n_layer - residency.first_streamed;
         eprintln!(
@@ -551,15 +561,6 @@ fn load_with_plan(
                 residency.streamed_bytes as f64 * m.active_fraction()
             }) / MIB
         );
-        if let Some(moe) = config.moe {
-            eprintln!(
-                "kllm: {} of {} experts per token, so a streamed block costs \
-                 {:.0}% of its bytes",
-                moe.n_expert_used,
-                moe.n_expert,
-                moe.active_fraction() * 100.0
-            );
-        }
     }
     let start = Instant::now();
     #[allow(unused_mut)]
