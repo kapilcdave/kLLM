@@ -68,15 +68,31 @@ and execute Llama-family models without exceeding a configured budget.
    further (the Q4_0 kernel costs about what F16's does per element, so it
    is ALU-bound here); then fuse the small per-layer kernels (about 15
    launches per block at ~5 µs each).
-3. **An x8-packed layout for Q3_K.** Q3_K now loads and is correct
-   (Qwen3-0.6B requantized: 44.5528 against llama.cpp's 44.4627 with flash
-   attention off and 44.7784 with it on, so inside its band), but it is slow:
-   32.7 tok/s decode against Q4_K's 55.4 on the same model, and 128 against
-   317 for prefill. Q4_K has an x8 layout and Q3_K does not, so Q3_K takes
-   the row-major path; it also packs 256 values into 110 bytes against
-   Q4_K's 144, so there is more unpacking per byte. Until it is packed, Q3_K
-   is a capability (models that would not otherwise load) rather than the
-   speed win that fewer bytes ought to buy.
+3. **A cheaper Q3_K kernel.** Q3_K loads and is correct (Qwen3-0.6B
+   requantized: 44.5528 against llama.cpp's 44.4627 with flash attention off
+   and 44.7784 with it on, so inside its band) but it is not the speed win
+   that 24% fewer bytes ought to buy on a bandwidth-bound engine. Measured
+   both ways:
+
+   - Small dense model, cache-resident: 32.7 tok/s decode against Q4_K's
+     55.4, prefill 128 against 317.
+   - Qwen3-30B-A3B requantized to Q3_K_M, 13.7 GiB against Q4_K_M's 17.3,
+     each warmed alone to its plateau: **6.0-6.6 tok/s against 10.6-11.3**.
+
+   So it is instruction-bound, not byte-bound: a Q3_K block is eight passes
+   with a `hmask` bit-plane to extract against Q4_K's four, and that costs
+   more than 24% fewer bytes buys. Note an x8-packed layout would *not* fix
+   the MoE case, because a routed model's experts are never packed (that is
+   a second copy of the model); what is needed is a cheaper row-major
+   kernel. Until then Q3_K is a capability -- models that would otherwise
+   not load at all -- rather than a way to go faster.
+
+   Methodology note for anyone repeating this: do not interleave two
+   different multi-gigabyte models to compare them. Together they exceed the
+   page cache and each run evicts the other's weights, which turned a clean
+   6.2-against-11 into a meaningless 6.2-against-1.5. Warm each separately
+   to its plateau instead. Interleaving is still right when both arms read
+   the *same* file.
 4. **Qwen3.5 (`qwen35`)**, scoped in [docs/QWEN35.md](docs/QWEN35.md). It is
    a layer-level hybrid: `full_attention_interval = 4`, so three of every
    four blocks are a gated-DeltaNet SSM and every fourth is ordinary

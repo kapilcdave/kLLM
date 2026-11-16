@@ -115,6 +115,13 @@ on the same file and machine. Three things matter in practice:
   is what makes routed prefill fast; a short one gets a narrow batch so the
   session does not spend 155 MiB of logits scratch it will not use.
 
+For a conversation, use `kllm chat` rather than repeated `run` calls. It keeps
+the session alive, so each turn feeds only what is new: in a three-turn
+exchange the third turn fed 18 tokens instead of re-processing all 174.
+Re-sending the history every turn is what makes a one-shot CLI unusable on a
+slow machine -- a thousand tokens of context costs minutes to re-read at
+prefill speed, every single turn.
+
 For a reasoning model such as the base Qwen3-30B-A3B, pass `--no-think`.
 Otherwise it answers by thinking first, and at ten tokens a second a 100-token
 budget is spent before it has said anything. Its own chat template suppresses

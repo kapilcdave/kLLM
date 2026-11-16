@@ -40,6 +40,8 @@ usage:
            [--seed S] [--threads N] [--batch N] [--ignore-eos] [--no-think]
            [--gpu-layers N|auto]
            [--ram-gib N|auto|all]
+  kllm chat MODEL.gguf [--system TEXT] [-n 512] [--context N] [--no-think]
+           [--temp T] [--top-k K] [--top-p P] [--min-p P] [--threads N] [--ram-gib N]
   kllm perplexity MODEL.gguf --file TEXT [--context 512] [--chunks N] [--threads N] [--gpu-layers N|auto]
   kllm compare REFERENCE.gguf TEST.gguf --file TEXT [--context 512] [--chunks N] [--threads N]
   kllm devices
@@ -103,6 +105,7 @@ fn run(args: &Args) -> Result<(), String> {
         Some("plan") => cmd_plan(args),
         Some("plan-model") => cmd_plan_model(args),
         Some("run") => cmd_run(args),
+        Some("chat") => cmd_chat(args),
         Some("perplexity") => cmd_perplexity(args),
         Some("compare") => cmd_compare(args),
         Some("bench") => cmd_bench(args),
@@ -768,6 +771,139 @@ fn cmd_run(args: &Args) -> Result<(), String> {
         gen_time.as_secs_f64(),
         generated.max(1) as f64 / gen_time.as_secs_f64().max(1e-9)
     );
+    Ok(())
+}
+
+/// One turn of a ChatML conversation, as the text to feed next.
+///
+/// Interactive chat only re-feeds what is new: the session's KV cache
+/// already holds every earlier turn, and re-sending the history would cost
+/// the whole prompt again on every turn -- at the speed a 30B runs on a
+/// laptop, a thousand tokens of history is minutes.
+fn chatml_turn(first: bool, system: Option<&str>, user: &str, think: bool) -> String {
+    let mut out = String::new();
+    if !first {
+        // Close the assistant turn the model left open by stopping at EOS.
+        out += "<|im_end|>\n";
+    } else if let Some(system) = system {
+        out += &format!("<|im_start|>system\n{system}<|im_end|>\n");
+    }
+    out += &format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n");
+    if !think {
+        out += "<think>\n\n</think>\n\n";
+    }
+    out
+}
+
+fn cmd_chat(args: &Args) -> Result<(), String> {
+    let path = args.positional(1, "GGUF path")?;
+    let threads = init_threads(args)?;
+    let info = inspect_file(path).map_err(|e| e.to_string())?;
+    let config = Config::from_gguf(&info).map_err(|e| e.to_string())?;
+    let template = info
+        .get("tokenizer.chat_template")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !template.contains("<|im_start|>") {
+        return Err(
+            "interactive chat needs a ChatML template (<|im_start|>); this model has another"
+                .into(),
+        );
+    }
+    let think = !args.has("--no-think") && template.contains("<think>");
+    let system = args.value(&["--system"])?.map(str::to_string);
+    let context: usize = args.or(&["--context", "-c"], config.train_context.min(4096))?;
+    let n_predict: usize = args.or(&["-n", "--n-predict"], 512)?;
+    // A turn's prompt is short, so a narrow batch keeps the logits scratch
+    // off the page cache the weights need.
+    let batch: usize = args.or(&["--batch", "-b"], 64)?;
+    let model = load_with_plan(args, gpu_request(args)?, path, context, batch, threads)?;
+    let tokenizer = Tokenizer::from_gguf(model.info()).map_err(|e| e.to_string())?;
+    let mut sampler = Sampler::new(SamplerConfig {
+        temperature: args.or(&["--temp"], 0.8)?,
+        top_k: args.or(&["--top-k"], 40)?,
+        top_p: args.or(&["--top-p"], 0.95)?,
+        min_p: args.or(&["--min-p"], 0.05)?,
+        repeat_penalty: args.or(&["--repeat-penalty"], 1.0)?,
+        repeat_last_n: args.or(&["--repeat-last-n"], 64)?,
+        seed: args.or(&["--seed", "-s"], 0x6b4c_4c4d)?,
+    });
+    let mut session = model
+        .new_session(context, batch)
+        .map_err(|e| e.to_string())?;
+    let mut stdout = io::stdout().lock();
+    let mut history: Vec<u32> = Vec::new();
+    let mut first = true;
+    eprintln!("kllm: chat ready; blank line or Ctrl-D to leave");
+
+    loop {
+        let _ = write!(stdout, "\n> ");
+        let _ = stdout.flush();
+        let mut line = String::new();
+        match io::stdin().read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        let line = line.trim_end_matches(['\n', '\r']);
+        if line.trim().is_empty() {
+            break;
+        }
+        let turn = chatml_turn(first, system.as_deref(), line, think);
+        first = false;
+        // `add_special` only on the first turn: a second BOS mid-stream is
+        // not what the model was trained on.
+        let tokens = tokenizer.encode(&turn, history.is_empty(), true);
+        if session.position() + tokens.len() + 8 >= context {
+            eprintln!(
+                "kllm: context of {context} tokens is full; start again with a larger --context"
+            );
+            break;
+        }
+        history.extend_from_slice(&tokens);
+        let start = Instant::now();
+        let mut logits = session
+            .forward(&tokens, Logits::Last)
+            .map_err(|e| e.to_string())?
+            .to_vec();
+        let prompt_time = start.elapsed();
+        let gen_start = Instant::now();
+        let mut stream = Utf8Stream {
+            pending: Vec::new(),
+        };
+        let mut generated = 0;
+        while generated < n_predict && session.position() < context {
+            let next = sampler.sample(&logits, &history);
+            if tokenizer.is_eog(next) {
+                break;
+            }
+            history.push(next);
+            generated += 1;
+            let piece = stream.push(&tokenizer.token_bytes(next, false));
+            if write!(stdout, "{piece}")
+                .and_then(|_| stdout.flush())
+                .is_err()
+            {
+                return Ok(());
+            }
+            if generated == n_predict || session.position() >= context {
+                break;
+            }
+            logits = session
+                .forward(&[next], Logits::Last)
+                .map_err(|e| e.to_string())?
+                .to_vec();
+        }
+        let _ = writeln!(stdout, "{}", stream.push(&[]));
+        eprintln!(
+            "kllm: {} new prompt tokens in {:.2} s | {generated} generated in {:.2} s ({:.1} tok/s) | {} of {context} used",
+            tokens.len(),
+            prompt_time.as_secs_f64(),
+            gen_start.elapsed().as_secs_f64(),
+            generated.max(1) as f64 / gen_start.elapsed().as_secs_f64().max(1e-9),
+            session.position(),
+        );
+    }
     Ok(())
 }
 
