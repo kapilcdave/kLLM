@@ -328,7 +328,7 @@ enum Ffn {
         up: Experts,
         down: Experts,
         shared: Option<[Weight; 3]>,
-        shared_gate: Option<Weight>,
+        shared_gate: Option<Vec<f32>>,
     },
 }
 
@@ -352,15 +352,11 @@ impl Layer {
         let mut all = vec![self.wq, self.wk, self.wv, self.wo];
         match &self.ffn {
             Ffn::Dense { gate, up, down } => all.extend([*gate, *up, *down]),
-            Ffn::Routed {
-                router,
-                shared,
-                shared_gate,
-                ..
-            } => {
+            Ffn::Routed { router, shared, .. } => {
+                // The shared expert's gate is a dequantized vector, not a
+                // mapped matrix, so it holds no bytes here.
                 all.push(*router);
                 all.extend(shared.iter().flatten().copied());
-                all.extend(shared_gate.iter().copied());
             }
         }
         all
@@ -510,7 +506,6 @@ impl Model {
         let mut layers = Vec::with_capacity(c.n_layer);
         for i in 0..c.n_layer {
             let name = |suffix: &str| format!("blk.{i}.{suffix}");
-            let qk_norm = c.arch == Arch::Qwen3;
             let streamed = i >= residency.first_streamed;
             loader.streaming.set(streamed);
             layers.push(Layer {
@@ -523,16 +518,11 @@ impl Model {
                 bq: loader.optional_vector(&name("attn_q.bias"), c.q_dim())?,
                 bk: loader.optional_vector(&name("attn_k.bias"), c.kv_dim())?,
                 bv: loader.optional_vector(&name("attn_v.bias"), c.kv_dim())?,
-                q_norm: if qk_norm {
-                    Some(loader.vector(&name("attn_q_norm.weight"), c.head_dim)?)
-                } else {
-                    None
-                },
-                k_norm: if qk_norm {
-                    Some(loader.vector(&name("attn_k_norm.weight"), c.head_dim)?)
-                } else {
-                    None
-                },
+                // Presence, not architecture: Qwen3-MoE carries these just
+                // as Qwen3 does, and deciding by architecture silently
+                // dropped them.
+                q_norm: loader.optional_vector(&name("attn_q_norm.weight"), c.head_dim)?,
+                k_norm: loader.optional_vector(&name("attn_k_norm.weight"), c.head_dim)?,
                 ffn_norm: loader.vector(&name("ffn_norm.weight"), c.n_embd)?,
                 ffn: match c.moe {
                     None => Ffn::Dense {
@@ -558,14 +548,10 @@ impl Model {
                             up: loader.experts(&name("ffn_up_exps.weight"), ff, c.n_embd, n)?,
                             down: loader.experts(&name("ffn_down_exps.weight"), c.n_embd, ff, n)?,
                             shared,
+                            // Stored 1-D as [n_embd], so it is a vector and
+                            // not a one-row matrix.
                             shared_gate: loader
-                                .file
-                                .info
-                                .tensor(&name("ffn_gate_inp_shexp.weight"))
-                                .map(|_| {
-                                    loader.matrix(&name("ffn_gate_inp_shexp.weight"), 1, c.n_embd)
-                                })
-                                .transpose()?,
+                                .optional_vector(&name("ffn_gate_inp_shexp.weight"), c.n_embd)?,
                         }
                     }
                 },
@@ -1052,6 +1038,10 @@ impl<'m> Session<'m> {
                     .extend_from_slice(&self.logits[..chunk.len() * n_vocab]);
             }
         }
+        // Flush per forward pass so a trace survives an interrupted run.
+        if router_trace::enabled() {
+            router_trace::flush();
+        }
         Ok(match want {
             Logits::All => &self.all_logits,
             Logits::Last => &self.logits[..n_vocab],
@@ -1327,6 +1317,9 @@ impl<'m> Session<'m> {
                     self.proj[..n * d].fill(0.0);
                     for i in 0..n {
                         route(&self.router[i * ne..(i + 1) * ne], &moe, &mut chosen);
+                        if router_trace::enabled() {
+                            router_trace::record(start + i, li, &chosen);
+                        }
                         for &(expert, weight) in chosen.iter() {
                             be.matmul_many(
                                 &mut [
@@ -1383,14 +1376,12 @@ impl<'m> Session<'m> {
                             )?;
                             let mut scale = 1.0;
                             if let Some(g) = shared_gate {
-                                let mut logit = [0.0_f32; 1];
-                                be.matmul(
-                                    model.matrix(*g),
-                                    &self.xn[i * d..(i + 1) * d],
-                                    &mut logit,
-                                    1,
-                                )?;
-                                scale = 1.0 / (1.0 + (-logit[0]).exp());
+                                let logit: f32 = g
+                                    .iter()
+                                    .zip(&self.xn[i * d..(i + 1) * d])
+                                    .map(|(w, v)| w * v)
+                                    .sum();
+                                scale = 1.0 / (1.0 + (-logit).exp());
                             }
                             for (p, v) in self.proj[i * d..(i + 1) * d]
                                 .iter_mut()
@@ -1492,6 +1483,56 @@ fn query_block(config: &Config, tokens: usize, threads: usize) -> usize {
     let by_cache = (16 * 1024 / per_query.max(1)).max(1);
     let by_threads = (tokens * config.n_head_kv / (2 * threads.max(1))).max(1);
     by_cache.min(by_threads).min(tokens.max(1))
+}
+
+/// Optional log of which experts each token routed to.
+///
+/// This exists to answer the question in docs/MOE.md: how concentrated is
+/// expert selection across a single decode stream? That decides whether a
+/// 30B MoE can run from disk on a small machine, and it is a property of the
+/// data, not of the code -- so it has to be measured rather than assumed.
+/// Set `KLLM_ROUTER_TRACE` to a path; each line is
+/// `position layer expert,expert,...`.
+mod router_trace {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    static SINK: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+
+    fn sink() -> Option<&'static Mutex<std::io::BufWriter<std::fs::File>>> {
+        SINK.get_or_init(|| {
+            let path = std::env::var_os("KLLM_ROUTER_TRACE")?;
+            match std::fs::File::create(&path) {
+                Ok(file) => Some(Mutex::new(std::io::BufWriter::new(file))),
+                Err(e) => {
+                    eprintln!("kllm: cannot write router trace: {e}");
+                    None
+                }
+            }
+        })
+        .as_ref()
+    }
+
+    pub fn enabled() -> bool {
+        sink().is_some()
+    }
+
+    pub fn record(position: usize, layer: usize, chosen: &[(usize, f32)]) {
+        let Some(sink) = sink() else { return };
+        let mut out = sink.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = write!(out, "{position} {layer}");
+        for (i, (expert, _)) in chosen.iter().enumerate() {
+            let _ = write!(out, "{}{expert}", if i == 0 { " " } else { "," });
+        }
+        let _ = writeln!(out);
+    }
+
+    /// Flush on the way out, so a trace is usable even if the run is killed.
+    pub fn flush() {
+        if let Some(sink) = sink() {
+            let _ = sink.lock().unwrap_or_else(|e| e.into_inner()).flush();
+        }
+    }
 }
 
 /// Expert weights for one token: gate the router's logits, take the
