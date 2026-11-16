@@ -190,9 +190,24 @@ fn upload_layer(
         q_norm: optional(&layer.q_norm)?,
         k_norm: optional(&layer.k_norm)?,
         ffn_norm: vector(&layer.ffn_norm)?,
-        w_gate: matrix(layer.w_gate)?,
-        w_up: matrix(layer.w_up)?,
-        w_down: matrix(layer.w_down)?,
+        // The GPU stack is dense-only for now: a routed layer would need
+        // the router, per-expert slicing and a gather on the device.
+        w_gate: match &layer.ffn {
+            super::Ffn::Dense { gate, .. } => matrix(*gate)?,
+            super::Ffn::Routed { .. } => {
+                return Err(ModelError::Unsupported(
+                    "mixture-of-experts layers on the GPU".into(),
+                ));
+            }
+        },
+        w_up: match &layer.ffn {
+            super::Ffn::Dense { up, .. } => matrix(*up)?,
+            super::Ffn::Routed { .. } => unreachable!("rejected above"),
+        },
+        w_down: match &layer.ffn {
+            super::Ffn::Dense { down, .. } => matrix(*down)?,
+            super::Ffn::Routed { .. } => unreachable!("rejected above"),
+        },
     })
 }
 

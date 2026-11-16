@@ -65,6 +65,7 @@ pub enum Arch {
     Llama,
     Qwen2,
     Qwen3,
+    Qwen3Moe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,11 +92,54 @@ pub struct Config {
     pub rope_scale: f32,
     pub rope_style: RopeStyle,
     pub train_context: usize,
+    /// Present when the feed-forward block is a mixture of experts.
+    pub moe: Option<Moe>,
+}
+
+/// How the router turns hidden states into expert weights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gating {
+    Softmax,
+    Sigmoid,
+}
+
+/// Mixture-of-experts feed-forward parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct Moe {
+    /// Experts per layer.
+    pub n_expert: usize,
+    /// Experts each token is routed to.
+    pub n_expert_used: usize,
+    /// One expert's feed-forward width (not `Config::n_ff`).
+    pub n_ff_exp: usize,
+    /// Width of the always-on shared expert; zero when there is none.
+    pub n_ff_shared: usize,
+    /// Renormalize the chosen experts' weights to sum to one.
+    pub weights_norm: bool,
+    pub weights_scale: f32,
+    pub gating: Gating,
+}
+
+impl Moe {
+    /// Weight bytes of one layer's experts that a single token reads, given
+    /// the bytes of the whole expert block. Routing is what makes an MoE
+    /// cheap per token and expensive to hold, so the planner needs both.
+    pub fn active_fraction(&self) -> f64 {
+        self.n_expert_used as f64 / self.n_expert.max(1) as f64
+    }
 }
 
 impl Config {
     pub fn q_dim(&self) -> usize {
         self.n_head * self.head_dim
+    }
+
+    /// Widest feed-forward intermediate the forward pass will hold: the
+    /// dense width, or an expert's (a routed model's `n_ff` is unused and
+    /// some files leave it zero).
+    pub fn ffn_width(&self) -> usize {
+        let moe = self.moe.map_or(0, |m| m.n_ff_exp.max(m.n_ff_shared));
+        self.n_ff.max(moe)
     }
 
     pub fn kv_dim(&self) -> usize {
@@ -115,9 +159,10 @@ impl Config {
             "llama" | "mistral" => Arch::Llama,
             "qwen2" => Arch::Qwen2,
             "qwen3" => Arch::Qwen3,
+            "qwen3moe" => Arch::Qwen3Moe,
             other => {
                 return Err(ModelError::Unsupported(format!(
-                    "architecture {other:?} (supported: llama, qwen2, qwen3)"
+                    "architecture {other:?} (supported: llama, qwen2, qwen3, qwen3moe)"
                 )));
             }
         };
@@ -167,6 +212,44 @@ impl Config {
                 .ok_or_else(|| ModelError::Missing("token_embd.weight".into()))?
                 as usize,
         };
+        // Mixture-of-experts parameters. The architecture decides how the
+        // router's weights are post-processed, because llama.cpp hardcodes
+        // that per architecture rather than writing it into the file; any
+        // key that *is* present overrides the default.
+        let moe = match opt_int("expert_count").filter(|n| *n > 0) {
+            None => None,
+            Some(n_expert) => {
+                let n_expert_used = opt_int("expert_used_count")
+                    .filter(|k| *k > 0 && *k <= n_expert)
+                    .ok_or_else(|| {
+                        ModelError::Shape(format!(
+                            "{arch_name}.expert_used_count must be in 1..={n_expert}"
+                        ))
+                    })?;
+                let (norm, scale, gating) = match arch {
+                    Arch::Qwen3Moe => (true, 1.0, Gating::Softmax),
+                    _ => (false, 1.0, Gating::Softmax),
+                };
+                Some(Moe {
+                    n_expert,
+                    n_expert_used,
+                    n_ff_exp: opt_int("expert_feed_forward_length").ok_or_else(|| {
+                        ModelError::Missing(format!("{arch_name}.expert_feed_forward_length"))
+                    })?,
+                    n_ff_shared: opt_int("expert_shared_feed_forward_length").unwrap_or(0),
+                    weights_norm: info
+                        .arch_get("expert_weights_norm")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(norm),
+                    weights_scale: float("expert_weights_scale").unwrap_or(scale),
+                    gating: match info.arch_get("expert_gating_func").and_then(Value::as_u64) {
+                        // llama.cpp: 1 = softmax, 2 = sigmoid.
+                        Some(2) => Gating::Sigmoid,
+                        _ => gating,
+                    },
+                })
+            }
+        };
         let config = Self {
             arch,
             n_embd,
@@ -174,7 +257,7 @@ impl Config {
             n_head,
             n_head_kv,
             head_dim,
-            n_ff: int("feed_forward_length")?,
+            n_ff: opt_int("feed_forward_length").unwrap_or(0),
             n_vocab,
             rms_eps: float("attention.layer_norm_rms_epsilon").unwrap_or(1e-5),
             rope_base: float("rope.freq_base").unwrap_or(10_000.0),
@@ -182,11 +265,15 @@ impl Config {
             rope_scale,
             rope_style: match arch {
                 Arch::Llama => RopeStyle::Norm,
-                Arch::Qwen2 | Arch::Qwen3 => RopeStyle::Neox,
+                Arch::Qwen2 | Arch::Qwen3 | Arch::Qwen3Moe => RopeStyle::Neox,
             },
             train_context: opt_int("context_length").unwrap_or(4096),
+            moe,
         };
-        if config.n_layer == 0 || config.n_embd == 0 || config.n_ff == 0 || config.head_dim == 0 {
+        // A routed model's dense `feed_forward_length` is unused, and some
+        // files set it to zero, so only require it when there are no experts.
+        let n_ff_required = config.moe.map_or(config.n_ff, |m| m.n_ff_exp);
+        if config.n_layer == 0 || config.n_embd == 0 || n_ff_required == 0 || config.head_dim == 0 {
             return Err(ModelError::Shape("zero-sized hyperparameter".into()));
         }
         Ok(config)
@@ -217,24 +304,84 @@ struct Layer {
     q_norm: Option<Vec<f32>>,
     k_norm: Option<Vec<f32>>,
     ffn_norm: Vec<f32>,
-    w_gate: Weight,
-    w_up: Weight,
-    w_down: Weight,
+    ffn: Ffn,
     /// Read from disk every token instead of held in RAM (see `LoadOptions`).
     streamed: bool,
 }
 
+/// One layer's feed-forward block.
+// The routed variant is the larger one, which costs `n_layer` times the
+// difference -- a few kilobytes against a model measured in gigabytes.
+#[allow(clippy::large_enum_variant)]
+enum Ffn {
+    Dense {
+        gate: Weight,
+        up: Weight,
+        down: Weight,
+    },
+    /// A mixture of experts: a router picks `n_expert_used` of `n_expert`
+    /// slices of each expert tensor, optionally alongside a shared expert
+    /// that every token uses.
+    Routed {
+        router: Weight,
+        gate: Experts,
+        up: Experts,
+        down: Experts,
+        shared: Option<[Weight; 3]>,
+        shared_gate: Option<Weight>,
+    },
+}
+
+/// A 3-D expert tensor: `count` matrices of `rows` x `cols` laid out back to
+/// back, so expert `e` starts at `offset + e * stride`.
+#[derive(Debug, Clone, Copy)]
+struct Experts {
+    kind: GgmlType,
+    rows: usize,
+    cols: usize,
+    offset: usize,
+    stride: usize,
+    count: usize,
+}
+
 impl Layer {
-    fn matrices(&self) -> [Weight; 7] {
-        [
-            self.wq,
-            self.wk,
-            self.wv,
-            self.wo,
-            self.w_gate,
-            self.w_up,
-            self.w_down,
-        ]
+    /// Every 2-D weight in the layer. Expert tensors are not here: they are
+    /// 3-D and only a routed fraction of them is read per token, so callers
+    /// that care about bytes ask `expert_bytes` separately.
+    fn matrices(&self) -> Vec<Weight> {
+        let mut all = vec![self.wq, self.wk, self.wv, self.wo];
+        match &self.ffn {
+            Ffn::Dense { gate, up, down } => all.extend([*gate, *up, *down]),
+            Ffn::Routed {
+                router,
+                shared,
+                shared_gate,
+                ..
+            } => {
+                all.push(*router);
+                all.extend(shared.iter().flatten().copied());
+                all.extend(shared_gate.iter().copied());
+            }
+        }
+        all
+    }
+
+    /// Bytes held by this layer's 3-D expert tensors, and the bytes of them
+    /// one token reads.
+    fn expert_bytes(&self, moe: Option<Moe>) -> (u64, u64) {
+        let Ffn::Routed { gate, up, down, .. } = &self.ffn else {
+            return (0, 0);
+        };
+        let total: u64 = [gate, up, down]
+            .iter()
+            .map(|e| (e.stride * e.count) as u64)
+            .sum();
+        let used = moe.map_or(0, |m| m.n_expert_used as u64);
+        let active: u64 = [gate, up, down]
+            .iter()
+            .map(|e| e.stride as u64 * used)
+            .sum();
+        (total, active)
     }
 }
 
@@ -387,9 +534,41 @@ impl Model {
                     None
                 },
                 ffn_norm: loader.vector(&name("ffn_norm.weight"), c.n_embd)?,
-                w_gate: loader.matrix(&name("ffn_gate.weight"), c.n_ff, c.n_embd)?,
-                w_up: loader.matrix(&name("ffn_up.weight"), c.n_ff, c.n_embd)?,
-                w_down: loader.matrix(&name("ffn_down.weight"), c.n_embd, c.n_ff)?,
+                ffn: match c.moe {
+                    None => Ffn::Dense {
+                        gate: loader.matrix(&name("ffn_gate.weight"), c.n_ff, c.n_embd)?,
+                        up: loader.matrix(&name("ffn_up.weight"), c.n_ff, c.n_embd)?,
+                        down: loader.matrix(&name("ffn_down.weight"), c.n_embd, c.n_ff)?,
+                    },
+                    Some(moe) => {
+                        let (n, ff) = (moe.n_expert, moe.n_ff_exp);
+                        let shared = if moe.n_ff_shared > 0 {
+                            let sh = moe.n_ff_shared;
+                            Some([
+                                loader.matrix(&name("ffn_gate_shexp.weight"), sh, c.n_embd)?,
+                                loader.matrix(&name("ffn_up_shexp.weight"), sh, c.n_embd)?,
+                                loader.matrix(&name("ffn_down_shexp.weight"), c.n_embd, sh)?,
+                            ])
+                        } else {
+                            None
+                        };
+                        Ffn::Routed {
+                            router: loader.matrix(&name("ffn_gate_inp.weight"), n, c.n_embd)?,
+                            gate: loader.experts(&name("ffn_gate_exps.weight"), ff, c.n_embd, n)?,
+                            up: loader.experts(&name("ffn_up_exps.weight"), ff, c.n_embd, n)?,
+                            down: loader.experts(&name("ffn_down_exps.weight"), c.n_embd, ff, n)?,
+                            shared,
+                            shared_gate: loader
+                                .file
+                                .info
+                                .tensor(&name("ffn_gate_inp_shexp.weight"))
+                                .map(|_| {
+                                    loader.matrix(&name("ffn_gate_inp_shexp.weight"), 1, c.n_embd)
+                                })
+                                .transpose()?,
+                        }
+                    }
+                },
             });
         }
         // Read ahead only what stays resident; streamed blocks are read
@@ -423,6 +602,24 @@ impl Model {
         &self.file.info
     }
 
+    /// Expert `index` of a 3-D expert tensor.
+    ///
+    /// Deliberately unpacked: the x8 layouts are a second copy of the
+    /// weights, and the expert tensors are nearly all of an MoE's bytes, so
+    /// repacking them would double the resident set of the one thing that
+    /// already does not fit.
+    fn expert(&self, e: Experts, index: usize) -> Matrix<'_> {
+        debug_assert!(index < e.count);
+        let at = e.offset + index * e.stride;
+        Matrix {
+            kind: e.kind,
+            rows: e.rows,
+            cols: e.cols,
+            data: &self.file.mapped()[at..at + e.stride],
+            packed: None,
+        }
+    }
+
     fn matrix(&self, w: Weight) -> Matrix<'_> {
         Matrix {
             kind: w.kind,
@@ -437,7 +634,8 @@ impl Model {
     pub fn weight_bytes(&self) -> u64 {
         let mut total = self.output.len as u64;
         for l in &self.layers {
-            for w in [l.wq, l.wk, l.wv, l.wo, l.w_gate, l.w_up, l.w_down] {
+            total += l.expert_bytes(self.config.moe).1;
+            for w in l.matrices() {
                 total += w.len as u64;
             }
         }
@@ -449,10 +647,8 @@ impl Model {
         self.layers
             .iter()
             .map(|l| {
-                [l.wq, l.wk, l.wv, l.wo, l.w_gate, l.w_up, l.w_down]
-                    .iter()
-                    .map(|w| w.len as u64)
-                    .sum::<u64>()
+                l.matrices().iter().map(|w| w.len as u64).sum::<u64>()
+                    + l.expert_bytes(self.config.moe).0
                     + 4 * (l.attn_norm.len() + l.ffn_norm.len()) as u64
             })
             .collect()
@@ -467,11 +663,7 @@ impl Model {
     pub fn weight_types(&self) -> Vec<&'static str> {
         let mut kinds: Vec<&'static str> = std::iter::once(self.output)
             .chain(std::iter::once(self.token_embd))
-            .chain(
-                self.layers
-                    .iter()
-                    .flat_map(|l| [l.wq, l.wk, l.wv, l.wo, l.w_gate, l.w_up, l.w_down]),
-            )
+            .chain(self.layers.iter().flat_map(|l| l.matrices()))
             .map(|w| w.kind.name())
             .collect();
         kinds.sort_unstable();
@@ -484,6 +676,16 @@ impl Model {
     }
 
     /// Read ahead the streamed blocks that follow block `layer`.
+    ///
+    /// `matrices()` deliberately excludes the 3-D expert tensors, so experts
+    /// are never read ahead and never released. Both halves matter for an
+    /// MoE. Reading a block ahead would fetch all `n_expert` experts when a
+    /// token wants `n_expert_used` of them -- for Qwen3-30B-A3B that is 128
+    /// instead of 8, turning ~1.9 GiB of real traffic per token into ~18
+    /// GiB. And not releasing them leaves their pages to the kernel's own
+    /// LRU, which is a usable expert cache for free; whether its hit rate is
+    /// good enough is the open question in docs/MOE.md, and it should be
+    /// measured before anything cleverer is built.
     fn stream_ahead(&self, layer: usize) {
         let n = self.layers.len();
         for next in layer + 1..(layer + 1 + STREAM_LOOKAHEAD).min(n) {
@@ -533,6 +735,48 @@ impl Loader<'_> {
             .info
             .tensor(name)
             .ok_or_else(|| ModelError::Missing(format!("tensor {name}")))
+    }
+
+    /// A 3-D expert tensor of `count` matrices, each `rows` x `cols`.
+    fn experts(
+        &self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        count: usize,
+    ) -> Result<Experts, ModelError> {
+        let t = self.tensor(name)?;
+        let kind = t
+            .kind()
+            .filter(|k| k.is_supported())
+            .ok_or_else(|| ModelError::Unsupported(format!("{name} has type {}", t.type_name())))?;
+        if t.dimensions != [cols as u64, rows as u64, count as u64] {
+            return Err(ModelError::Shape(format!(
+                "{name} is {:?}, expected [{cols}, {rows}, {count}]",
+                t.dimensions
+            )));
+        }
+        let bytes = self.file.tensor_bytes(t)?;
+        let offset = bytes.as_ptr() as usize - self.file.mapped().as_ptr() as usize;
+        let stride = bytes.len() / count;
+        let row_bytes = kind.row_bytes(cols).ok_or(ModelError::Shape(format!(
+            "{name}: {cols} columns are not a whole number of {} blocks",
+            kind.name()
+        )))?;
+        if stride != row_bytes * rows {
+            return Err(ModelError::Shape(format!(
+                "{name}: {stride} bytes per expert, expected {}",
+                row_bytes * rows
+            )));
+        }
+        Ok(Experts {
+            kind,
+            rows,
+            cols,
+            offset,
+            stride,
+            count,
+        })
     }
 
     fn matrix(&self, name: &str, rows: usize, cols: usize) -> Result<Weight, ModelError> {
@@ -665,6 +909,10 @@ pub struct Session<'m> {
     proj: Vec<f32>,
     gate: Vec<f32>,
     up: Vec<f32>,
+    /// Router logits, `n_expert` per token (empty for dense models).
+    router: Vec<f32>,
+    /// One expert's down-projection output, accumulated into `proj`.
+    moe_proj: Vec<f32>,
     scores: Vec<f32>,
     rope: Vec<(f32, f32)>,
     logits: Vec<f32>,
@@ -701,8 +949,10 @@ impl<'m> Session<'m> {
             v: vec![0.0; b * c.kv_dim()],
             attn: vec![0.0; b * c.q_dim()],
             proj: vec![0.0; b * c.n_embd],
-            gate: vec![0.0; b * c.n_ff],
-            up: vec![0.0; b * c.n_ff],
+            gate: vec![0.0; b * c.ffn_width()],
+            up: vec![0.0; b * c.ffn_width()],
+            router: vec![0.0; b * c.moe.map_or(0, |m| m.n_expert)],
+            moe_proj: vec![0.0; c.n_embd],
             scores: vec![0.0; b * c.n_head * context],
             rope: vec![(0.0, 0.0); b * c.rope_dim / 2],
             logits: vec![0.0; b * c.n_vocab],
@@ -844,6 +1094,9 @@ impl<'m> Session<'m> {
         let group = c.n_head / c.n_head_kv;
         let layer_stride = self.context * kvd;
         let query_block = query_block(c, n, crate::pool::global().threads());
+        // Reused by every routed layer; `route` clears it.
+        let mut chosen: Vec<(usize, f32)> =
+            Vec::with_capacity(c.moe.map_or(0, |m| m.n_expert_used));
 
         let streaming = model.residency.first_streamed < c.n_layer || model.residency.head_streamed;
         if streaming {
@@ -1023,32 +1276,133 @@ impl<'m> Session<'m> {
                 xn.copy_from_slice(x);
                 rms_norm_in_place(xn, &layer.ffn_norm, c.rms_eps);
             }
-            let ff = c.n_ff;
             self.profiler.lap(0);
-            be.matmul_many(
-                &mut [
-                    Job {
-                        matrix: model.matrix(layer.w_gate),
-                        output: &mut self.gate[..n * ff],
-                    },
-                    Job {
-                        matrix: model.matrix(layer.w_up),
-                        output: &mut self.up[..n * ff],
-                    },
-                ],
-                &self.xn[..n * d],
-                n,
-            )?;
-            self.profiler.lap(5);
-            kernels::swiglu_in_place(&mut self.gate[..n * ff], &self.up[..n * ff]);
-            self.profiler.lap(0);
-            be.matmul(
-                model.matrix(layer.w_down),
-                &self.gate[..n * ff],
-                &mut self.proj[..n * d],
-                n,
-            )?;
-            self.profiler.lap(6);
+            match &layer.ffn {
+                Ffn::Dense { gate, up, down } => {
+                    let ff = c.n_ff;
+                    be.matmul_many(
+                        &mut [
+                            Job {
+                                matrix: model.matrix(*gate),
+                                output: &mut self.gate[..n * ff],
+                            },
+                            Job {
+                                matrix: model.matrix(*up),
+                                output: &mut self.up[..n * ff],
+                            },
+                        ],
+                        &self.xn[..n * d],
+                        n,
+                    )?;
+                    self.profiler.lap(5);
+                    kernels::swiglu_in_place(&mut self.gate[..n * ff], &self.up[..n * ff]);
+                    self.profiler.lap(0);
+                    be.matmul(
+                        model.matrix(*down),
+                        &self.gate[..n * ff],
+                        &mut self.proj[..n * d],
+                        n,
+                    )?;
+                    self.profiler.lap(6);
+                }
+                Ffn::Routed {
+                    router,
+                    gate,
+                    up,
+                    down,
+                    shared,
+                    shared_gate,
+                } => {
+                    let moe = c.moe.expect("a routed layer needs expert parameters");
+                    let ne = moe.n_expert;
+                    let ff = moe.n_ff_exp;
+                    // One router matvec covers the whole batch.
+                    be.matmul(
+                        model.matrix(*router),
+                        &self.xn[..n * d],
+                        &mut self.router[..n * ne],
+                        n,
+                    )?;
+                    self.profiler.lap(5);
+                    self.proj[..n * d].fill(0.0);
+                    for i in 0..n {
+                        route(&self.router[i * ne..(i + 1) * ne], &moe, &mut chosen);
+                        for &(expert, weight) in chosen.iter() {
+                            be.matmul_many(
+                                &mut [
+                                    Job {
+                                        matrix: model.expert(*gate, expert),
+                                        output: &mut self.gate[..ff],
+                                    },
+                                    Job {
+                                        matrix: model.expert(*up, expert),
+                                        output: &mut self.up[..ff],
+                                    },
+                                ],
+                                &self.xn[i * d..(i + 1) * d],
+                                1,
+                            )?;
+                            kernels::swiglu_in_place(&mut self.gate[..ff], &self.up[..ff]);
+                            be.matmul(
+                                model.expert(*down, expert),
+                                &self.gate[..ff],
+                                &mut self.moe_proj[..d],
+                                1,
+                            )?;
+                            for (p, v) in self.proj[i * d..(i + 1) * d]
+                                .iter_mut()
+                                .zip(&self.moe_proj[..d])
+                            {
+                                *p += weight * v;
+                            }
+                        }
+                        // The shared expert runs for every token. Its own
+                        // gate, when the model has one, is a sigmoid.
+                        if let Some([sg, su, sd]) = shared {
+                            let sh = moe.n_ff_shared;
+                            be.matmul_many(
+                                &mut [
+                                    Job {
+                                        matrix: model.matrix(*sg),
+                                        output: &mut self.gate[..sh],
+                                    },
+                                    Job {
+                                        matrix: model.matrix(*su),
+                                        output: &mut self.up[..sh],
+                                    },
+                                ],
+                                &self.xn[i * d..(i + 1) * d],
+                                1,
+                            )?;
+                            kernels::swiglu_in_place(&mut self.gate[..sh], &self.up[..sh]);
+                            be.matmul(
+                                model.matrix(*sd),
+                                &self.gate[..sh],
+                                &mut self.moe_proj[..d],
+                                1,
+                            )?;
+                            let mut scale = 1.0;
+                            if let Some(g) = shared_gate {
+                                let mut logit = [0.0_f32; 1];
+                                be.matmul(
+                                    model.matrix(*g),
+                                    &self.xn[i * d..(i + 1) * d],
+                                    &mut logit,
+                                    1,
+                                )?;
+                                scale = 1.0 / (1.0 + (-logit[0]).exp());
+                            }
+                            for (p, v) in self.proj[i * d..(i + 1) * d]
+                                .iter_mut()
+                                .zip(&self.moe_proj[..d])
+                            {
+                                *p += scale * v;
+                            }
+                        }
+                    }
+                    self.profiler.lap(6);
+                }
+            }
             add_assign(&mut self.x[..n * d], &self.proj[..n * d]);
             if streaming {
                 model.stream_done(li);
@@ -1140,6 +1494,68 @@ fn query_block(config: &Config, tokens: usize, threads: usize) -> usize {
     by_cache.min(by_threads).min(tokens.max(1))
 }
 
+/// Expert weights for one token: gate the router's logits, take the
+/// `n_expert_used` largest, then renormalize and scale as the architecture
+/// asks.
+///
+/// This follows llama.cpp's order exactly, because the order is observable:
+/// gating over *all* experts and then selecting is not the same as selecting
+/// and then gating unless the weights are renormalized afterwards. Ties go
+/// to the lower expert index.
+fn route(logits: &[f32], moe: &Moe, out: &mut Vec<(usize, f32)>) {
+    out.clear();
+    // Gate first, over every expert.
+    let probability = |v: f32, max: f32| match moe.gating {
+        Gating::Softmax => (v - max).exp(),
+        Gating::Sigmoid => 1.0 / (1.0 + (-v).exp()),
+    };
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let total: f32 = match moe.gating {
+        Gating::Softmax => logits.iter().map(|&v| (v - max).exp()).sum(),
+        Gating::Sigmoid => 1.0,
+    };
+    // Then the k largest. Selection is O(k * n_expert) with no allocation,
+    // and k is a handful.
+    let mut taken = 0_u64;
+    let wide = logits.len() > 64;
+    for _ in 0..moe.n_expert_used.min(logits.len()) {
+        let mut best = usize::MAX;
+        let mut best_value = f32::NEG_INFINITY;
+        for (e, &v) in logits.iter().enumerate() {
+            let already = if wide {
+                out.iter().any(|(j, _)| *j == e)
+            } else {
+                taken & (1 << e) != 0
+            };
+            if already || v <= best_value {
+                continue;
+            }
+            best_value = v;
+            best = e;
+        }
+        if best == usize::MAX {
+            break;
+        }
+        if !wide {
+            taken |= 1 << best;
+        }
+        out.push((best, probability(best_value, max) / total));
+    }
+    if moe.weights_norm {
+        let sum: f32 = out.iter().map(|(_, w)| *w).sum();
+        if sum != 0.0 {
+            for (_, w) in out.iter_mut() {
+                *w /= sum;
+            }
+        }
+    }
+    if moe.weights_scale != 1.0 {
+        for (_, w) in out.iter_mut() {
+            *w *= moe.weights_scale;
+        }
+    }
+}
+
 fn add_bias(values: &mut [f32], bias: Option<&[f32]>) {
     if let Some(bias) = bias {
         add_assign(values, bias);
@@ -1170,5 +1586,87 @@ fn rope(head: &mut [f32], table: &[(f32, f32)], style: RopeStyle) {
                 head[j + n] = a * sin + b * cos;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn moe(n_expert: usize, n_expert_used: usize) -> Moe {
+        Moe {
+            n_expert,
+            n_expert_used,
+            n_ff_exp: 8,
+            n_ff_shared: 0,
+            weights_norm: true,
+            weights_scale: 1.0,
+            gating: Gating::Softmax,
+        }
+    }
+
+    #[test]
+    fn router_picks_the_largest_logits() {
+        let mut out = Vec::new();
+        route(&[0.1, 3.0, -1.0, 2.0, 0.5], &moe(5, 2), &mut out);
+        assert_eq!(out.iter().map(|(e, _)| *e).collect::<Vec<_>>(), [1, 3]);
+        // Normalized, so the two weights sum to one.
+        let sum: f32 = out.iter().map(|(_, w)| *w).sum();
+        assert!((sum - 1.0).abs() < 1e-6, "weights sum to {sum}");
+        // And they are softmax over just those two, because renormalizing
+        // cancels the full normalizer: exp(3)/(exp(3)+exp(2)).
+        let expected = 1.0 / (1.0 + (2.0_f32 - 3.0).exp());
+        assert!(
+            (out[0].1 - expected).abs() < 1e-6,
+            "{} vs {expected}",
+            out[0].1
+        );
+    }
+
+    /// Selection must be stable where logits tie, or two engines disagree on
+    /// which expert ran.
+    #[test]
+    fn router_breaks_ties_toward_the_lower_index() {
+        let mut out = Vec::new();
+        route(&[1.0, 5.0, 5.0, 5.0], &moe(4, 2), &mut out);
+        assert_eq!(out.iter().map(|(e, _)| *e).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    #[test]
+    fn router_handles_more_than_sixty_four_experts() {
+        // Past 64 the "already taken" test cannot be a u64 mask.
+        let mut logits = vec![0.0_f32; 128];
+        logits[100] = 9.0;
+        logits[7] = 8.0;
+        let mut out = Vec::new();
+        route(&logits, &moe(128, 3), &mut out);
+        let picked: Vec<usize> = out.iter().map(|(e, _)| *e).collect();
+        assert_eq!(picked[..2], [100, 7]);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|(_, w)| w.is_finite() && *w >= 0.0));
+    }
+
+    #[test]
+    fn router_applies_sigmoid_gating_and_scale() {
+        let mut config = moe(4, 2);
+        config.gating = Gating::Sigmoid;
+        config.weights_norm = false;
+        config.weights_scale = 2.0;
+        let mut out = Vec::new();
+        route(&[0.0, 1.0, -1.0, 2.0], &config, &mut out);
+        assert_eq!(out.iter().map(|(e, _)| *e).collect::<Vec<_>>(), [3, 1]);
+        let sigmoid = |v: f32| 1.0 / (1.0 + (-v).exp());
+        assert!((out[0].1 - 2.0 * sigmoid(2.0)).abs() < 1e-6);
+        assert!((out[1].1 - 2.0 * sigmoid(1.0)).abs() < 1e-6);
+    }
+
+    /// Asking for every expert must still produce a valid distribution.
+    #[test]
+    fn router_can_select_all_experts() {
+        let mut out = Vec::new();
+        route(&[1.0, 2.0, 3.0], &moe(3, 3), &mut out);
+        assert_eq!(out.len(), 3);
+        let sum: f32 = out.iter().map(|(_, w)| *w).sum();
+        assert!((sum - 1.0).abs() < 1e-6);
     }
 }

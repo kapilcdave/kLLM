@@ -183,6 +183,30 @@ fn cmd_inspect(args: &Args) -> Result<(), String> {
                 c.rope_style,
                 c.rope_base
             );
+            if let Some(moe) = c.moe {
+                out!(
+                    "  experts:            {} of {} per token, ff={}{}, {:?} gating{}{}",
+                    moe.n_expert_used,
+                    moe.n_expert,
+                    moe.n_ff_exp,
+                    if moe.n_ff_shared > 0 {
+                        format!(" (+shared ff={})", moe.n_ff_shared)
+                    } else {
+                        String::new()
+                    },
+                    moe.gating,
+                    if moe.weights_norm { ", normalized" } else { "" },
+                    if moe.weights_scale != 1.0 {
+                        format!(", scale={}", moe.weights_scale)
+                    } else {
+                        String::new()
+                    },
+                );
+                out!(
+                    "  active fraction:    {:.1}% of expert weights per token",
+                    moe.active_fraction() * 100.0
+                );
+            }
             out!(
                 "  KV cache:           {} bytes/token (f16)",
                 c.kv_bytes_per_token()
