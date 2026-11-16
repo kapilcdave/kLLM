@@ -966,6 +966,10 @@ pub struct Session<'m> {
     router: Vec<f32>,
     /// One expert's down-projection output, accumulated into `proj`.
     moe_proj: Vec<f32>,
+    /// Activations gathered for one expert's token group, and that group's
+    /// output, when a batch is sorted by expert.
+    moe_x: Vec<f32>,
+    moe_y: Vec<f32>,
     scores: Vec<f32>,
     rope: Vec<(f32, f32)>,
     logits: Vec<f32>,
@@ -1006,6 +1010,8 @@ impl<'m> Session<'m> {
             up: vec![0.0; b * c.ffn_width()],
             router: vec![0.0; b * c.moe.map_or(0, |m| m.n_expert)],
             moe_proj: vec![0.0; c.n_embd],
+            moe_x: vec![0.0; if c.moe.is_some() { b * c.n_embd } else { 0 }],
+            moe_y: vec![0.0; if c.moe.is_some() { b * c.n_embd } else { 0 }],
             scores: vec![0.0; b * c.n_head * context],
             rope: vec![(0.0, 0.0); b * c.rope_dim / 2],
             logits: vec![0.0; b * c.n_vocab],
@@ -1154,6 +1160,16 @@ impl<'m> Session<'m> {
         // Reused by every routed layer; `route` clears it.
         let mut chosen: Vec<(usize, f32)> =
             Vec::with_capacity(c.moe.map_or(0, |m| m.n_expert_used));
+        // Tokens grouped by the expert they chose, for batches larger than
+        // one. Allocated once here rather than per layer.
+        let mut assign: Vec<Vec<(usize, f32)>> = vec![
+            Vec::new();
+            if n > 1 {
+                c.moe.map_or(0, |m| m.n_expert)
+            } else {
+                0
+            }
+        ];
 
         let streaming = model.residency.first_streamed < c.n_layer || model.residency.head_streamed;
         if streaming {
@@ -1382,6 +1398,115 @@ impl<'m> Session<'m> {
                     )?;
                     self.profiler.lap(5);
                     self.proj[..n * d].fill(0.0);
+
+                    // More than one token: group the tokens by the expert
+                    // they chose, so each expert's weights are read once for
+                    // the batch instead of once per token. Prefill is
+                    // bandwidth-bound like decode, and this is the whole
+                    // difference: at batch 64 with 8 of 128 experts, a layer
+                    // reads 64 x 8 experts naively against 128 sorted, so
+                    // about four times less.
+                    if n > 1 {
+                        for list in assign.iter_mut() {
+                            list.clear();
+                        }
+                        for i in 0..n {
+                            route(&self.router[i * ne..(i + 1) * ne], &moe, &mut chosen);
+                            if router_trace::enabled() {
+                                router_trace::record(start + i, li, &chosen);
+                            }
+                            for &(expert, weight) in chosen.iter() {
+                                assign[expert].push((i, weight));
+                            }
+                        }
+                        for (expert, group) in assign.iter().enumerate() {
+                            let rows = group.len();
+                            if rows == 0 {
+                                continue;
+                            }
+                            for (j, &(i, _)) in group.iter().enumerate() {
+                                self.moe_x[j * d..(j + 1) * d]
+                                    .copy_from_slice(&self.xn[i * d..(i + 1) * d]);
+                            }
+                            be.matmul_many(
+                                &mut [
+                                    Job {
+                                        matrix: model.expert(*gate, expert),
+                                        output: &mut self.gate[..rows * ff],
+                                    },
+                                    Job {
+                                        matrix: model.expert(*up, expert),
+                                        output: &mut self.up[..rows * ff],
+                                    },
+                                ],
+                                &self.moe_x[..rows * d],
+                                rows,
+                            )?;
+                            kernels::swiglu_in_place(
+                                &mut self.gate[..rows * ff],
+                                &self.up[..rows * ff],
+                            );
+                            be.matmul(
+                                model.expert(*down, expert),
+                                &self.gate[..rows * ff],
+                                &mut self.moe_y[..rows * d],
+                                rows,
+                            )?;
+                            for (j, &(i, weight)) in group.iter().enumerate() {
+                                for (p, v) in self.proj[i * d..(i + 1) * d]
+                                    .iter_mut()
+                                    .zip(&self.moe_y[j * d..(j + 1) * d])
+                                {
+                                    *p += weight * v;
+                                }
+                            }
+                        }
+                        // The shared expert runs for every token at once.
+                        if let Some([sg, su, sd]) = shared {
+                            let sh = moe.n_ff_shared;
+                            be.matmul_many(
+                                &mut [
+                                    Job {
+                                        matrix: model.matrix(*sg),
+                                        output: &mut self.gate[..n * sh],
+                                    },
+                                    Job {
+                                        matrix: model.matrix(*su),
+                                        output: &mut self.up[..n * sh],
+                                    },
+                                ],
+                                &self.xn[..n * d],
+                                n,
+                            )?;
+                            kernels::swiglu_in_place(&mut self.gate[..n * sh], &self.up[..n * sh]);
+                            be.matmul(
+                                model.matrix(*sd),
+                                &self.gate[..n * sh],
+                                &mut self.moe_y[..n * d],
+                                n,
+                            )?;
+                            for i in 0..n {
+                                let scale = shared_gate.as_ref().map_or(1.0, |g| {
+                                    let logit: f32 = g
+                                        .iter()
+                                        .zip(&self.xn[i * d..(i + 1) * d])
+                                        .map(|(w, v)| w * v)
+                                        .sum();
+                                    1.0 / (1.0 + (-logit).exp())
+                                });
+                                for (p, v) in self.proj[i * d..(i + 1) * d]
+                                    .iter_mut()
+                                    .zip(&self.moe_y[i * d..(i + 1) * d])
+                                {
+                                    *p += scale * v;
+                                }
+                            }
+                        }
+                        self.profiler.lap(6);
+                        add_assign(&mut self.x[..n * d], &self.proj[..n * d]);
+                        continue;
+                    }
+
                     for i in 0..n {
                         route(&self.router[i * ne..(i + 1) * ne], &moe, &mut chosen);
                         if router_trace::enabled() {

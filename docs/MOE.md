@@ -95,13 +95,21 @@ time on bookkeeping. The right shape is one parallel region per layer over all
 `Job` list already supported by `matmul_many`, extended to let each job carry
 its own input scaling.
 
-**Prefill needs tokens sorted by expert.** Each of `B` tokens picks its own
-`k` experts, so the naive loop does `B x k` narrow matvecs and throws away
-every bit of the register tiling that just doubled float prefill. The standard
-fix is a gather: for each expert, collect the tokens that chose it, run one
-dense GEMM over that subset, scatter the results back weighted. That also
-turns expert weight traffic from `B x k` reads into `N` reads per batch, which
-matters enormously when the weights come from disk.
+**Prefill needs tokens sorted by expert** -- done, and worth 52%. Each of
+`B` tokens picks its own `k` experts, so a per-token loop reads an expert's
+weights once per token that chose it. Sorting gathers the tokens that chose
+each expert, runs one matmul over that group, and scatters the results back
+weighted, so each expert is read once per batch: at batch 64 with 8 of 128
+experts a layer reads `64 x 8` expert copies naively against 128 sorted.
+Measured on Qwen3-30B-A3B, pp64 over three interleaved rounds: 16.2, 13.9,
+13.9 tok/s per-token against 19.3, 24.7, 22.7 sorted. Raising the batch to
+128 did not compound it (15.2 against 15.6 at pp128), so the gain is in
+reading each expert once rather than in wider tiles.
+
+Perplexity moves from 13.0682 to 12.9472, which is within llama.cpp's own
+1.23% band (+0.38% from its flash-attention-off figure): summing a token's
+experts in expert-index order rather than router-rank order is a different
+summation order, amplified as everything here is by routing.
 
 But note the arithmetic: the average tokens-per-expert is `B x k / N`. For
 Qwen3-30B-A3B at the current default batch of 64, that is `64 x 8 / 128 = 4`
@@ -227,10 +235,11 @@ Either way the staging is: router and routed FFN correct on a RAM-resident
 model → locality trace → expert-granularity residency in the planner and
 disk tier → prefill token sorting.
 
-**Status, 2026-11-15.** `qwen3moe` runs, at 11.3 tok/s against llama.cpp's
-1.81 on Qwen3-30B-A3B Q4_K_M -- 6x, on a machine with 16 GiB for a 17.3 GiB
-model, and from a starting point of 1.4. See "Residency" below for where
-that came from; none of it was kernel work.
+**Status, 2026-11-16.** `qwen3moe` runs Qwen3-30B-A3B Q4_K_M -- a 17.3 GiB
+model on a machine with 16 GiB -- at 11.3 tok/s decode against llama.cpp's
+1.81, from a starting point of 1.4, and 24.7 tok/s prefill against 16.2
+before sorting. Decode is now at memory bandwidth; prefill got the 52%. None
+of it was kernel work.
 
 ## Routing amplifies numerical noise, and that sets the tolerance
 
@@ -318,7 +327,19 @@ Perplexity under this default is 13.0682 against llama.cpp's 13.0579 with
 flash attention on, +0.08%.
 
 An explicit expert cache is therefore *not* the next thing to build: the
-free one already gets us to the compute ceiling. The next lever is the
-compute path -- one parallel region per layer instead of `k` separate
-matmuls, which also shares the activation quantization across experts
-instead of repeating it 16 times per layer.
+free one already gets us there.
+
+And "there" turns out to be memory bandwidth, not compute. Decode streams
+20.0 GiB/s of weights at 11.2 tok/s, against 20.7 GB/s for a Q4_0 matvec and
+27.3 for F16 on this machine (`examples/kernel_bench`, 4096x4096, four
+threads) -- so roughly 80-100% of what the hardware gives, depending on
+which ceiling is fair for Q4_K. A token reads about 1.79 GiB: 1.02 of
+experts, 283 MiB of qkv, 226 of the output projection and 255 of the head.
+Fusing the per-expert matmuls into one parallel region, sharing the
+activation quantization, better tiling -- all of it is worth a few percent
+against that. **Decode has no headroom left in the compute path**, and the
+only remaining lever for it is reading fewer bytes, which means trading
+quality (fewer experts) rather than engineering.
+
+Prefill was the opposite case and is where the work went: see the sorting
+above.

@@ -25,17 +25,25 @@ and execute Llama-family models without exceeding a configured budget.
    loses to plain mmap because the kernel can reclaim other caches. Deciding
    that at run time, from observed major faults, would beat a static budget.
 
-1. **Routed decode compute.** Mixture-of-experts runs (`qwen3moe`, designed
+1. **Routed prefill and decode: at the hardware.** Mixture-of-experts runs (`qwen3moe`, designed
    in [docs/MOE.md](docs/MOE.md)): Qwen3-30B-A3B Q4_K_M, a 17.3 GiB model on
    a 16 GiB laptop, at **11.3 tok/s against llama.cpp's 1.81** -- 6x, up from
    1.4 -- with perplexity 13.0682 against llama.cpp's 13.0579 (+0.08%, and
    its own flash-attention spread on this model is 1.23%).
 
-   Decode is now compute-bound, not traffic-bound, so the next lever is the
-   routed path itself: one parallel region per layer instead of `k` separate
-   matmuls, which also shares the activation quantization across experts
-   rather than repeating it 16 times per layer. This model wants ~2.1 G MAC
-   per token, which is where the ~10-14 tok/s ceiling comes from.
+   Prefill sorts tokens by expert so each expert is read once per batch
+   rather than once per token that chose it: pp64 22.2 tok/s against 14.7,
+   a 52% gain.
+
+   Decode, measured, is memory-bandwidth-bound and not compute-bound as this
+   entry previously claimed: 20.0 GiB/s of weights against 20.7-27.3 GB/s for
+   this machine, so 80-100% of the hardware. A token reads ~1.79 GiB. There
+   is no headroom in the routed compute path for decode -- fusing the
+   per-expert matmuls, sharing the activation quantization and better tiling
+   are each worth a few percent against a bandwidth wall. The only remaining
+   decode lever is reading fewer bytes, i.e. trading quality by dropping the
+   lowest-weight experts, which should be opt-in and measured with
+   `kllm compare` rather than slipped in.
 
    An explicit expert cache is deliberately *not* next. The locality curve
    (an LRU over (layer, expert) reaching 61% at 1.9 GiB and 92% at 7.2 GiB,
