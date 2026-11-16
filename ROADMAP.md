@@ -77,9 +77,20 @@ and execute Llama-family models without exceeding a configured budget.
    Q4_K's 144, so there is more unpacking per byte. Until it is packed, Q3_K
    is a capability (models that would not otherwise load) rather than the
    speed win that fewer bytes ought to buy.
-4. **More architectures**: Gemma, Phi-3, and the hybrid Qwen3.5, whose
-   linear-attention layers need new kernels.
-5. `serve`: an OpenAI-compatible local HTTP endpoint (spec milestone 8).
+4. **Qwen3.5 (`qwen35`)**, scoped in [docs/QWEN35.md](docs/QWEN35.md). It is
+   a layer-level hybrid: `full_attention_interval = 4`, so three of every
+   four blocks are a gated-DeltaNet SSM and every fourth is ordinary
+   attention. The attention blocks are nearly free (they are `qwen3`), and
+   M-RoPE collapses to plain RoPE for text-only input because all three
+   position axes carry the same index -- so the work is the SSM: a causal
+   four-tap depthwise conv needing a ring buffer, and a recurrence over a
+   16x128 state, neither of which the KV cache covers. Worth doing because
+   Qwen3.5-4B and 9B are already here as Q4_K_M and small enough to hold in
+   RAM, so they would be fast rather than merely possible. Qwen3.5-35B-A3B
+   additionally needs IQ2_XXS, which is where all of its bytes are.
+
+5. **More architectures**: Gemma, Phi-3.
+6. `serve`: an OpenAI-compatible local HTTP endpoint (spec milestone 8).
 
 ## Closed
 
