@@ -107,7 +107,7 @@ Building without the GPU backend: `cargo build --release --no-default-features`.
 | **Execution** | CPU: batched prefill, f16 KV cache, AVX2/FMA/F16C kernels with a portable scalar fallback |
 | **Sampling** | Greedy, temperature, top-k, top-p, min-p, repetition penalty, seeded |
 | **CUDA** | Kernels for all weight types, coalesced struct-of-arrays matvecs for Q4_0/Q8_0/Q4_K/Q6_K, KV cache in VRAM. Perplexity matches llama.cpp on the GPU as closely as on the CPU (`tests/gpu.rs`) |
-| **In progress** | `qwen35` (Qwen3.5 hybrid attention / gated DeltaNet) loads every tensor; the recurrence is next. See [docs/QWEN35.md](docs/QWEN35.md) |
+| **Qwen3.5** | `qwen35` dense 4B/9B Q4_K_M runs on CPU with gated attention and DeltaNet; 4B perplexity is within 0.27% of llama.cpp. The 35B-A3B IQ2_XXS file still needs that weight type. See [docs/QWEN35.md](docs/QWEN35.md) |
 
 ## Commands
 

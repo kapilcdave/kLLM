@@ -9,6 +9,7 @@ CPU backend) by `scripts/make_fixtures.py` and
 | `*.tokens.json` | `llama-tokenize` output for tricky strings |
 | `*.greedy.json` | `llama-server` greedy completions: token IDs and top-10 log-probs per step |
 | `perplexity.json` | `llama-perplexity -c 256 --chunks 8` on `wiki.test.head.txt`, flash attention on and off |
+| `qwen35-perplexity.json` | Qwen3.5-4B Q4_K_M, `llama-perplexity -c 256 --chunks 4 -t 8 -ngl 0`; see `docs/QWEN35.md` |
 | `divergence.json` | `llama-perplexity --kl-divergence -c 512 --chunks 4` against each family's reference model |
 | `wiki.test.head.txt` | First 16 kB of the WikiText-2 raw test split |
 

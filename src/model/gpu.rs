@@ -92,6 +92,11 @@ impl Model {
                 weight_bytes: 0,
             });
         }
+        if layers > 0 && (c.ssm.is_some() || c.attn_gated) {
+            return Err(ModelError::Unsupported(
+                "gated attention and DeltaNet layers on the GPU".into(),
+            ));
+        }
         if c.head_dim > 256 {
             return Err(ModelError::Unsupported(format!(
                 "GPU attention needs head_dim <= 256, model has {}",

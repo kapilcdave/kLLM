@@ -99,8 +99,8 @@ pub struct Config {
     /// Present when some layers mix positions with a linear-attention
     /// recurrence instead of softmax attention.
     pub ssm: Option<SsmConfig>,
-    /// Whether the q projection also emits a sigmoid gate for the attention
-    /// output, doubling its width (Qwen3.5).
+    /// Whether each q head also emits a sigmoid output gate, doubling the
+    /// projection width with interleaved query/gate heads (Qwen3.5).
     pub attn_gated: bool,
 }
 
@@ -109,14 +109,24 @@ pub struct Config {
 pub struct SsmConfig {
     /// Taps of the causal depthwise convolution.
     pub conv_kernel: usize,
-    /// Width of the recurrent state per group.
+    /// Key and value head dimension.
     pub state_size: usize,
     pub group_count: usize,
     pub time_step_rank: usize,
-    /// Width of the fused q/k/v projection's output.
+    /// Combined value-head width (the Q/K channels are additional).
     pub inner_size: usize,
     /// Every `interval`-th block uses softmax attention instead.
     pub interval: usize,
+}
+
+impl SsmConfig {
+    fn conv_width(self) -> usize {
+        2 * self.group_count * self.state_size + self.inner_size
+    }
+    fn state_floats(self) -> usize {
+        self.time_step_rank * self.state_size * self.state_size
+            + self.conv_width() * self.conv_kernel
+    }
 }
 
 /// How the router turns hidden states into expert weights.
@@ -293,8 +303,8 @@ impl Config {
             },
             train_context: opt_int("context_length").unwrap_or(4096),
             moe,
-            // By shape, not by architecture: the q projection is twice
-            // `q_dim` wide when its second half is an output gate.
+            // By shape, not by architecture: each Q head has a companion
+            // output gate, doubling the Q projection width.
             attn_gated: (0..int("block_count")?).any(|i| {
                 info.tensor(&format!("blk.{i}.attn_q.weight"))
                     .and_then(|t| t.dimensions.get(1).copied())
@@ -314,6 +324,19 @@ impl Config {
         let n_ff_required = config.moe.map_or(config.n_ff, |m| m.n_ff_exp);
         if config.n_layer == 0 || config.n_embd == 0 || n_ff_required == 0 || config.head_dim == 0 {
             return Err(ModelError::Shape("zero-sized hyperparameter".into()));
+        }
+        if let Some(sc) = config.ssm
+            && (sc.conv_kernel == 0
+                || sc.state_size == 0
+                || sc.group_count == 0
+                || sc.time_step_rank == 0
+                || sc.time_step_rank % sc.group_count != 0
+                || sc.inner_size != sc.time_step_rank * sc.state_size
+                || sc.interval == 0)
+        {
+            return Err(ModelError::Shape(
+                "invalid gated DeltaNet hyperparameters".into(),
+            ));
         }
         Ok(config)
     }
@@ -364,12 +387,7 @@ struct Attention {
     k_norm: Option<Vec<f32>>,
 }
 
-/// Linear-attention weights. `qkv` is fused and `gate` sigmoid-gates the
-/// output; the rest drive a four-tap causal convolution and a recurrence
-/// over a `group_count` by `state_size` state.
-// Loaded and shape-checked, but the recurrence that would read the last four
-// is not written yet; see docs/QWEN35.md.
-#[allow(dead_code)]
+/// Gated DeltaNet weights. GGUF stores `a` as -exp(A_log).
 struct Ssm {
     qkv: Weight,
     gate: Weight,
@@ -380,6 +398,106 @@ struct Ssm {
     alpha: Weight,
     beta: Weight,
     norm: Vec<f32>,
+}
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+struct SsmState {
+    conv: Vec<f32>,
+    matrix: Vec<f32>,
+    mixed: Vec<f32>,
+}
+
+impl SsmState {
+    fn new(c: SsmConfig) -> Self {
+        let width = 2 * c.group_count * c.state_size + c.inner_size;
+        Self {
+            conv: vec![0.0; width * (c.conv_kernel - 1)],
+            matrix: vec![0.0; c.time_step_rank * c.state_size * c.state_size],
+            mixed: vec![0.0; width],
+        }
+    }
+    fn reset(&mut self) {
+        self.conv.fill(0.0);
+        self.matrix.fill(0.0);
+    }
+
+    // Reference: llama.cpp src/models/qwen35.cpp and gated_delta_net.
+    #[allow(clippy::too_many_arguments)]
+    fn step(
+        &mut self,
+        c: SsmConfig,
+        w: &Ssm,
+        eps: f32,
+        x: &[f32],
+        z: &[f32],
+        alpha: &[f32],
+        beta: &[f32],
+        out: &mut [f32],
+    ) {
+        let taps = c.conv_kernel;
+        let hd = c.state_size;
+        let kd = c.group_count * hd;
+        for (ch, &current) in x.iter().enumerate() {
+            let history = &mut self.conv[ch * (taps - 1)..(ch + 1) * (taps - 1)];
+            let kernel = &w.conv1d[ch * taps..(ch + 1) * taps];
+            let mut value = current * kernel[taps - 1];
+            for j in 0..taps - 1 {
+                value += history[j] * kernel[j];
+            }
+            if taps > 1 {
+                history.rotate_left(1);
+                history[taps - 2] = current;
+            }
+            self.mixed[ch] = value * sigmoid(value);
+        }
+        for head in self.mixed[..2 * kd].chunks_exact_mut(hd) {
+            let inv = 1.0 / (head.iter().map(|v| v * v).sum::<f32>() + eps).sqrt();
+            for v in head {
+                *v *= inv;
+            }
+        }
+        assert_eq!(self.matrix.len(), c.time_step_rank * hd * hd);
+        assert_eq!(out.len(), c.time_step_rank * hd);
+        let matrix = OutPtr(self.matrix.as_mut_ptr());
+        let output = OutPtr(out.as_mut_ptr());
+        let mixed = &self.mixed;
+        crate::pool::global().for_each(c.time_step_rank, |h| {
+            // GGUF reorders V heads for tiled Q/K broadcasting.
+            let kh = h % c.group_count;
+            let q = &mixed[kh * hd..(kh + 1) * hd];
+            let k = &mixed[kd + kh * hd..kd + (kh + 1) * hd];
+            let v = &mixed[2 * kd + h * hd..2 * kd + (h + 1) * hd];
+            let a = alpha[h] + w.dt_bias[h];
+            let softplus = a.max(0.0) + (-a.abs()).exp().ln_1p();
+            let decay = (w.a[h] * softplus).exp();
+            let b = sigmoid(beta[h]);
+            // SAFETY: task h exclusively owns matrix head h and output
+            // head h; the pool joins all tasks before these buffers are reused.
+            let state = unsafe { std::slice::from_raw_parts_mut(matrix.at(h * hd * hd), hd * hd) };
+            let o = unsafe { std::slice::from_raw_parts_mut(output.at(h * hd), hd) };
+            for j in 0..hd {
+                let row = &mut state[j * hd..(j + 1) * hd];
+                for s in row.iter_mut() {
+                    *s *= decay;
+                }
+                let delta = b * (v[j] - row.iter().zip(k).map(|(s, k)| s * k).sum::<f32>());
+                let mut value = 0.0;
+                for t in 0..hd {
+                    row[t] += k[t] * delta;
+                    value += row[t] * q[t];
+                }
+                o[j] = value / (hd as f32).sqrt();
+            }
+            rms_norm_in_place(o, &w.norm, eps);
+            for j in 0..hd {
+                let gate = z[h * hd + j];
+                o[j] *= gate * sigmoid(gate);
+            }
+        });
+    }
 }
 
 /// One layer's feed-forward block.
@@ -643,14 +761,15 @@ impl Model {
                     Some(ssm) => Mixer::Ssm(Ssm {
                         qkv: loader.matrix(
                             &name("attn_qkv.weight"),
-                            ssm.inner_size * 2,
+                            2 * ssm.group_count * ssm.state_size + ssm.inner_size,
                             c.n_embd,
                         )?,
                         gate: loader.matrix(&name("attn_gate.weight"), ssm.inner_size, c.n_embd)?,
                         out: loader.matrix(&name("ssm_out.weight"), c.n_embd, ssm.inner_size)?,
                         conv1d: loader.vector(
                             &name("ssm_conv1d.weight"),
-                            ssm.conv_kernel * ssm.inner_size * 2,
+                            ssm.conv_kernel
+                                * (2 * ssm.group_count * ssm.state_size + ssm.inner_size),
                         )?,
                         a: loader.vector(&name("ssm_a"), ssm.time_step_rank)?,
                         dt_bias: loader.vector(&name("ssm_dt.bias"), ssm.time_step_rank)?,
@@ -1101,6 +1220,16 @@ pub struct Session<'m> {
     rope: Vec<(f32, f32)>,
     logits: Vec<f32>,
     all_logits: Vec<f32>,
+    ssm_states: Vec<Option<SsmState>>,
+    history: Vec<u32>,
+    replay: bool,
+    q_full: Vec<f32>,
+    attn_gate: Vec<f32>,
+    ssm_qkv: Vec<f32>,
+    ssm_z: Vec<f32>,
+    ssm_alpha: Vec<f32>,
+    ssm_beta: Vec<f32>,
+    ssm_out: Vec<f32>,
     pub profiler: Profiler,
     #[cfg(feature = "cuda")]
     gpu: Option<gpu::GpuState>,
@@ -1143,6 +1272,23 @@ impl<'m> Session<'m> {
             rope: vec![(0.0, 0.0); b * c.rope_dim / 2],
             logits: vec![0.0; b * c.n_vocab],
             all_logits: Vec::new(),
+            ssm_states: model
+                .layers
+                .iter()
+                .map(|l| match l.mixer {
+                    Mixer::Ssm(_) => Some(SsmState::new(c.ssm.unwrap())),
+                    _ => None,
+                })
+                .collect(),
+            history: Vec::new(),
+            replay: false,
+            q_full: vec![0.0; if c.attn_gated { b * 2 * c.q_dim() } else { 0 }],
+            attn_gate: vec![0.0; if c.attn_gated { b * c.q_dim() } else { 0 }],
+            ssm_qkv: vec![0.0; b * c.ssm.map_or(0, |sc| sc.conv_width())],
+            ssm_z: vec![0.0; b * c.ssm.map_or(0, |sc| sc.inner_size)],
+            ssm_alpha: vec![0.0; b * c.ssm.map_or(0, |sc| sc.time_step_rank)],
+            ssm_beta: vec![0.0; b * c.ssm.map_or(0, |sc| sc.time_step_rank)],
+            ssm_out: vec![0.0; b * c.ssm.map_or(0, |sc| sc.inner_size)],
             profiler: Profiler {
                 enabled: false,
                 last: Instant::now(),
@@ -1179,7 +1325,20 @@ impl<'m> Session<'m> {
             + self.up.len()
             + self.scores.len()
             + self.logits.len()
-            + self.rope.len() * 2;
+            + self.rope.len() * 2
+            + self.q_full.len()
+            + self.attn_gate.len()
+            + self.ssm_qkv.len()
+            + self.ssm_z.len()
+            + self.ssm_alpha.len()
+            + self.ssm_beta.len()
+            + self.ssm_out.len()
+            + self
+                .ssm_states
+                .iter()
+                .flatten()
+                .map(|s| s.conv.len() + s.matrix.len() + s.mixed.len())
+                .sum::<usize>();
         (self.k_cache.len() + self.v_cache.len()) as u64 * 2 + f32s as u64 * 4
     }
 
@@ -1198,12 +1357,32 @@ impl<'m> Session<'m> {
                 + c.n_head as u64 * context
                 + c.rope_dim as u64
                 + c.n_vocab as u64);
-        (kv, f32s * 4)
+        let gated = if c.attn_gated {
+            b * 3 * c.q_dim() as u64
+        } else {
+            0
+        };
+        let ssm = c.ssm.map_or(0, |sc| {
+            let layers = c.n_layer - c.n_layer / sc.interval;
+            layers as u64 * sc.state_floats() as u64
+                + b * (sc.conv_width() + 2 * sc.inner_size + 2 * sc.time_step_rank) as u64
+        });
+        (kv, (f32s + gated + ssm) * 4)
     }
 
     /// Discard positions `>= pos` so generation can resume from `pos`.
+    /// Recurrent models rebuild a retained prefix on the next forward pass;
+    /// resetting to zero clears the convolution and DeltaNet state immediately.
     pub fn truncate(&mut self, pos: usize) {
-        self.pos = self.pos.min(pos);
+        let next = self.pos.min(pos);
+        if next < self.pos && self.model.config.ssm.is_some() {
+            self.history.truncate(next);
+            for state in self.ssm_states.iter_mut().flatten() {
+                state.reset();
+            }
+            self.replay = next != 0;
+        }
+        self.pos = next;
     }
 
     /// Feed `tokens`, returning logits for the last one (or for every token
@@ -1221,6 +1400,13 @@ impl<'m> Session<'m> {
                 context: self.context,
             });
         }
+        if self.replay {
+            let prefix = self.history.clone();
+            self.pos = 0;
+            self.history.clear();
+            self.replay = false;
+            self.forward(&prefix, Logits::Last)?;
+        }
         let chunk_count = tokens.len().div_ceil(self.max_batch);
         if want == Logits::All {
             self.all_logits.clear();
@@ -1233,6 +1419,9 @@ impl<'m> Session<'m> {
                 Logits::Last => Rows::None,
             };
             self.forward_batch(chunk, rows)?;
+            if self.model.config.ssm.is_some() {
+                self.history.extend_from_slice(chunk);
+            }
             if want == Logits::All {
                 self.all_logits
                     .extend_from_slice(&self.logits[..chunk.len() * n_vocab]);
@@ -1319,164 +1508,222 @@ impl<'m> Session<'m> {
                 rms_norm_in_place(xn, &layer.attn_norm, c.rms_eps);
             }
             self.profiler.lap(0);
-            // Linear attention is not implemented yet; see docs/QWEN35.md.
-            // The weights load and `inspect` reports the shape, so the file
-            // can be checked before any of the arithmetic exists.
-            let weights = match &layer.mixer {
-                Mixer::Attention(a) => a,
-                Mixer::Ssm(_) => {
-                    return Err(ModelError::Unsupported(
-                        "linear-attention (SSM) layers: the weights load but the \
-                         recurrence is not implemented yet"
-                            .into(),
-                    ));
+            if let Mixer::Ssm(weights) = &layer.mixer {
+                let sc = c.ssm.unwrap();
+                let width = weights.qkv.rows;
+                let qkv = &mut self.ssm_qkv[..n * width];
+                let z = &mut self.ssm_z[..n * sc.inner_size];
+                let alpha = &mut self.ssm_alpha[..n * sc.time_step_rank];
+                let beta = &mut self.ssm_beta[..n * sc.time_step_rank];
+                be.matmul_many(
+                    &mut [
+                        Job {
+                            matrix: model.matrix(weights.qkv),
+                            output: qkv,
+                        },
+                        Job {
+                            matrix: model.matrix(weights.gate),
+                            output: z,
+                        },
+                        Job {
+                            matrix: model.matrix(weights.alpha),
+                            output: alpha,
+                        },
+                        Job {
+                            matrix: model.matrix(weights.beta),
+                            output: beta,
+                        },
+                    ],
+                    &self.xn[..n * d],
+                    n,
+                )?;
+                self.profiler.lap(1);
+                let out = &mut self.ssm_out[..n * sc.inner_size];
+                let state = self.ssm_states[li].as_mut().unwrap();
+                for i in 0..n {
+                    state.step(
+                        sc,
+                        weights,
+                        c.rms_eps,
+                        &qkv[i * width..(i + 1) * width],
+                        &z[i * sc.inner_size..(i + 1) * sc.inner_size],
+                        &alpha[i * sc.time_step_rank..(i + 1) * sc.time_step_rank],
+                        &beta[i * sc.time_step_rank..(i + 1) * sc.time_step_rank],
+                        &mut out[i * sc.inner_size..(i + 1) * sc.inner_size],
+                    );
                 }
-            };
-            be.matmul_many(
-                &mut [
-                    Job {
-                        matrix: model.matrix(weights.wq),
-                        output: &mut self.q[..n * qd],
-                    },
-                    Job {
-                        matrix: model.matrix(weights.wk),
-                        output: &mut self.k[..n * kvd],
-                    },
-                    Job {
-                        matrix: model.matrix(weights.wv),
-                        output: &mut self.v[..n * kvd],
-                    },
-                ],
-                &self.xn[..n * d],
-                n,
-            )?;
-            self.profiler.lap(1);
-            for i in 0..n {
-                let q = &mut self.q[i * qd..(i + 1) * qd];
-                let k = &mut self.k[i * kvd..(i + 1) * kvd];
-                let v = &mut self.v[i * kvd..(i + 1) * kvd];
-                add_bias(q, weights.bq.as_deref());
-                add_bias(k, weights.bk.as_deref());
-                add_bias(v, weights.bv.as_deref());
-                if let Some(w) = &weights.q_norm {
+                self.profiler.lap(3);
+                be.matmul(model.matrix(weights.out), out, &mut self.proj[..n * d], n)?;
+            } else {
+                let Mixer::Attention(weights) = &layer.mixer else {
+                    unreachable!()
+                };
+                be.matmul_many(
+                    &mut [
+                        Job {
+                            matrix: model.matrix(weights.wq),
+                            output: if c.attn_gated {
+                                &mut self.q_full[..n * 2 * qd]
+                            } else {
+                                &mut self.q[..n * qd]
+                            },
+                        },
+                        Job {
+                            matrix: model.matrix(weights.wk),
+                            output: &mut self.k[..n * kvd],
+                        },
+                        Job {
+                            matrix: model.matrix(weights.wv),
+                            output: &mut self.v[..n * kvd],
+                        },
+                    ],
+                    &self.xn[..n * d],
+                    n,
+                )?;
+                if c.attn_gated {
+                    for i in 0..n {
+                        for h in 0..c.n_head {
+                            let src = i * 2 * qd + h * 2 * hd;
+                            let dst = i * qd + h * hd;
+                            self.q[dst..dst + hd].copy_from_slice(&self.q_full[src..src + hd]);
+                            self.attn_gate[dst..dst + hd]
+                                .copy_from_slice(&self.q_full[src + hd..src + 2 * hd]);
+                        }
+                    }
+                }
+                self.profiler.lap(1);
+                for i in 0..n {
+                    let q = &mut self.q[i * qd..(i + 1) * qd];
+                    let k = &mut self.k[i * kvd..(i + 1) * kvd];
+                    let v = &mut self.v[i * kvd..(i + 1) * kvd];
+                    add_bias(q, weights.bq.as_deref());
+                    add_bias(k, weights.bk.as_deref());
+                    add_bias(v, weights.bv.as_deref());
+                    if let Some(w) = &weights.q_norm {
+                        q.chunks_exact_mut(hd)
+                            .for_each(|h| rms_norm_in_place(h, w, c.rms_eps));
+                    }
+                    if let Some(w) = &weights.k_norm {
+                        k.chunks_exact_mut(hd)
+                            .for_each(|h| rms_norm_in_place(h, w, c.rms_eps));
+                    }
+                    let table = &self.rope[i * half_rope..(i + 1) * half_rope];
                     q.chunks_exact_mut(hd)
-                        .for_each(|h| rms_norm_in_place(h, w, c.rms_eps));
-                }
-                if let Some(w) = &weights.k_norm {
+                        .for_each(|h| rope(h, table, c.rope_style));
                     k.chunks_exact_mut(hd)
-                        .for_each(|h| rms_norm_in_place(h, w, c.rms_eps));
+                        .for_each(|h| rope(h, table, c.rope_style));
+                    let at = li * layer_stride + (start + i) * kvd;
+                    kernels::store_f16(k, &mut self.k_cache[at..at + kvd]);
+                    kernels::store_f16(v, &mut self.v_cache[at..at + kvd]);
                 }
-                let table = &self.rope[i * half_rope..(i + 1) * half_rope];
-                q.chunks_exact_mut(hd)
-                    .for_each(|h| rope(h, table, c.rope_style));
-                k.chunks_exact_mut(hd)
-                    .for_each(|h| rope(h, table, c.rope_style));
-                let at = li * layer_stride + (start + i) * kvd;
-                kernels::store_f16(k, &mut self.k_cache[at..at + kvd]);
-                kernels::store_f16(v, &mut self.v_cache[at..at + kvd]);
-            }
 
-            self.profiler.lap(2);
-            // Causal attention: token i sees positions 0..=start+i.
-            //
-            // Blocked over query tokens: one task owns a block of query
-            // tokens and one KV head, so each cache row is read once and
-            // reused by every query in the block and every query head in the
-            // group. A row-per-(token, head) loop instead re-reads the whole
-            // cache n_head times per token, which is the dominant cost of
-            // prefill attention. The arithmetic per (token, head) is
-            // unchanged, so results are bit-identical either way.
-            let k_layer = &self.k_cache[li * layer_stride..(li + 1) * layer_stride];
-            let v_layer = &self.v_cache[li * layer_stride..(li + 1) * layer_stride];
-            let q_all = &self.q[..n * qd];
-            let context = self.context;
-            let attn = OutPtr(self.attn.as_mut_ptr());
-            let scores_base = OutPtr(self.scores.as_mut_ptr());
-            let blocks = n.div_ceil(query_block);
-            crate::pool::global().for_each(blocks * c.n_head_kv, |task| {
-                let (block, kv_head) = (task / c.n_head_kv, task % c.n_head_kv);
-                let i0 = block * query_block;
-                let i1 = (i0 + query_block).min(n);
-                let kv_off = kv_head * hd;
-                let heads = kv_head * group..(kv_head + 1) * group;
-                // SAFETY: this task owns attn[(i * n_head + h) * hd ..] and
-                // scores[(i * n_head + h) * context ..] for its own query
-                // tokens i and query heads h, which no other task touches.
-                let out = |i: usize, h: usize| unsafe {
-                    std::slice::from_raw_parts_mut(attn.at(i * qd + h * hd), hd)
-                };
-                let row = |i: usize, h: usize| unsafe {
-                    std::slice::from_raw_parts_mut(
-                        scores_base.at((i * c.n_head + h) * context),
-                        context,
-                    )
-                };
-                // Scores: read each key once and dot it against the queries
-                // that attend to it, a tile at a time so one widened key
-                // serves several queries and each has its own accumulators.
-                const Q_TILE: usize = 4;
-                for t in 0..start + i1 {
-                    let key = &k_layer[t * kvd + kv_off..t * kvd + kv_off + hd];
-                    // Query token i attends to position t only once
-                    // t <= start + i, so the earliest query that sees t is
-                    // t - start.
-                    let first = i0.max(t.saturating_sub(start));
-                    let pairs = (i1 - first) * group;
-                    // Pair p is query token first + p / group, query head
-                    // kv_head * group + p % group.
-                    let pair = |p: usize| (first + p / group, kv_head * group + p % group);
-                    let query = |p: usize| {
-                        let (i, h) = pair(p);
-                        &q_all[i * qd + h * hd..i * qd + (h + 1) * hd]
+                self.profiler.lap(2);
+                // Causal attention: token i sees positions 0..=start+i.
+                //
+                // Blocked over query tokens: one task owns a block of query
+                // tokens and one KV head, so each cache row is read once and
+                // reused by every query in the block and every query head in the
+                // group. A row-per-(token, head) loop instead re-reads the whole
+                // cache n_head times per token, which is the dominant cost of
+                // prefill attention. The arithmetic per (token, head) is
+                // unchanged, so results are bit-identical either way.
+                let k_layer = &self.k_cache[li * layer_stride..(li + 1) * layer_stride];
+                let v_layer = &self.v_cache[li * layer_stride..(li + 1) * layer_stride];
+                let q_all = &self.q[..n * qd];
+                let context = self.context;
+                let attn = OutPtr(self.attn.as_mut_ptr());
+                let scores_base = OutPtr(self.scores.as_mut_ptr());
+                let blocks = n.div_ceil(query_block);
+                crate::pool::global().for_each(blocks * c.n_head_kv, |task| {
+                    let (block, kv_head) = (task / c.n_head_kv, task % c.n_head_kv);
+                    let i0 = block * query_block;
+                    let i1 = (i0 + query_block).min(n);
+                    let kv_off = kv_head * hd;
+                    let heads = kv_head * group..(kv_head + 1) * group;
+                    // SAFETY: this task owns attn[(i * n_head + h) * hd ..] and
+                    // scores[(i * n_head + h) * context ..] for its own query
+                    // tokens i and query heads h, which no other task touches.
+                    let out = |i: usize, h: usize| unsafe {
+                        std::slice::from_raw_parts_mut(attn.at(i * qd + h * hd), hd)
                     };
-                    let mut p = 0;
-                    while p + Q_TILE <= pairs {
-                        let got = kernels::dot_f16_f32_many(
-                            key,
-                            std::array::from_fn::<_, Q_TILE, _>(|o| query(p + o)),
-                        );
-                        for (o, value) in got.iter().enumerate() {
-                            let (i, h) = pair(p + o);
-                            row(i, h)[t] = value * scale;
+                    let row = |i: usize, h: usize| unsafe {
+                        std::slice::from_raw_parts_mut(
+                            scores_base.at((i * c.n_head + h) * context),
+                            context,
+                        )
+                    };
+                    // Scores: read each key once and dot it against the queries
+                    // that attend to it, a tile at a time so one widened key
+                    // serves several queries and each has its own accumulators.
+                    const Q_TILE: usize = 4;
+                    for t in 0..start + i1 {
+                        let key = &k_layer[t * kvd + kv_off..t * kvd + kv_off + hd];
+                        // Query token i attends to position t only once
+                        // t <= start + i, so the earliest query that sees t is
+                        // t - start.
+                        let first = i0.max(t.saturating_sub(start));
+                        let pairs = (i1 - first) * group;
+                        // Pair p is query token first + p / group, query head
+                        // kv_head * group + p % group.
+                        let pair = |p: usize| (first + p / group, kv_head * group + p % group);
+                        let query = |p: usize| {
+                            let (i, h) = pair(p);
+                            &q_all[i * qd + h * hd..i * qd + (h + 1) * hd]
+                        };
+                        let mut p = 0;
+                        while p + Q_TILE <= pairs {
+                            let got = kernels::dot_f16_f32_many(
+                                key,
+                                std::array::from_fn::<_, Q_TILE, _>(|o| query(p + o)),
+                            );
+                            for (o, value) in got.iter().enumerate() {
+                                let (i, h) = pair(p + o);
+                                row(i, h)[t] = value * scale;
+                            }
+                            p += Q_TILE;
                         }
-                        p += Q_TILE;
-                    }
-                    while p < pairs {
-                        let (i, h) = pair(p);
-                        row(i, h)[t] = kernels::dot_f16_f32_many(key, [query(p)])[0] * scale;
-                        p += 1;
-                    }
-                }
-                // Softmax each (token, head) row over the positions it sees.
-                for i in i0..i1 {
-                    for h in heads.clone() {
-                        let scores = &mut row(i, h)[..start + i + 1];
-                        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                        let inv = 1.0 / kernels::exp_shifted_sum(scores, max);
-                        for s in scores.iter_mut() {
-                            *s *= inv;
+                        while p < pairs {
+                            let (i, h) = pair(p);
+                            row(i, h)[t] = kernels::dot_f16_f32_many(key, [query(p)])[0] * scale;
+                            p += 1;
                         }
-                        out(i, h).fill(0.0);
                     }
-                }
-                // Values: read each value row once and accumulate it into
-                // every output that weights it.
-                for t in 0..start + i1 {
-                    let value = &v_layer[t * kvd + kv_off..t * kvd + kv_off + hd];
-                    for i in i0.max(t.saturating_sub(start))..i1 {
+                    // Softmax each (token, head) row over the positions it sees.
+                    for i in i0..i1 {
                         for h in heads.clone() {
-                            kernels::axpy_f16(out(i, h), row(i, h)[t], value);
+                            let scores = &mut row(i, h)[..start + i + 1];
+                            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                            let inv = 1.0 / kernels::exp_shifted_sum(scores, max);
+                            for s in scores.iter_mut() {
+                                *s *= inv;
+                            }
+                            out(i, h).fill(0.0);
                         }
                     }
+                    // Values: read each value row once and accumulate it into
+                    // every output that weights it.
+                    for t in 0..start + i1 {
+                        let value = &v_layer[t * kvd + kv_off..t * kvd + kv_off + hd];
+                        for i in i0.max(t.saturating_sub(start))..i1 {
+                            for h in heads.clone() {
+                                kernels::axpy_f16(out(i, h), row(i, h)[t], value);
+                            }
+                        }
+                    }
+                });
+                if c.attn_gated {
+                    for (a, g) in self.attn[..n * qd].iter_mut().zip(&self.attn_gate) {
+                        *a *= sigmoid(*g);
+                    }
                 }
-            });
-            self.profiler.lap(3);
-            be.matmul(
-                model.matrix(weights.wo),
-                &self.attn[..n * qd],
-                &mut self.proj[..n * d],
-                n,
-            )?;
+                self.profiler.lap(3);
+                be.matmul(
+                    model.matrix(weights.wo),
+                    &self.attn[..n * qd],
+                    &mut self.proj[..n * d],
+                    n,
+                )?;
+            }
             self.profiler.lap(4);
             add_assign(&mut self.x[..n * d], &self.proj[..n * d]);
 
@@ -1976,6 +2223,84 @@ fn rope(head: &mut [f32], table: &[(f32, f32)], style: RopeStyle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::excessive_precision)]
+    fn deltanet_two_steps_match_matrix_reference() {
+        // Independent float64 matrix calculation of decay, delta update,
+        // q/sqrt(d) readout and gated RMSNorm. Two K heads and four V heads
+        // distinguish GGUF's tiled head layout from repeat_interleave.
+        let c = SsmConfig {
+            conv_kernel: 2,
+            state_size: 2,
+            group_count: 2,
+            time_step_rank: 4,
+            inner_size: 8,
+            interval: 4,
+        };
+        let unused = Weight {
+            kind: GgmlType::F32,
+            rows: 0,
+            cols: 0,
+            offset: 0,
+            len: 0,
+            packed: None,
+        };
+        let w = Ssm {
+            qkv: unused,
+            gate: unused,
+            out: unused,
+            alpha: unused,
+            beta: unused,
+            conv1d: [0.25, 0.75].repeat(16),
+            a: vec![-0.2, -0.4, -0.6, -0.8],
+            dt_bias: vec![0.1, -0.1, 0.2, -0.2],
+            norm: vec![0.7, 1.3],
+        };
+        let inputs: [Vec<f32>; 2] = [
+            (0..16).map(|i| 0.1 * (i as f32 - 5.0)).collect(),
+            (0..16).map(|i| 0.07 * (8.0 - i as f32)).collect(),
+        ];
+        let expected = [
+            [
+                -0.13402966,
+                0.35352146,
+                -0.34338953,
+                0.18236619,
+                0.07055382,
+                0.54209078,
+                0.10481338,
+                -0.88364250,
+            ],
+            [
+                0.058649996,
+                -0.39217433,
+                0.37416972,
+                -0.16981628,
+                -0.06435756,
+                -0.56974379,
+                -0.10716131,
+                0.86273280,
+            ],
+        ];
+        let mut state = SsmState::new(c);
+        for (input, expected) in inputs.iter().zip(expected) {
+            let mut out = [0.0; 8];
+            state.step(
+                c,
+                &w,
+                1e-5,
+                input,
+                &[-0.7, 0.4, 0.8, -0.3, 0.2, 0.6, -0.4, 0.9],
+                &[0.3, -0.5, 0.7, -0.2],
+                &[-0.8, 0.2, 0.6, -0.4],
+                &mut out,
+            );
+            for (got, expected) in out.iter().zip(expected) {
+                assert!((got - expected).abs() < 2e-6, "{got} vs {expected}");
+            }
+        }
+    }
 
     fn moe(n_expert: usize, n_expert_used: usize) -> Moe {
         Moe {

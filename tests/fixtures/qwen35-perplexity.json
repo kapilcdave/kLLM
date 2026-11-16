@@ -1,0 +1,9 @@
+{
+  "model": "Qwen3.5-4B-Q4_K_M.gguf",
+  "reference": "llama.cpp b12099, CPU, -t 8 -ngl 0, default flash attention",
+  "command": "llama-perplexity -m Qwen3.5-4B-Q4_K_M.gguf -f tests/fixtures/wiki.test.head.txt -c 256 --chunks 4 -t 8 -ngl 0",
+  "context": 256,
+  "chunks": 4,
+  "ppl": 12.8886,
+  "tolerance": 0.01
+}

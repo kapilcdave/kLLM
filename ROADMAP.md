@@ -93,17 +93,12 @@ and execute Llama-family models without exceeding a configured budget.
    6.2-against-11 into a meaningless 6.2-against-1.5. Warm each separately
    to its plateau instead. Interleaving is still right when both arms read
    the *same* file.
-4. **Qwen3.5 (`qwen35`)**, scoped in [docs/QWEN35.md](docs/QWEN35.md). It is
-   a layer-level hybrid: `full_attention_interval = 4`, so three of every
-   four blocks are a gated-DeltaNet SSM and every fourth is ordinary
-   attention. The attention blocks are nearly free (they are `qwen3`), and
-   M-RoPE collapses to plain RoPE for text-only input because all three
-   position axes carry the same index -- so the work is the SSM: a causal
-   four-tap depthwise conv needing a ring buffer, and a recurrence over a
-   16x128 state, neither of which the KV cache covers. Worth doing because
-   Qwen3.5-4B and 9B are already here as Q4_K_M and small enough to hold in
-   RAM, so they would be fast rather than merely possible. Qwen3.5-35B-A3B
-   additionally needs IQ2_XXS, which is where all of its bytes are.
+4. **Qwen3.5 (`qwen35`)**: dense CPU text inference is implemented and
+   validated on the local 4B Q4_K_M, with a 9B chat smoke test. This includes
+   causal convolution, a `32 × 128 × 128` recurrent matrix state per SSM
+   layer, gated attention and text RoPE. See [docs/QWEN35.md](docs/QWEN35.md)
+   for equations and the llama.cpp comparison. The remaining 35B-A3B blocker
+   is IQ2_XXS expert weights; GPU hybrid-layer execution also remains open.
 
 5. **More architectures**: Gemma, Phi-3.
 6. `serve`: an OpenAI-compatible local HTTP endpoint (spec milestone 8).
