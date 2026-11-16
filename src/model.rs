@@ -524,7 +524,16 @@ impl Model {
                 q_norm: loader.optional_vector(&name("attn_q_norm.weight"), c.head_dim)?,
                 k_norm: loader.optional_vector(&name("attn_k_norm.weight"), c.head_dim)?,
                 ffn_norm: loader.vector(&name("ffn_norm.weight"), c.n_embd)?,
-                ffn: match c.moe {
+                // Routed or dense per layer, by which tensors are present:
+                // several MoE architectures keep the first blocks dense, and
+                // a whole-model switch would fail to load them.
+                ffn: match c.moe.filter(|_| {
+                    loader
+                        .file
+                        .info
+                        .tensor(&name("ffn_gate_exps.weight"))
+                        .is_some()
+                }) {
                     None => Ffn::Dense {
                         gate: loader.matrix(&name("ffn_gate.weight"), c.n_ff, c.n_embd)?,
                         up: loader.matrix(&name("ffn_up.weight"), c.n_ff, c.n_embd)?,

@@ -109,6 +109,22 @@ Qwen3-30B-A3B at the current default batch of 64, that is `64 x 8 / 128 = 4`
 gives 32 per expert), which interacts with the planner's scratch budget. The
 batch default should become architecture-aware.
 
+And one correction to the obvious reading of "token sorting saves traffic".
+It does not change *which* experts a batch reads — across 256 tokens picking
+8 of 128, essentially all 128 get touched — only *how many times* each is
+read. Naive, a 256-token chunk makes `256 x 8 = 2048` expert visits per layer
+against ~128 distinct ones: 16x redundant. Sorted, it makes 128.
+
+Whether that redundancy costs anything depends on a number worth having to
+hand for Qwen3-30B-A3B at Q4_K: an expert is `3 x 768 x 2048` parameters,
+about 2.6 MiB, so one layer's 128 experts are ~337 MiB and the whole model is
+~16 GiB of experts. A single layer's expert set therefore fits in RAM *even
+when the model does not*, which means the 16x redundancy lands on the page
+cache rather than the disk, and sorting mainly buys back dispatch and compute
+rather than bandwidth. That is a much weaker reason to do it than it first
+appears, and it should be measured before being built — the same discipline
+this note asks for everywhere else.
+
 ## The decisive unknown: expert locality
 
 Everything above is ordinary work. The thing that decides whether the
