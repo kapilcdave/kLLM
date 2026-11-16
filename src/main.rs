@@ -10,7 +10,7 @@ use kllm::kernels;
 use kllm::model::{Config, Logits, Model, Session};
 use kllm::planner::{ModelPlanInput, PlanInput, bytes_from_gib, gib, plan, plan_model};
 use kllm::sampler::{Sampler, SamplerConfig};
-use kllm::tokenizer::{Tokenizer, format_chat};
+use kllm::tokenizer::{Tokenizer, format_chat_with};
 
 const DEFAULT_WORKSPACE_GIB: f64 = 0.25;
 const DEFAULT_SAFETY_GIB: f64 = 0.25;
@@ -37,7 +37,8 @@ usage:
   kllm plan --model-gib N --layers N --vram-gib N --context N --kv-bytes-per-token N
   kllm run MODEL.gguf --prompt TEXT [-n N] [--chat] [--system TEXT] [--context N]
            [--temp T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R]
-           [--seed S] [--threads N] [--batch N] [--ignore-eos] [--gpu-layers N|auto]
+           [--seed S] [--threads N] [--batch N] [--ignore-eos] [--no-think]
+           [--gpu-layers N|auto]
            [--ram-gib N|auto|all]
   kllm perplexity MODEL.gguf --file TEXT [--context 512] [--chunks N] [--threads N] [--gpu-layers N|auto]
   kllm compare REFERENCE.gguf TEST.gguf --file TEXT [--context 512] [--chunks N] [--threads N]
@@ -684,7 +685,8 @@ fn cmd_run(args: &Args) -> Result<(), String> {
     let tokenizer = Tokenizer::from_gguf(&info).map_err(|e| e.to_string())?;
     let text = if args.has("--chat") {
         let system = args.value(&["--system"])?;
-        format_chat(&info, system, &prompt).ok_or("model has no recognisable chat template")?
+        format_chat_with(&info, system, &prompt, !args.has("--no-think"))
+            .ok_or("model has no recognisable chat template")?
     } else {
         prompt
     };

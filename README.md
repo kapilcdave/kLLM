@@ -89,6 +89,39 @@ Streaming is bounded by the disk: 3.98 GB streamed per token at 1.4 GB/s is
 kernel can often free enough other cache to hold the whole model, and
 `--ram-gib all` is then faster.
 
+## A 30B model on a 16 GiB laptop
+
+A dense 30B needs all of itself for every token, so on a machine this size it
+is hopeless. A mixture of experts needs a routed fraction -- 8 of 128 experts
+for Qwen3-30B-A3B, about 6% of the expert weights -- and *which* fraction
+repeats enough for the page cache to absorb it. That is the whole reason this
+works:
+
+```sh
+kllm run Qwen3-30B-A3B-Q4_K_M.gguf --chat --prompt "..." -n 400 --context 4096
+```
+
+17.3 GiB of weights, 16 GiB of RAM, **10-11 tok/s** against llama.cpp's 1.81
+on the same file and machine. Three things matter in practice:
+
+- **Let the cache warm.** The first run of a model reads experts from disk and
+  lands at 4-7 tok/s; by the second or third it is at 10-11. Switching
+  between two 18 GiB models resets that, so expect a slow first answer.
+- **Leave the budget alone.** `--ram-gib` defaults to something sensible, and
+  for a routed model it only governs the non-expert weights (about 1 GiB);
+  everything else is better spent on page cache for the experts. Forcing it
+  smaller makes kLLM stream blocks it had no need to and costs 6x.
+- **Prompt length picks the batch.** A long prompt gets a wide batch, which
+  is what makes routed prefill fast; a short one gets a narrow batch so the
+  session does not spend 155 MiB of logits scratch it will not use.
+
+For a reasoning model such as the base Qwen3-30B-A3B, pass `--no-think`.
+Otherwise it answers by thinking first, and at ten tokens a second a 100-token
+budget is spent before it has said anything. Its own chat template suppresses
+reasoning by pre-filling an empty `<think></think>`, and that is what the flag
+does. Instruct builds that do not reason (Qwen3's `-2507-Instruct`, for one)
+need nothing.
+
 ## Correctness
 
 The test-suite compares kLLM with llama.cpp (build 12099) on recorded

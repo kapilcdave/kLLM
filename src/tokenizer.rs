@@ -678,6 +678,24 @@ impl Ord for SpmPair {
 /// model's chat template. Jinja is not evaluated; the template is only
 /// sniffed for its family.
 pub fn format_chat(info: &GgufInfo, system: Option<&str>, user: &str) -> Option<String> {
+    format_chat_with(info, system, user, true)
+}
+
+/// As [`format_chat`], but able to turn off a reasoning model's thinking.
+///
+/// A thinking model answers by emitting `<think>...</think>` first, which on
+/// a slow machine can spend a whole generation budget before saying
+/// anything. Its own template suppresses that by pre-filling an already
+/// closed, empty think block at the start of the assistant turn, so that is
+/// what this does -- and only for templates that mention `<think>` at all,
+/// since pre-filling it for a model that does not reason would just be a
+/// stray token.
+pub fn format_chat_with(
+    info: &GgufInfo,
+    system: Option<&str>,
+    user: &str,
+    think: bool,
+) -> Option<String> {
     let template = info.get("tokenizer.chat_template")?.as_str()?;
     let mut out = String::new();
     if template.contains("<|im_start|>") {
@@ -707,6 +725,9 @@ pub fn format_chat(info: &GgufInfo, system: Option<&str>, user: &str) -> Option<
         out += &format!("[INST] {body} [/INST]");
     } else {
         return None;
+    }
+    if !think && template.contains("<think>") {
+        out += "<think>\n\n</think>\n\n";
     }
     Some(out)
 }
