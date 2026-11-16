@@ -119,6 +119,16 @@ fn qwen3_q4_k_m() {
     check("Qwen3-0.6B-Q4_K_M.gguf", 0.01);
 }
 
+/// Q3_K, the last common K-quant. SmolLM2 cannot carry it (576-wide rows
+/// are not a multiple of 256, so llama.cpp falls back to legacy types), so
+/// this one is Qwen3-0.6B requantized from Q8_0 with `--allow-requantize`.
+/// The doubly-quantized weights make the absolute perplexity meaningless and
+/// the agreement with llama.cpp exactly as meaningful as ever.
+#[test]
+fn qwen3_q3_k_m() {
+    check("Qwen3-0.6B-Q3_K_M.gguf", 0.01);
+}
+
 #[test]
 fn qwen3_q8_0() {
     check("Qwen3-0.6B-Q8_0.gguf", 0.01);

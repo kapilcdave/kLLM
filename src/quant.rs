@@ -119,7 +119,7 @@ impl GgmlType {
 
     /// Whether kLLM can compute with this type (not merely size it).
     pub fn is_supported(self) -> bool {
-        !matches!(self, Self::Q8_1 | Self::Q3K | Self::Q8K)
+        !matches!(self, Self::Q8_1 | Self::Q8K)
     }
 
     /// Bytes needed for one row of `columns` elements.
@@ -255,10 +255,11 @@ pub fn dequantize_block(kind: GgmlType, block: &[u8], out: &mut [f32]) {
             }
         }
         GgmlType::Q2K => dequantize_q2k(block, out),
+        GgmlType::Q3K => dequantize_q3k(block, out),
         GgmlType::Q4K => dequantize_q4k(block, out),
         GgmlType::Q5K => dequantize_q5k(block, out),
         GgmlType::Q6K => dequantize_q6k(block, out),
-        GgmlType::Q8_1 | GgmlType::Q3K | GgmlType::Q8K => {
+        GgmlType::Q8_1 | GgmlType::Q8K => {
             unreachable!("{} is not a supported compute type", kind.name())
         }
     }
@@ -344,6 +345,54 @@ fn dequantize_q5k(block: &[u8], out: &mut [f32]) {
             let hi2 = if qh[l] & u2 != 0 { 16 } else { 0 };
             y[l] = d1 * ((q[l] & 0x0f) + hi1) as f32 - m1;
             y[l + 32] = d2 * ((q[l] >> 4) + hi2) as f32 - m2;
+        }
+    }
+}
+
+/// The sixteen 6-bit scales of a Q3_K block, already biased by -32.
+///
+/// They are stored as twelve bytes: the low four bits of each scale in the
+/// first eight, and the high two bits of all sixteen packed into the last
+/// four.
+pub fn q3k_scales(scales: &[u8]) -> [i8; 16] {
+    let mut out = [0_i8; 16];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let low = if i < 8 {
+            scales[i] & 0x0f
+        } else {
+            scales[i - 8] >> 4
+        };
+        let high = (scales[8 + (i % 4)] >> (2 * (i / 4))) & 0x03;
+        *slot = ((low | (high << 4)) as i8) - 32;
+    }
+    out
+}
+
+fn dequantize_q3k(block: &[u8], out: &mut [f32]) {
+    // Layout: hmask[32], qs[64], scales[12], d.
+    let hmask = &block[0..32];
+    let qs = &block[32..96];
+    let scales = q3k_scales(&block[96..108]);
+    let d_all = half(block, 108);
+    let mut y = 0;
+    let mut is = 0;
+    for n in 0..2 {
+        let q = &qs[n * 32..n * 32 + 32];
+        for j in 0..4 {
+            // The third bit of every quant lives in `hmask`, one bit plane
+            // per (n, j); a clear bit means the value is four lower.
+            let plane = 1_u8 << (j + 4 * n);
+            for half_index in 0..2 {
+                let dl = d_all * scales[is] as f32;
+                is += 1;
+                for l in 0..16 {
+                    let at = half_index * 16 + l;
+                    let low = ((q[at] >> (2 * j)) & 3) as i32;
+                    let high = if hmask[at] & plane != 0 { 0 } else { 4 };
+                    out[y] = dl * (low - high) as f32;
+                    y += 1;
+                }
+            }
         }
     }
 }

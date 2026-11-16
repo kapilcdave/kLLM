@@ -68,7 +68,15 @@ and execute Llama-family models without exceeding a configured budget.
    further (the Q4_0 kernel costs about what F16's does per element, so it
    is ALU-bound here); then fuse the small per-layer kernels (about 15
    launches per block at ~5 µs each).
-3. **Q3_K kernels**, the remaining common K-quant.
+3. **An x8-packed layout for Q3_K.** Q3_K now loads and is correct
+   (Qwen3-0.6B requantized: 44.5528 against llama.cpp's 44.4627 with flash
+   attention off and 44.7784 with it on, so inside its band), but it is slow:
+   32.7 tok/s decode against Q4_K's 55.4 on the same model, and 128 against
+   317 for prefill. Q4_K has an x8 layout and Q3_K does not, so Q3_K takes
+   the row-major path; it also packs 256 values into 110 bytes against
+   Q4_K's 144, so there is more unpacking per byte. Until it is packed, Q3_K
+   is a capability (models that would not otherwise load) rather than the
+   speed win that fewer bytes ought to buy.
 4. **More architectures**: Gemma, Phi-3, and the hybrid Qwen3.5, whose
    linear-attention layers need new kernels.
 5. `serve`: an OpenAI-compatible local HTTP endpoint (spec milestone 8).
