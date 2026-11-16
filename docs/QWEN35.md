@@ -73,7 +73,8 @@ Implement it that way and it is exact for text; the sections only start to
 matter when images are in the prompt, which kLLM does not take.
 
 **3. The SSM block is the real work.** From the tensor inventory it is a
-gated DeltaNet, the Qwen3-Next shape:
+gated DeltaNet, the Qwen3-Next shape. The roles and widths are now pinned
+down (4B numbers):
 
 - `attn_qkv` projects to 8192 = q, k and v for the linear-attention path.
 - `ssm_conv1d` `[4, 8192]` is a causal depthwise convolution, four taps, over
@@ -88,12 +89,78 @@ gated DeltaNet, the Qwen3-Next shape:
   `ssm_out` `[4096, 2560]` projects back, and `attn_gate` `[2560, 4096]`
   supplies a sigmoid gate on the way out.
 
-That is a new `Session` concern (recurrent state and a conv ring buffer,
-neither of which the KV cache covers), a new kernel, and a recurrence whose
-exact form is inferred from tensor names here rather than read from a
-reference. So it should be built against the perplexity harness from the
-first commit: a wrong recurrence does not look subtly off, it explodes, and
-`kllm perplexity` against llama.cpp on the 4B will say so in one run.
+### What the widths say, exactly
+
+The hyper-parameters name the same three numbers three different ways, and
+putting them together fixes the whole layout:
+
+- `ssm.state_size = 128` is the head dimension.
+- `ssm.time_step_rank = 32` is the number of **v** heads, and
+  `32 x 128 = 4096 = ssm.inner_size`.
+- `ssm.group_count = 16` is the number of **q** and **k** heads, so two v
+  heads share each k head.
+
+Which accounts for `attn_qkv`'s 8192 outputs exactly:
+
+| part | heads x dim | width |
+|---|---|---|
+| q | 16 x 128 | 2048 |
+| k | 16 x 128 | 2048 |
+| v | 32 x 128 | 4096 |
+
+and for everything else: `ssm_conv1d [4, 8192]` convolves all three
+depthwise, `ssm_a` and `ssm_dt.bias` are `[32]` because they are per v head,
+`ssm_alpha` and `ssm_beta` are `[n_embd, 32]` because they project the hidden
+state to a scalar per v head, `ssm_norm [128]` normalizes over the head
+dimension, and `ssm_out [4096, n_embd]` projects the 32 heads back.
+
+### What is left is one formula, and it should not be guessed
+
+Everything above is read off shapes and is therefore safe. The recurrence is
+not: it is about five coupled choices, and the plausible-looking options are
+indistinguishable from the file.
+
+- whether q and k are L2-normalized per head before use (gated DeltaNet
+  usually does);
+- whether the convolution is followed by an activation, and which;
+- how the decay is parameterized -- something of the shape
+  `g = exp(-exp(ssm_a) * softplus(alpha . x + dt_bias))`, but the exact
+  nesting matters;
+- the delta rule itself, `S <- S g - beta (S k) k^T + beta v k^T`, and
+  whether beta comes from a sigmoid;
+- where the output gate applies, before or after `ssm_norm`.
+
+Get any one wrong and perplexity explodes rather than drifting, so the
+failure tells you nothing about *which* one. That is the argument for not
+shipping a guess: five binary-ish choices is up to thirty-odd combinations,
+each needing a multi-minute perplexity run to reject, and no signal to
+order the search. It wants the reference implementation open alongside,
+not an evening of bisection.
+
+It also needs a new `Session` concern either way -- a recurrent state of
+`32 x 128 x 128` floats per layer (about 2 MiB, so ~50 MiB over 24 SSM
+layers) and a ring buffer of the last three positions for the convolution,
+neither of which the KV cache covers.
+
+## Status
+
+Steps 1 and 2 below are done. Qwen3.5-4B Q4_K_M loads every tensor at the
+right shape in 3.7 s and stops with an explicit "the recurrence is not
+implemented yet"; the config, the per-block attention/SSM split, the gated
+attention and the norm naming are all in. Two things turned up that the
+first pass of this note had wrong:
+
+- **The attention blocks are gated too.** `attn_q` is *twice* `q_dim` wide
+  (`[2560, 8192]` on the 4B against a `q_dim` of 4096), and the second half
+  is a sigmoid gate on the attention output -- the same gate the SSM blocks
+  keep in a separate `attn_gate` tensor. Detected by shape, not by
+  architecture.
+- **There is no `ffn_norm`.** `post_attention_norm` *is* the norm before the
+  feed-forward block; it is simply named for where it sits relative to the
+  mixer. Nothing else in the file could play that role.
+
+And the 35B's other blocker is confirmed rather than assumed: it stops at
+`blk.0.ffn_gate_exps.weight has type UNKNOWN`, which is IQ2_XXS.
 
 ## Order to build it
 

@@ -66,6 +66,8 @@ pub enum Arch {
     Qwen2,
     Qwen3,
     Qwen3Moe,
+    /// Qwen3.5: three linear-attention blocks to each attention block.
+    Qwen35,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +96,27 @@ pub struct Config {
     pub train_context: usize,
     /// Present when the feed-forward block is a mixture of experts.
     pub moe: Option<Moe>,
+    /// Present when some layers mix positions with a linear-attention
+    /// recurrence instead of softmax attention.
+    pub ssm: Option<SsmConfig>,
+    /// Whether the q projection also emits a sigmoid gate for the attention
+    /// output, doubling its width (Qwen3.5).
+    pub attn_gated: bool,
+}
+
+/// Linear-attention parameters (Qwen3.5's gated DeltaNet).
+#[derive(Debug, Clone, Copy)]
+pub struct SsmConfig {
+    /// Taps of the causal depthwise convolution.
+    pub conv_kernel: usize,
+    /// Width of the recurrent state per group.
+    pub state_size: usize,
+    pub group_count: usize,
+    pub time_step_rank: usize,
+    /// Width of the fused q/k/v projection's output.
+    pub inner_size: usize,
+    /// Every `interval`-th block uses softmax attention instead.
+    pub interval: usize,
 }
 
 /// How the router turns hidden states into expert weights.
@@ -160,9 +183,10 @@ impl Config {
             "qwen2" => Arch::Qwen2,
             "qwen3" => Arch::Qwen3,
             "qwen3moe" => Arch::Qwen3Moe,
+            "qwen35" | "qwen35moe" => Arch::Qwen35,
             other => {
                 return Err(ModelError::Unsupported(format!(
-                    "architecture {other:?} (supported: llama, qwen2, qwen3, qwen3moe)"
+                    "architecture {other:?} (supported: llama, qwen2, qwen3, qwen3moe, qwen35)"
                 )));
             }
         };
@@ -227,7 +251,7 @@ impl Config {
                         ))
                     })?;
                 let (norm, scale, gating) = match arch {
-                    Arch::Qwen3Moe => (true, 1.0, Gating::Softmax),
+                    Arch::Qwen3Moe | Arch::Qwen35 => (true, 1.0, Gating::Softmax),
                     _ => (false, 1.0, Gating::Softmax),
                 };
                 Some(Moe {
@@ -265,10 +289,25 @@ impl Config {
             rope_scale,
             rope_style: match arch {
                 Arch::Llama => RopeStyle::Norm,
-                Arch::Qwen2 | Arch::Qwen3 | Arch::Qwen3Moe => RopeStyle::Neox,
+                Arch::Qwen2 | Arch::Qwen3 | Arch::Qwen3Moe | Arch::Qwen35 => RopeStyle::Neox,
             },
             train_context: opt_int("context_length").unwrap_or(4096),
             moe,
+            // By shape, not by architecture: the q projection is twice
+            // `q_dim` wide when its second half is an output gate.
+            attn_gated: (0..int("block_count")?).any(|i| {
+                info.tensor(&format!("blk.{i}.attn_q.weight"))
+                    .and_then(|t| t.dimensions.get(1).copied())
+                    .is_some_and(|rows| rows == 2 * (n_head * head_dim) as u64)
+            }),
+            ssm: opt_int("ssm.state_size").map(|state_size| SsmConfig {
+                conv_kernel: opt_int("ssm.conv_kernel").unwrap_or(4),
+                state_size,
+                group_count: opt_int("ssm.group_count").unwrap_or(1),
+                time_step_rank: opt_int("ssm.time_step_rank").unwrap_or(0),
+                inner_size: opt_int("ssm.inner_size").unwrap_or(0),
+                interval: opt_int("full_attention_interval").unwrap_or(usize::MAX),
+            }),
         };
         // A routed model's dense `feed_forward_length` is unused, and some
         // files set it to zero, so only require it when there are no experts.
@@ -294,6 +333,26 @@ struct Weight {
 
 struct Layer {
     attn_norm: Vec<f32>,
+    mixer: Mixer,
+    ffn_norm: Vec<f32>,
+    ffn: Ffn,
+    /// Read from disk every token instead of held in RAM (see `LoadOptions`).
+    streamed: bool,
+}
+
+/// How a layer mixes across positions.
+///
+/// Softmax attention for every layer of the architectures kLLM started with;
+/// Qwen3.5 instead alternates, three linear-attention blocks to one
+/// attention block (`full_attention_interval`).
+#[allow(clippy::large_enum_variant)]
+enum Mixer {
+    Attention(Attention),
+    /// A gated DeltaNet: see `docs/QWEN35.md`.
+    Ssm(Ssm),
+}
+
+struct Attention {
     wq: Weight,
     wk: Weight,
     wv: Weight,
@@ -303,10 +362,24 @@ struct Layer {
     bv: Option<Vec<f32>>,
     q_norm: Option<Vec<f32>>,
     k_norm: Option<Vec<f32>>,
-    ffn_norm: Vec<f32>,
-    ffn: Ffn,
-    /// Read from disk every token instead of held in RAM (see `LoadOptions`).
-    streamed: bool,
+}
+
+/// Linear-attention weights. `qkv` is fused and `gate` sigmoid-gates the
+/// output; the rest drive a four-tap causal convolution and a recurrence
+/// over a `group_count` by `state_size` state.
+// Loaded and shape-checked, but the recurrence that would read the last four
+// is not written yet; see docs/QWEN35.md.
+#[allow(dead_code)]
+struct Ssm {
+    qkv: Weight,
+    gate: Weight,
+    out: Weight,
+    conv1d: Vec<f32>,
+    a: Vec<f32>,
+    dt_bias: Vec<f32>,
+    alpha: Weight,
+    beta: Weight,
+    norm: Vec<f32>,
 }
 
 /// One layer's feed-forward block.
@@ -349,7 +422,10 @@ impl Layer {
     /// 3-D and only a routed fraction of them is read per token, so callers
     /// that care about bytes ask `expert_bytes` separately.
     fn matrices(&self) -> Vec<Weight> {
-        let mut all = vec![self.wq, self.wk, self.wv, self.wo];
+        let mut all = match &self.mixer {
+            Mixer::Attention(a) => vec![a.wq, a.wk, a.wv, a.wo],
+            Mixer::Ssm(m) => vec![m.qkv, m.gate, m.out, m.alpha, m.beta],
+        };
         match &self.ffn {
             Ffn::Dense { gate, up, down } => all.extend([*gate, *up, *down]),
             Ffn::Routed { router, shared, .. } => {
@@ -536,19 +612,70 @@ impl Model {
             layers.push(Layer {
                 streamed,
                 attn_norm: loader.vector(&name("attn_norm.weight"), c.n_embd)?,
-                wq: loader.matrix(&name("attn_q.weight"), c.q_dim(), c.n_embd)?,
-                wk: loader.matrix(&name("attn_k.weight"), c.kv_dim(), c.n_embd)?,
-                wv: loader.matrix(&name("attn_v.weight"), c.kv_dim(), c.n_embd)?,
-                wo: loader.matrix(&name("attn_output.weight"), c.n_embd, c.q_dim())?,
-                bq: loader.optional_vector(&name("attn_q.bias"), c.q_dim())?,
-                bk: loader.optional_vector(&name("attn_k.bias"), c.kv_dim())?,
-                bv: loader.optional_vector(&name("attn_v.bias"), c.kv_dim())?,
-                // Presence, not architecture: Qwen3-MoE carries these just
-                // as Qwen3 does, and deciding by architecture silently
-                // dropped them.
-                q_norm: loader.optional_vector(&name("attn_q_norm.weight"), c.head_dim)?,
-                k_norm: loader.optional_vector(&name("attn_k_norm.weight"), c.head_dim)?,
-                ffn_norm: loader.vector(&name("ffn_norm.weight"), c.n_embd)?,
+                // Attention or linear attention, by which tensors the block
+                // has rather than by arithmetic on `full_attention_interval`.
+                mixer: match c
+                    .ssm
+                    .filter(|_| loader.file.info.tensor(&name("ssm_a")).is_some())
+                {
+                    None => Mixer::Attention(Attention {
+                        wq: loader.matrix(
+                            &name("attn_q.weight"),
+                            if c.attn_gated {
+                                2 * c.q_dim()
+                            } else {
+                                c.q_dim()
+                            },
+                            c.n_embd,
+                        )?,
+                        wk: loader.matrix(&name("attn_k.weight"), c.kv_dim(), c.n_embd)?,
+                        wv: loader.matrix(&name("attn_v.weight"), c.kv_dim(), c.n_embd)?,
+                        wo: loader.matrix(&name("attn_output.weight"), c.n_embd, c.q_dim())?,
+                        bq: loader.optional_vector(&name("attn_q.bias"), c.q_dim())?,
+                        bk: loader.optional_vector(&name("attn_k.bias"), c.kv_dim())?,
+                        bv: loader.optional_vector(&name("attn_v.bias"), c.kv_dim())?,
+                        // Presence, not architecture: Qwen3-MoE carries
+                        // these just as Qwen3 does, and deciding by
+                        // architecture silently dropped them.
+                        q_norm: loader.optional_vector(&name("attn_q_norm.weight"), c.head_dim)?,
+                        k_norm: loader.optional_vector(&name("attn_k_norm.weight"), c.head_dim)?,
+                    }),
+                    Some(ssm) => Mixer::Ssm(Ssm {
+                        qkv: loader.matrix(
+                            &name("attn_qkv.weight"),
+                            ssm.inner_size * 2,
+                            c.n_embd,
+                        )?,
+                        gate: loader.matrix(&name("attn_gate.weight"), ssm.inner_size, c.n_embd)?,
+                        out: loader.matrix(&name("ssm_out.weight"), c.n_embd, ssm.inner_size)?,
+                        conv1d: loader.vector(
+                            &name("ssm_conv1d.weight"),
+                            ssm.conv_kernel * ssm.inner_size * 2,
+                        )?,
+                        a: loader.vector(&name("ssm_a"), ssm.time_step_rank)?,
+                        dt_bias: loader.vector(&name("ssm_dt.bias"), ssm.time_step_rank)?,
+                        alpha: loader.matrix(
+                            &name("ssm_alpha.weight"),
+                            ssm.time_step_rank,
+                            c.n_embd,
+                        )?,
+                        beta: loader.matrix(
+                            &name("ssm_beta.weight"),
+                            ssm.time_step_rank,
+                            c.n_embd,
+                        )?,
+                        norm: loader.vector(&name("ssm_norm.weight"), ssm.state_size)?,
+                    }),
+                },
+                // The norm before the feed-forward block. Qwen3.5 has no
+                // `ffn_norm` and calls it `post_attention_norm` instead --
+                // which is the same position in the block, after the mixer
+                // and before the feed-forward, and there is no other
+                // candidate in the file.
+                ffn_norm: match loader.optional_vector(&name("ffn_norm.weight"), c.n_embd)? {
+                    Some(v) => v,
+                    None => loader.vector(&name("post_attention_norm.weight"), c.n_embd)?,
+                },
                 // Routed or dense per layer, by which tensors are present:
                 // several MoE architectures keep the first blocks dense, and
                 // a whole-model switch would fail to load them.
@@ -1192,18 +1319,31 @@ impl<'m> Session<'m> {
                 rms_norm_in_place(xn, &layer.attn_norm, c.rms_eps);
             }
             self.profiler.lap(0);
+            // Linear attention is not implemented yet; see docs/QWEN35.md.
+            // The weights load and `inspect` reports the shape, so the file
+            // can be checked before any of the arithmetic exists.
+            let weights = match &layer.mixer {
+                Mixer::Attention(a) => a,
+                Mixer::Ssm(_) => {
+                    return Err(ModelError::Unsupported(
+                        "linear-attention (SSM) layers: the weights load but the \
+                         recurrence is not implemented yet"
+                            .into(),
+                    ));
+                }
+            };
             be.matmul_many(
                 &mut [
                     Job {
-                        matrix: model.matrix(layer.wq),
+                        matrix: model.matrix(weights.wq),
                         output: &mut self.q[..n * qd],
                     },
                     Job {
-                        matrix: model.matrix(layer.wk),
+                        matrix: model.matrix(weights.wk),
                         output: &mut self.k[..n * kvd],
                     },
                     Job {
-                        matrix: model.matrix(layer.wv),
+                        matrix: model.matrix(weights.wv),
                         output: &mut self.v[..n * kvd],
                     },
                 ],
@@ -1215,14 +1355,14 @@ impl<'m> Session<'m> {
                 let q = &mut self.q[i * qd..(i + 1) * qd];
                 let k = &mut self.k[i * kvd..(i + 1) * kvd];
                 let v = &mut self.v[i * kvd..(i + 1) * kvd];
-                add_bias(q, layer.bq.as_deref());
-                add_bias(k, layer.bk.as_deref());
-                add_bias(v, layer.bv.as_deref());
-                if let Some(w) = &layer.q_norm {
+                add_bias(q, weights.bq.as_deref());
+                add_bias(k, weights.bk.as_deref());
+                add_bias(v, weights.bv.as_deref());
+                if let Some(w) = &weights.q_norm {
                     q.chunks_exact_mut(hd)
                         .for_each(|h| rms_norm_in_place(h, w, c.rms_eps));
                 }
-                if let Some(w) = &layer.k_norm {
+                if let Some(w) = &weights.k_norm {
                     k.chunks_exact_mut(hd)
                         .for_each(|h| rms_norm_in_place(h, w, c.rms_eps));
                 }
@@ -1332,7 +1472,7 @@ impl<'m> Session<'m> {
             });
             self.profiler.lap(3);
             be.matmul(
-                model.matrix(layer.wo),
+                model.matrix(weights.wo),
                 &self.attn[..n * qd],
                 &mut self.proj[..n * d],
                 n,
