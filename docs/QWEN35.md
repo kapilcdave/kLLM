@@ -109,6 +109,30 @@ prefix rebuilds that prefix on the next forward call, using the retained
 token IDs. This keeps rewind correct without storing a matrix snapshot per
 token; rewinding consequently costs a prefix prefill.
 
+## Why this matters for a long context
+
+The KV cache is what stops a long context on a small machine, and a hybrid
+keeps only one in four. kLLM charges and allocates for exactly those layers
+(`Config::kv_layers` and `kv_slot`), so the per-token cost is a quarter of
+what the same depth costs dense:
+
+| Model | KV per token | at 32k | at 128k | at 200k |
+|---|---:|---:|---:|---:|
+| Qwen3-30B-A3B (attention everywhere) | 98,304 B | 3.0 GiB | 12.3 GiB | 19.2 GiB |
+| Qwen3.5-4B (hybrid) | 32,768 B | 1.0 GiB | 16.0 GiB | 25.0 GiB |
+| **Qwen3.5-35B-A3B (hybrid)** | **20,480 B** | **0.6 GiB** | **2.5 GiB** | **4.0 GiB** |
+
+The 4B is not as cheap as the one-in-four ratio suggests, because a 256-wide
+head and four KV heads leave it a large `kv_dim`; 32k fits it in a gigabyte
+and runs at 10.4 tok/s, and 128k does not fit at all.
+
+The 35B is the model this buys something for. 128k of context costs it
+2.5 GiB and 200k costs 4.0 GiB, either of which fits on a 16 GiB machine
+beside a demand-paged model -- where a dense 30B wants 12.3 GiB for 128k and
+simply cannot. That makes IQ2_XXS the only thing left between this hardware
+and a 128k-context 35B, which is worth knowing before optimizing anything
+else.
+
 ## Validation
 
 On `tests/fixtures/wiki.test.head.txt`, CPU, 4 chunks of context 256 (508
