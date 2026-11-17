@@ -172,13 +172,25 @@ fn has_avx2() -> bool {
     })
 }
 
+#[cfg(target_arch = "aarch64")]
+fn has_neon() -> bool {
+    std::env::var_os("KLLM_NO_SIMD").is_none()
+}
+
 /// Name of the kernel set in use, for logs and benchmarks.
 pub fn kernel_name() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     if has_avx2() {
         return "avx2+fma+f16c";
     }
-    "scalar"
+    #[cfg(target_arch = "aarch64")]
+    {
+        if has_neon() { "neon" } else { "scalar" }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        "scalar"
+    }
 }
 
 /// Dot product of one stored row with a prepared activation vector.
@@ -204,6 +216,12 @@ pub fn dot(kind: GgmlType, row: &[u8], x: &Prepared<'_>) -> f32 {
                 _ => {}
             }
         }
+    }
+    #[cfg(target_arch = "aarch64")]
+    if has_neon()
+        && let (GgmlType::Q4_0, Prepared::Q8_0(x)) = (kind, x)
+    {
+        return neon::q4_0(row, x);
     }
     dot_scalar(kind, row, x)
 }
@@ -933,6 +951,49 @@ pub fn store_f16(src: &[f32], dst: &mut [u16]) {
     }
     for (d, &s) in dst.iter_mut().zip(src) {
         *d = crate::quant::f32_to_f16(s);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)] // every intrinsic is valid on baseline AArch64
+mod neon {
+    use std::arch::aarch64::*;
+
+    use super::BlockQ8_0;
+    use crate::quant::f16_to_f32;
+
+    /// GGML Q4_0 weights against Q8_0 activations. AArch64 guarantees NEON,
+    /// so no runtime feature probe is required.
+    pub fn q4_0(row: &[u8], x: &[BlockQ8_0]) -> f32 {
+        debug_assert_eq!(row.len(), x.len() * 18);
+        // SAFETY: every 18-byte weight block contains 16 packed quants, every
+        // activation block contains 32 i8 values, and AArch64 guarantees NEON.
+        unsafe { q4_0_neon(row, x) }
+    }
+
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn q4_0_neon(row: &[u8], x: &[BlockQ8_0]) -> f32 {
+        let mask = vdupq_n_u8(0x0f);
+        let eight = vdupq_n_u8(8);
+        let mut sum = 0.0_f32;
+        for (block_index, activation) in x.iter().enumerate() {
+            let block = row.as_ptr().add(block_index * 18);
+            let scale = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+            let packed = vld1q_u8(block.add(2));
+            let low = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(packed, mask), eight));
+            let high = vreinterpretq_s8_u8(vsubq_u8(vshrq_n_u8(packed, 4), eight));
+            let activations_low = vld1q_s8(activation.qs.as_ptr());
+            let activations_high = vld1q_s8(activation.qs.as_ptr().add(16));
+            let integer_dot = dot_i8x16(low, activations_low) + dot_i8x16(high, activations_high);
+            sum = (scale * activation.d).mul_add(integer_dot as f32, sum);
+        }
+        sum
+    }
+
+    #[inline(always)]
+    unsafe fn dot_i8x16(left: int8x16_t, right: int8x16_t) -> i32 {
+        vaddlvq_s16(vmull_s8(vget_low_s8(left), vget_low_s8(right)))
+            + vaddlvq_s16(vmull_s8(vget_high_s8(left), vget_high_s8(right)))
     }
 }
 

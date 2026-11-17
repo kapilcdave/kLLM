@@ -107,8 +107,9 @@ Building without the GPU backend: `cargo build --release --no-default-features`.
 | **Weight types** | Validated end to end against llama.cpp on real models, by perplexity *and* KL divergence: F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K. F32 is kernel-tested only |
 | **Tokenizers** | GPT-2 byte-level BPE (gpt2, smollm, llama3, qwen2 pre-tokenizers) and SentencePiece; special tokens; byte-exact with llama.cpp on the fixtures |
 | **GGUF parsing** | Full metadata and tensor directory; every length is bounds-checked against the file before allocation; payloads are memory-mapped |
-| **Execution** | CPU: batched prefill, f16 KV cache, AVX2/FMA/F16C kernels with a portable scalar fallback |
+| **Execution** | CPU: batched prefill, f16 KV cache, AVX2/FMA/F16C kernels, an AArch64 NEON Q4_0 kernel, and a portable scalar fallback |
 | **Sampling** | Greedy, temperature, top-k, top-p, min-p, repetition penalty, seeded |
+| **Planning** | Per-layer VRAM/RAM placement from real tensor sizes and KV costs |
 | **CUDA** | Kernels for all weight types, coalesced struct-of-arrays matvecs for Q4_0/Q8_0/Q4_K/Q6_K, KV cache in VRAM. Perplexity matches llama.cpp on the GPU as closely as on the CPU (`tests/gpu.rs`) |
 | **Qwen3.5** | `qwen35` dense 4B/9B Q4_K_M runs on CPU with gated attention and DeltaNet; 4B perplexity is within 0.27% of llama.cpp. The 35B-A3B IQ2_XXS file still needs that weight type. See [docs/QWEN35.md](docs/QWEN35.md) |
 
@@ -396,6 +397,7 @@ they are the right first stop before optimizing anything:
 | Example | Answers |
 |---|---|
 | `kernel_bench` | matvec GB/s per weight type — is a shape bandwidth-bound? |
+| `bench_q4_0` | scalar or NEON Q4_0 matvec latency on AArch64 |
 | `gemm_bench` | batched matmul GOP/s |
 | `tile_bench` | splits a matmul into kernel / row-streaming / full path, and times `prepare` separately |
 | `attn_bench` | attention primitives in GMAC/s, per head width |

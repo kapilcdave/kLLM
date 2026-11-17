@@ -1,0 +1,9 @@
+{
+  "kernel": "q4_0_x_q8_0_matvec",
+  "architecture": "aarch64",
+  "implementation": "neon",
+  "rows": 4096,
+  "columns": 4096,
+  "threads": 5,
+  "samples": 9
+}
