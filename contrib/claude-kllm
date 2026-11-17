@@ -131,6 +131,14 @@ export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${KLLM_CONTEXT:-32768}"
 # request of a session can take many minutes. The default client timeout would
 # abandon it long before the model finishes.
 export API_TIMEOUT_MS="${KLLM_TIMEOUT_MS:-3600000}"
+# API_TIMEOUT_MS alone is not enough: the streaming reader has its own
+# first-byte and idle deadlines, and they are what actually fired here. The
+# server pings between prefill chunks, but a chunk is ~18 s of compute at this
+# speed and a slow one can exceed a short idle deadline -- which is why a
+# 794 s prefill succeeded and an 890 s one was abandoned and retried.
+export CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS="${KLLM_TIMEOUT_MS:-3600000}"
+export CLAUDE_STREAM_IDLE_TIMEOUT_MS="${KLLM_TIMEOUT_MS:-3600000}"
+export CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS="${KLLM_TIMEOUT_MS:-3600000}"
 # At ~8 tok/s a 4k-token answer is eight minutes. Cap it lower than the cloud
 # default so a runaway generation is interruptible.
 export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${KLLM_MAX_OUTPUT:-2048}"

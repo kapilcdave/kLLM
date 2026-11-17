@@ -598,6 +598,17 @@ impl Engine {
                     return Err(Fail::Engine(e.to_string()));
                 }
             };
+            // Per chunk, not after the loop. `cached` has to stay in step with
+            // the session's position at every point a `?` can leave this
+            // function, or the next request matches its prefix against a
+            // history the session no longer has.
+            //
+            // This is not theoretical: a client that hung up mid-prefill left
+            // the session 8981 tokens in with `cached` still holding 21, so
+            // its own retry reused those 21 and re-read 10902 -- throwing away
+            // eleven minutes of completed work. Now an interrupted prefill is
+            // progress, and the retry resumes from it.
+            self.cached.extend_from_slice(chunk);
             // Keep the connection alive between chunks. One chunk is seconds
             // to tens of seconds of compute, so this is the finest granularity
             // available without giving up the wide batch that makes routed
@@ -607,7 +618,6 @@ impl Engine {
                 last_ping = Instant::now();
             }
         }
-        self.cached.extend_from_slice(&tokens[shared..]);
 
         // User stop sequences first, then the tool marker, so a marker index
         // identifies which of the two kinds matched.
