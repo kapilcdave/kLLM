@@ -27,7 +27,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::json::{Value, count, object, string};
@@ -42,6 +42,10 @@ const MAX_BODY: usize = 128 * 1024 * 1024;
 /// How many connections may be open at once. Generation is serialized
 /// anyway; this only bounds the threads a client can make us spawn.
 const MAX_CONNECTIONS: usize = 64;
+
+/// How often to send an SSE `ping` while a long prefill is running. Short
+/// enough to stay inside any client's idle timeout, long enough to be free.
+const PING_EVERY: Duration = Duration::from_secs(10);
 
 /// The markers Qwen3 was trained to wrap a tool call in.
 const TOOL_OPEN: &str = "<tool_call>";
@@ -176,8 +180,10 @@ struct Request {
 /// An event on the way out, consumed either by the SSE writer or by the
 /// buffer that builds a single JSON response.
 enum Delta<'a> {
-    /// The prompt is in and `input_tokens` is final.
+    /// The prompt has been counted; generation has not started yet.
     Prompt(usize),
+    /// Still working. Streamed as the API's `ping` event; ignored otherwise.
+    Ping,
     Text(&'a str),
     Tool {
         id: String,
@@ -270,12 +276,28 @@ fn render_tools(tools: &[Value], out: &mut String) {
     );
 }
 
-impl Engine {
+/// How a conversation is turned into a prompt.
+///
+/// Split out of [`Engine`] so the invariant the prefix cache depends on can be
+/// tested without a model file behind it.
+#[derive(Clone, Copy)]
+struct Style {
+    /// Let a reasoning model reason, rather than pre-filling an empty
+    /// `<think></think>` the way its own template does.
+    think: bool,
+    /// The template knows `<tool_call>`, so tool definitions mean something.
+    tool_format: bool,
+}
+
+impl Style {
     /// Turns an Anthropic request body into a ChatML prompt.
     ///
-    /// The rendering is deliberately a pure function of the conversation so
-    /// that adding a turn extends the previous prompt rather than perturbing
-    /// it — which is what makes the prefix cache hit.
+    /// The rendering is deliberately a pure function of the conversation, and
+    /// specifically one where appending a turn *extends* the previous prompt
+    /// rather than perturbing it. That is what makes the prefix cache hit, and
+    /// on a recurrent model it is the difference between resuming and replaying
+    /// the whole history. `renders_each_turn_as_an_extension_of_the_last`
+    /// pins it.
     fn render(&self, body: &Value) -> Result<(String, bool), String> {
         let messages = body
             .field("messages")
@@ -359,6 +381,19 @@ impl Engine {
 
     fn render_assistant(&self, content: &Value, out: &mut String) {
         out.push_str("<|im_start|>assistant\n");
+        // The same empty `<think>` block the live turn below is opened with.
+        //
+        // This looks like a cosmetic detail and is not. The session processed
+        // that prefill when it generated this reply, so omitting it when the
+        // reply comes back as history puts the divergence at the first token
+        // of the previous answer -- which is the worst possible place. Every
+        // turn would then rewind past it, and on a recurrent model a rewind
+        // resets the SSM state and replays the whole prefix from zero. With
+        // the prefill rendered here the prompt is a true extension of what
+        // the session already holds, so nothing rewinds at all.
+        if !self.think {
+            out.push_str("<think>\n\n</think>\n\n");
+        }
         out.push_str(&text_of(content));
         if let Value::Array(blocks) = content {
             for block in blocks {
@@ -394,8 +429,18 @@ impl Engine {
         out.push_str("<|im_end|>\n");
     }
 
+}
+
+impl Engine {
+    fn style(&self) -> Style {
+        Style {
+            think: self.think,
+            tool_format: self.tool_format,
+        }
+    }
+
     fn parse_request(&self, body: &Value, opts: &Options) -> Result<Request, String> {
-        let (prompt, tools) = self.render(body)?;
+        let (prompt, tools) = self.style().render(body)?;
         let mut sampler = opts.sampler.clone();
         if let Some(t) = body.field("temperature").and_then(Value::as_f64) {
             sampler.temperature = t as f32;
@@ -534,7 +579,17 @@ impl Engine {
         self.reused = shared;
         self.fed = tokens.len() - shared;
 
+        // Announce the message before prefilling rather than after.
+        //
+        // The token count is already known -- the prompt is tokenized above --
+        // and prefill of a large prompt takes minutes on this hardware. A
+        // client that has had a 200 and then nothing for eighteen minutes
+        // hangs up, which is exactly what Claude Code did: two requests
+        // logged "client left" after 1087 s and 976 s of honest work.
+        emit(Delta::Prompt(tokens.len()))?;
+
         let mut logits = Vec::new();
+        let mut last_ping = Instant::now();
         for chunk in tokens[shared..].chunks(self.batch) {
             logits = match self.session.forward(chunk, Logits::Last) {
                 Ok(values) => values.to_vec(),
@@ -543,9 +598,16 @@ impl Engine {
                     return Err(Fail::Engine(e.to_string()));
                 }
             };
+            // Keep the connection alive between chunks. One chunk is seconds
+            // to tens of seconds of compute, so this is the finest granularity
+            // available without giving up the wide batch that makes routed
+            // prefill fast in the first place.
+            if last_ping.elapsed() >= PING_EVERY {
+                emit(Delta::Ping)?;
+                last_ping = Instant::now();
+            }
         }
         self.cached.extend_from_slice(&tokens[shared..]);
-        emit(Delta::Prompt(tokens.len()))?;
 
         // User stop sequences first, then the tool marker, so a marker index
         // identifies which of the two kinds matched.
@@ -725,6 +787,8 @@ impl Buffered {
     fn push(&mut self, delta: Delta<'_>) {
         match delta {
             Delta::Prompt(n) => self.input_tokens = n,
+            // Nothing to buffer: a ping exists only to occupy the wire.
+            Delta::Ping => {}
             Delta::Text(chunk) => match self.text {
                 Some(at) => {
                     if let Value::Object(fields) = &mut self.blocks[at]
@@ -832,6 +896,7 @@ impl Streamed<'_> {
                     &object([("type", string("message_start")), ("message", message)]),
                 )
             }
+            Delta::Ping => self.event("ping", &object([("type", string("ping"))])),
             Delta::Text(chunk) => {
                 if self.open != Some(true) {
                     self.close_block()?;
@@ -1470,6 +1535,79 @@ mod tests {
             "{json}"
         );
         assert!(json.contains(r#"{"type":"text","text":"done"}"#), "{json}");
+    }
+
+    /// The property the prefix cache is built on, and the one that decides
+    /// whether a recurrent model resumes or replays: adding a turn must
+    /// *extend* the previous prompt, never rewrite any of it.
+    #[test]
+    fn renders_each_turn_as_an_extension_of_the_last() {
+        for think in [false, true] {
+            let style = Style {
+                think,
+                tool_format: true,
+            };
+            let turn1 = Value::parse(
+                r#"{"system":"be brief","messages":[{"role":"user","content":"first"}]}"#,
+            )
+            .unwrap();
+            let turn2 = Value::parse(
+                r#"{"system":"be brief","messages":[
+                     {"role":"user","content":"first"},
+                     {"role":"assistant","content":"an answer"},
+                     {"role":"user","content":"second"}]}"#,
+            )
+            .unwrap();
+            let (first, _) = style.render(&turn1).unwrap();
+            let (second, _) = style.render(&turn2).unwrap();
+            assert!(
+                second.starts_with(&first),
+                "think={think}: turn 2 is not an extension of turn 1.\n\
+                 turn 1 ended: {:?}\nturn 2 had:   {:?}",
+                &first[first.len().saturating_sub(60)..],
+                &second[first.len().saturating_sub(60)..second.len().min(first.len() + 20)],
+            );
+        }
+    }
+
+    /// Same property across a tool round trip, which is how a coding client
+    /// actually grows a conversation: call, result, next answer.
+    #[test]
+    fn a_tool_round_trip_also_only_extends() {
+        let style = Style {
+            think: false,
+            tool_format: true,
+        };
+        let called = Value::parse(
+            r#"{"messages":[
+                 {"role":"user","content":"read it"},
+                 {"role":"assistant","content":[
+                    {"type":"tool_use","id":"t1","name":"Read","input":{"path":"a"}}]}]}"#,
+        )
+        .unwrap();
+        let resulted = Value::parse(
+            r#"{"messages":[
+                 {"role":"user","content":"read it"},
+                 {"role":"assistant","content":[
+                    {"type":"tool_use","id":"t1","name":"Read","input":{"path":"a"}}]},
+                 {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"t1","content":"file body"}]}]}"#,
+        )
+        .unwrap();
+        let (before, _) = style.render(&called).unwrap();
+        let (after, _) = style.render(&resulted).unwrap();
+        // The open assistant turn is the only part that differs, and it is at
+        // the end, so everything up to it must be shared.
+        let shared = before
+            .bytes()
+            .zip(after.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let tail = before.len() - shared;
+        assert!(
+            tail <= "<|im_start|>assistant\n<think>\n\n</think>\n\n".len(),
+            "diverged {tail} bytes before the end, not just at the open turn"
+        );
     }
 
     #[test]

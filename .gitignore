@@ -4,3 +4,6 @@
 .DS_Store
 
 /models
+
+# Runtime logs from the serve unit.
+logs/

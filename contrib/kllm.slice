@@ -13,9 +13,14 @@ Documentation=man:systemd.resource-control(5)
 # would sit right on the knee, so inference gets its own slice above it --
 # while still leaving the recorders (about 5 GiB) room to avoid the global OOM
 # killer that cost curvetape 62 of 180 minutes on 11/14.
+#
+# Raised for a 128k context: 2.5 GiB of that is now the KV cache, which is
+# anonymous and cannot be reclaimed, so the old 8G ceiling would have left
+# only 5.5G of expert cache -- below the knee. 10G leaves about 7.5G, which
+# the locality curve puts at ~90% hit.
 [Slice]
-MemoryHigh=8G
-MemoryMax=10G
+MemoryHigh=10G
+MemoryMax=12G
 # Never swap: the KV cache is hot anonymous memory and the weights are a
 # file-backed mapping that should be re-read from NVMe, not written to swap.
 MemorySwapMax=256M

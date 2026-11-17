@@ -229,6 +229,11 @@ kllm serve Qwen3-30B-A3B-Q4_K_M.gguf --context 16384
 ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ANTHROPIC_AUTH_TOKEN=local claude
 ```
 
+For the version you keep -- a systemd unit, a memory ceiling, and a
+`claude-kllm` wrapper that starts the server and sets the dozen environment
+variables Claude Code needs (including the ones that must be *un*set, or it
+quietly talks to a cloud provider instead) -- see [contrib/](contrib/).
+
 `POST /v1/messages` streams over SSE or returns a single JSON message, and
 `/v1/messages/count_tokens`, `/v1/models` and `/health` are there too. The
 wire format is Anthropic's; underneath it is the same ChatML the model was

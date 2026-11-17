@@ -1381,7 +1381,13 @@ impl<'m> Session<'m> {
         let c = config;
         let context = context.max(1) as u64;
         let b = max_batch.clamp(1, context as usize) as u64;
-        let kv = 2 * 2 * c.n_layer as u64 * context * c.kv_dim() as u64;
+        // Through `kv_bytes_per_token`, so this cannot drift from what
+        // `Session::new` actually allocates again: it counted every layer
+        // while the allocation gives a slot only to the layers that keep a
+        // cache, and on a 40-block hybrid with one attention block in four
+        // that is a 4x over-estimate -- enough for the planner to refuse a
+        // 128k context that fits in 2.5 GiB.
+        let kv = c.kv_bytes_per_token() * context;
         let f32s = b
             * (3 * c.n_embd as u64
                 + 2 * c.q_dim() as u64
