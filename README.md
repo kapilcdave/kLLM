@@ -35,8 +35,11 @@ Llama- and Qwen-family decoders with AVX2 kernels whose output is checked
 against llama.cpp.
 
 Its reference machine is a Dell Precision 5520: a Xeon E3-1505M v6, 16 GiB of
-RAM and a 4 GiB Quadro M1200. On it, kLLM runs **Qwen3-30B-A3B at 10-11 tok/s,
-6x llama.cpp** on the same file.
+RAM and a 4 GiB Quadro M1200. On it, kLLM runs a **17.3 GiB
+Qwen3-30B-A3B model with 16 GiB of RAM**. In the latest fresh comparison,
+kLLM prefills it at 12.4 tok/s against llama.cpp's 10.9; see
+[the recorded results](evals/dell-comparison.md) for decode numbers and
+benchmark limitations.
 
 <table>
   <tr>
@@ -100,7 +103,7 @@ Building without the GPU backend: `cargo build --release --no-default-features`.
 
 | | |
 |---|---|
-| **Architectures** | `llama` (Llama 1–3, Mistral, SmolLM, TinyLlama), `qwen2`, `qwen3`, `qwen3moe`. A 30B mixture of experts runs on a 16 GiB machine at 6x llama.cpp: see [docs/MOE.md](docs/MOE.md) |
+| **Architectures** | `llama` (Llama 1–3, Mistral, SmolLM, TinyLlama), `qwen2`, `qwen3`, `qwen3moe`. A 17.3 GiB mixture of experts runs on a 16 GiB machine: see [docs/MOE.md](docs/MOE.md) |
 | **Weight types** | Validated end to end against llama.cpp on real models, by perplexity *and* KL divergence: F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K. F32 is kernel-tested only |
 | **Tokenizers** | GPT-2 byte-level BPE (gpt2, smollm, llama3, qwen2 pre-tokenizers) and SentencePiece; special tokens; byte-exact with llama.cpp on the fixtures |
 | **GGUF parsing** | Full metadata and tensor directory; every length is bounds-checked against the file before allocation; payloads are memory-mapped |
@@ -191,8 +194,11 @@ works:
 kllm run Qwen3-30B-A3B-Q4_K_M.gguf --chat --prompt "..." -n 400 --context 4096
 ```
 
-17.3 GiB of weights, 16 GiB of RAM, **10-11 tok/s** against llama.cpp's 1.81
-on the same file and machine. Three things matter in practice:
+17.3 GiB of weights, 16 GiB of RAM. In a fresh three-round CPU comparison,
+kLLM reached **12.4 tok/s prefill** against llama.cpp's 10.9; llama.cpp led
+decode at 6.0 against kLLM's 4.8. These use equivalent workload sizes rather
+than identical token streams; exact commands, hashes, ranges and limitations
+are in [evals/dell-30b/](evals/dell-30b/). Three things matter in practice:
 
 - **Let the cache warm.** The first run of a model reads experts from disk and
   lands at 4-7 tok/s; by the second or third it is at 10-11. Switching
