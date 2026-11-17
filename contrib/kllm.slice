@@ -14,13 +14,21 @@ Documentation=man:systemd.resource-control(5)
 # while still leaving the recorders (about 5 GiB) room to avoid the global OOM
 # killer that cost curvetape 62 of 180 minutes on 11/14.
 #
-# Raised for a 128k context: 2.5 GiB of that is now the KV cache, which is
-# anonymous and cannot be reclaimed, so the old 8G ceiling would have left
-# only 5.5G of expert cache -- below the knee. 10G leaves about 7.5G, which
-# the locality curve puts at ~90% hit.
+# Sized against what else lives on this 15.8 GiB box, not against what
+# inference would like: about 5 GiB of memecoin recorders, a bit over 1 GiB of
+# long-running editor sessions, and the OS. 10G/12G was set for a 128k context
+# and over-committed the machine -- `available` fell to 225 MiB and the page
+# cache collapsed to 279 MiB, which starves the expert cache this is supposed
+# to protect and risks the global OOM killer that cost curvetape 62 of 180
+# minutes on 11/14.
+#
+# At a 128k context roughly 2.9 GiB of the allowance is unreclaimable (2.5 GiB
+# KV plus scratch), so this leaves about 4.5-6 GiB of expert cache -- around
+# the measured 85%-hit point of 4.8 GiB. Lower the context in serve.env if you
+# would rather spend that 2.5 GiB on cache than on context.
 [Slice]
-MemoryHigh=10G
-MemoryMax=12G
+MemoryHigh=7500M
+MemoryMax=9G
 # Never swap: the KV cache is hot anonymous memory and the weights are a
 # file-backed mapping that should be re-read from NVMe, not written to swap.
 MemorySwapMax=256M
