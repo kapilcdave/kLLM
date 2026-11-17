@@ -76,3 +76,31 @@ Measured on a 4-core laptop with 16 GiB of RAM, no usable GPU:
 - **One session.** Generation serializes, and there is a single prefix cache.
   Two conversations against one server will evict each other and every turn
   becomes a full prefill again.
+
+## The flag that decides whether this is usable daily
+
+`claude-kllm` passes `--exclude-dynamic-system-prompt-sections`, and on this
+setup that is not a micro-optimisation.
+
+Claude Code's system prompt and tool definitions come to about **11,000
+tokens**, which is a ~13 minute cold prefill here. By default that prompt also
+carries per-machine blocks -- working directory, environment info, memory
+paths, git status -- and those differ on every run. So the prompt mismatches
+near its *start*, the prefix cache misses, and **every new session pays the
+full thirteen minutes again**. Measured: a second session with the default
+prompt was still prefilling past 600 s.
+
+The flag moves those blocks into the first user message instead. The expensive
+part of the prompt becomes byte-identical across sessions, the prefix cache
+hits, and only the genuinely new tail is read. Upstream offers it for
+cross-user prompt-cache reuse on the API; here it is the difference between
+"slow once" and "slow every time".
+
+Two consequences worth keeping in mind:
+
+- **The 13 minutes is per server lifetime, not per session** -- so leave the
+  unit running. A restart throws the prefix away and you pay it again. This is
+  the main reason it is a systemd unit rather than something you start when you
+  need it.
+- **Switching models in `serve.env` also throws it away**, on top of the cold
+  page cache. Expect a slow first answer after any restart.

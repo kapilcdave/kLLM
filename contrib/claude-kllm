@@ -151,4 +151,18 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL="$NAME"
 unset CLAUDE_CODE_SESSION_ID CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_MESSAGING_SOCKET
 unset CLAUDE_CODE_MESSAGING_TOKEN CLAUDE_CODE_SESSION_ATTENDED CLAUDE_PID
 
+# `--exclude-dynamic-system-prompt-sections` moves the per-machine blocks
+# (cwd, env info, memory paths, git status) out of the system prompt and into
+# the first user message. Upstream offers it for cross-user prompt-cache reuse;
+# here it is what makes the server's prefix cache survive across sessions at
+# all. Without it those blocks differ every run, so the ~11k-token system
+# prompt mismatches from near its start and every new session pays the full
+# cold prefill -- thirteen minutes on this hardware. Moving them to the end of
+# the prompt leaves the expensive, identical prefix intact.
+#
+# Set KLLM_NO_STATIC_PROMPT=1 to drop the flag (it is ignored anyway if you
+# pass your own --system-prompt).
+if [[ -z ${KLLM_NO_STATIC_PROMPT:-} ]]; then
+    exec claude --exclude-dynamic-system-prompt-sections "$@"
+fi
 exec claude "$@"
