@@ -1,0 +1,299 @@
+{
+  "schema": 1,
+  "model": "/home/kapil/ai/models/small/SmolLM2-135M/SmolLM2-135M-Instruct-Q6_K.gguf",
+  "model_sha256": "2d49312e08da4b40c3f37a5de3762fc1a079c9e133497f1c5ae83b351022be5e",
+  "kllm_binary_sha256": "6f7b4e72040e20b6452e5f2036855eddd15e3c537c7fcde246188634878eb19a",
+  "llama_binary_sha256": "30e15304c1f663ce14ca522611f4364fbece639e514ace94a4b182aeedf5391d",
+  "kllm_commit": "29e7ed647f24194b6ca5fac5addcf4a42ec317b9",
+  "llama_version": "",
+  "host": {
+    "platform": "Linux-6.18.60-1-lts-x86_64-with-glibc2.44",
+    "cpu": "",
+    "logical_cpus": 8,
+    "pinned_cpus": "0-3",
+    "threads": 4,
+    "initial_state": {
+      "time": "2026-11-17T12:42:27-0800",
+      "load_1m": 3.88330078125,
+      "load_5m": 3.24609375,
+      "load_15m": 2.86181640625,
+      "governor": "powersave",
+      "ac_online": "1"
+    }
+  },
+  "method": {
+    "workload": "pp512/tg128",
+    "process_rounds": 5,
+    "repetitions_per_process": 3,
+    "order": "alternating by round",
+    "gpu": "disabled for both engines",
+    "reported_statistic": "median of process-level means",
+    "limitation": "Run an auditable, interleaved kLLM/llama.cpp CPU microbenchmark.\n\nBoth engines process the standard llama-bench workload sizes (pp512/tg128),\nuse the same four physical cores, run three timed repetitions per process,\nand alternate process order over five rounds. Results report process-level\nmeans and the median/range across processes. The engines choose their own\ninternal batching and synthetic token stream, so this is an equivalent-size\nengine microbenchmark rather than an identical-token chat-latency test.\n"
+  },
+  "commands": {
+    "kllm": [
+      "taskset",
+      "-c",
+      "0-3",
+      "/home/kapil/kllm/evals/credible-2026-11-17/smollm2-q6_k/kllm-snapshot",
+      "bench",
+      "/home/kapil/ai/models/small/SmolLM2-135M/SmolLM2-135M-Instruct-Q6_K.gguf",
+      "-p",
+      "512",
+      "-n",
+      "128",
+      "-t",
+      "4",
+      "-r",
+      "3",
+      "--gpu-layers",
+      "0"
+    ],
+    "llama.cpp": [
+      "taskset",
+      "-c",
+      "0-3",
+      "/home/kapil/ai/llama.cpp/cpu/llama-b12099/llama-bench",
+      "-m",
+      "/home/kapil/ai/models/small/SmolLM2-135M/SmolLM2-135M-Instruct-Q6_K.gguf",
+      "-p",
+      "512",
+      "-n",
+      "128",
+      "-t",
+      "4",
+      "-r",
+      "3",
+      "-ngl",
+      "0",
+      "-dev",
+      "none",
+      "-o",
+      "json"
+    ]
+  },
+  "samples": [
+    {
+      "engine": "kllm",
+      "round": 1,
+      "host_before": {
+        "time": "2026-11-17T12:42:27-0800",
+        "load_1m": 3.88330078125,
+        "load_5m": 3.24609375,
+        "load_15m": 2.86181640625,
+        "governor": "powersave",
+        "ac_online": "1"
+      },
+      "wall_seconds": 5.8514662069501355,
+      "exit_code": 0,
+      "raw_log": "1-kllm.log",
+      "pp": 667.4,
+      "pp_within_process_sd": 8.2,
+      "tg": 114.6,
+      "tg_within_process_sd": 2.2
+    },
+    {
+      "engine": "llama.cpp",
+      "round": 1,
+      "host_before": {
+        "time": "2026-11-17T12:42:35-0800",
+        "load_1m": 3.81494140625,
+        "load_5m": 3.25390625,
+        "load_15m": 2.86865234375,
+        "governor": "powersave",
+        "ac_online": "1"
+      },
+      "wall_seconds": 5.931573743000627,
+      "exit_code": 0,
+      "raw_log": "1-llama.cpp.log",
+      "pp": 642.842571,
+      "pp_within_process_sd": 73.989704,
+      "tg": 147.338107,
+      "tg_within_process_sd": 9.824489
+    },
+    {
+      "engine": "llama.cpp",
+      "round": 2,
+      "host_before": {
+        "time": "2026-11-17T12:42:43-0800",
+        "load_1m": 3.830078125,
+        "load_5m": 3.2666015625,
+        "load_15m": 2.875,
+        "governor": "powersave",
+        "ac_online": "1"
+      },
+      "wall_seconds": 6.012390370015055,
+      "exit_code": 0,
+      "raw_log": "2-llama.cpp.log",
+      "pp": 607.617187,
+      "pp_within_process_sd": 22.978805,
+      "tg": 153.243003,
+      "tg_within_process_sd": 3.158181
+    },
+    {
+      "engine": "kllm",
+      "round": 2,
+      "host_before": {
+        "time": "2026-11-17T12:42:51-0800",
+        "load_1m": 3.9169921875,
+        "load_5m": 3.30615234375,
+        "load_15m": 2.892578125,
+        "governor": "powersave",
+        "ac_online": "1"
+      },
+      "wall_seconds": 6.064379026996903,
+      "exit_code": 0,
+      "raw_log": "2-kllm.log",
+      "pp": 637.2,
+      "pp_within_process_sd": 25.4,
+      "tg": 112.1,
+      "tg_within_process_sd": 2.7
+    },
+    {
+      "engine": "kllm",
+      "round": 3,
+      "host_before": {
+        "time": "2026-11-17T12:42:59-0800",
+        "load_1m": 4.00390625,
+        "load_5m": 3.33447265625,
+        "load_15m": 2.904296875,
+        "governor": "powersave",
+        "ac_online": "1"
+      },
+      "wall_seconds": 5.968953767907806,
+      "exit_code": 0,
+      "raw_log": "3-kllm.log",
+      "pp": 647.6,
+      "pp_within_process_sd": 11.5,
+      "tg": 115.0,
+      "tg_within_process_sd": 2.7
+    },
+    {
+      "engine": "llama.cpp",
+      "round": 3,
+      "host_before": {
+        "time": "2026-11-17T12:43:07-0800",
+        "load_1m": 4.15771484375,
+        "load_5m": 3.3896484375,
+        "load_15m": 2.92724609375,
+        "governor": "powersave",
+        "ac_online": "1"
+      },
+      "wall_seconds": 6.158444366999902,
+      "exit_code": 0,
+      "raw_log": "3-llama.cpp.log",
+      "pp": 644.430823,
+      "pp_within_process_sd": 54.022954,
+      "tg": 134.063362,
+      "tg_within_process_sd": 17.420405
+    },
+    {
+      "engine": "llama.cpp",
+      "round": 4,
+      "host_before": {
+        "time": "2026-11-17T12:43:15-0800",
+        "load_1m": 3.89306640625,
+        "load_5m": 3.35986328125,
+        "load_15m": 2.92236328125,
+        "governor": "powersave",
+        "ac_online": "1"
+      },
+      "wall_seconds": 6.037821382982656,
+      "exit_code": 0,
+      "raw_log": "4-llama.cpp.log",
+      "pp": 608.111254,
+      "pp_within_process_sd": 86.372308,
+      "tg": 152.548408,
+      "tg_within_process_sd": 1.241885
+    },
+    {
+      "engine": "kllm",
+      "round": 4,
+      "host_before": {
+        "time": "2026-11-17T12:43:23-0800",
+        "load_1m": 3.98193359375,
+        "load_5m": 3.38720703125,
+        "load_15m": 2.93359375,
+        "governor": "powersave",
+        "ac_online": "1"
+      },
+      "wall_seconds": 6.471682609990239,
+      "exit_code": 0,
+      "raw_log": "4-kllm.log",
+      "pp": 616.5,
+      "pp_within_process_sd": 29.8,
+      "tg": 102.3,
+      "tg_within_process_sd": 5.7
+    },
+    {
+      "engine": "kllm",
+      "round": 5,
+      "host_before": {
+        "time": "2026-11-17T12:43:32-0800",
+        "load_1m": 4.29248046875,
+        "load_5m": 3.4736328125,
+        "load_15m": 2.966796875,
+        "governor": "powersave",
+        "ac_online": "1"
+      },
+      "wall_seconds": 6.878113212995231,
+      "exit_code": 0,
+      "raw_log": "5-kllm.log",
+      "pp": 598.2,
+      "pp_within_process_sd": 49.5,
+      "tg": 98.9,
+      "tg_within_process_sd": 19.8
+    },
+    {
+      "engine": "llama.cpp",
+      "round": 5,
+      "host_before": {
+        "time": "2026-11-17T12:43:40-0800",
+        "load_1m": 4.89794921875,
+        "load_5m": 3.63720703125,
+        "load_15m": 3.02587890625,
+        "governor": "powersave",
+        "ac_online": "1"
+      },
+      "wall_seconds": 6.154637030907907,
+      "exit_code": 0,
+      "raw_log": "5-llama.cpp.log",
+      "pp": 610.810081,
+      "pp_within_process_sd": 13.592376,
+      "tg": 152.744994,
+      "tg_within_process_sd": 3.471092
+    }
+  ],
+  "summary": {
+    "kllm": {
+      "successful_rounds": 5,
+      "pp": {
+        "median_process_mean": 637.2,
+        "mean_process_mean": 633.38,
+        "min_process_mean": 598.2,
+        "max_process_mean": 667.4
+      },
+      "tg": {
+        "median_process_mean": 112.1,
+        "mean_process_mean": 108.58,
+        "min_process_mean": 98.9,
+        "max_process_mean": 115.0
+      }
+    },
+    "llama.cpp": {
+      "successful_rounds": 5,
+      "pp": {
+        "median_process_mean": 610.810081,
+        "mean_process_mean": 622.7623832,
+        "min_process_mean": 607.617187,
+        "max_process_mean": 644.430823
+      },
+      "tg": {
+        "median_process_mean": 152.548408,
+        "mean_process_mean": 147.9875748,
+        "min_process_mean": 134.063362,
+        "max_process_mean": 153.243003
+      }
+    }
+  }
+}

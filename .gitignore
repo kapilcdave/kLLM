@@ -9,3 +9,4 @@ __pycache__/
 
 # Runtime logs from the serve unit.
 logs/
+evals/**/kllm-snapshot

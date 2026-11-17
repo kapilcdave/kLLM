@@ -36,10 +36,10 @@ against llama.cpp.
 
 Its reference machine is a Dell Precision 5520: a Xeon E3-1505M v6, 16 GiB of
 RAM and a 4 GiB Quadro M1200. On it, kLLM runs a **17.3 GiB
-Qwen3-30B-A3B model with 16 GiB of RAM**. In the latest fresh comparison,
-kLLM prefills it at 12.4 tok/s against llama.cpp's 10.9; see
-[the recorded results](evals/dell-comparison.md) for decode numbers and
-benchmark limitations.
+Qwen3-30B-A3B model with 16 GiB of RAM**. Its advantage is memory behavior,
+not universal speed: the current interleaved CPU comparison has prompt
+processing approximately tied, with llama.cpp ahead on generation. See
+[the recorded results](evals/credible-2026-11-17/).
 
 <table>
   <tr>
@@ -63,9 +63,9 @@ benchmark limitations.
   </tr>
   <tr>
     <td width="33%" valign="top">
-      <h4>⚡ Faster prefill than llama.cpp</h4>
-      1.15-1.61x on every weight type measured, float types included. Decode is
-      at parity or better on most types.
+      <h4>⚡ Competitive prompt processing</h4>
+      In the current standard-size CPU run, kLLM leads llama.cpp by 4-9% on
+      three SmolLM2 quantizations. llama.cpp leads generation and Qwen3-0.6B.
     </td>
     <td width="33%" valign="top">
       <h4>✅ Checked against llama.cpp</h4>
@@ -195,11 +195,13 @@ works:
 kllm run Qwen3-30B-A3B-Q4_K_M.gguf --chat --prompt "..." -n 400 --context 4096
 ```
 
-17.3 GiB of weights, 16 GiB of RAM. In a fresh three-round CPU comparison,
-kLLM reached **12.4 tok/s prefill** against llama.cpp's 10.9; llama.cpp led
-decode at 6.0 against kLLM's 4.8. These use equivalent workload sizes rather
-than identical token streams; exact commands, hashes, ranges and limitations
-are in [evals/dell-30b/](evals/dell-30b/). Three things matter in practice:
+17.3 GiB of weights, 16 GiB of RAM. In the current interleaved CPU comparison,
+prompt processing is approximately tied at **11.6 tok/s** for kLLM and 11.8
+for llama.cpp; llama.cpp leads generation at 6.3 against kLLM's 4.4. llama.cpp
+uses `--repack 0` so its extra repacked copy does not exhaust RAM, while kLLM
+uses its default planner. Exact commands, hashes, samples and limitations are
+in [evals/credible-2026-11-17/](evals/credible-2026-11-17/). Three things
+matter in practice:
 
 - **Let the cache warm.** The first run of a model reads experts from disk and
   lands at 4-7 tok/s; by the second or third it is at 10-11. Switching
@@ -343,37 +345,23 @@ spread.
 
 ## Performance
 
-Same machine, 4 threads, `kllm bench MODEL -p 128 -n 64 -t 4 -r 3` against
-`llama-bench -t 4 -p 128 -n 64 -r 3` (llama.cpp b12099 CPU build), tokens per
-second, best of three. The full table with model hashes and the exact commands
-is in [evals/](evals/); regenerate it with `scripts/eval_report.py`.
+The current CPU comparison uses the standard pp512/tg128 workload for small
+models, five alternating process rounds, three timed repetitions per process,
+and reports the median process mean. Both engines are pinned to the same four
+physical cores with GPU execution disabled.
 
-| Model | pp128 kLLM / llama.cpp | ratio | tg64 kLLM / llama.cpp | ratio |
+| Model | prompt kLLM / llama.cpp | ratio | generation kLLM / llama.cpp | ratio |
 |---|---|---|---|---|
-| SmolLM2-135M Q4_0 | 1145 / 750 | 1.53x | 229 / 219 | 1.05x |
-| SmolLM2-135M Q8_0 | 1060 / 658 | 1.61x | 165 / 140 | 1.18x |
-| SmolLM2-135M Q6_K | 988 / 667 | 1.48x | 165 / 145 | 1.14x |
-| SmolLM2-135M Q2_K | 1089 / 814 | 1.34x | 247 / 244 | 1.01x |
-| SmolLM2-135M Q5_K_M | 462 / 352 | 1.31x | 157 / 167 | 0.94x |
-| SmolLM2-135M f16 | 629 / 547 | 1.15x | 85.5 / 82.3 | 1.04x |
-| Qwen3-0.6B Q4_K_M | 324 / 266 | 1.22x | 48.3 / 55.2 | 0.88x |
-| Qwen3-0.6B Q8_0 | 284 / 184 | 1.54x | 36.4 / 37.0 | 0.98x |
+| SmolLM2-135M Q4_0 | 677.6 / 621.7 | 1.09x | 124.0 / 173.2 | 0.72x |
+| SmolLM2-135M Q6_K | 637.2 / 610.8 | 1.04x | 112.1 / 152.5 | 0.74x |
+| SmolLM2-135M Q8_0 | 685.9 / 631.8 | 1.09x | 111.9 / 146.1 | 0.77x |
+| Qwen3-0.6B Q4_K_M | 211.7 / 219.6 | 0.96x | 35.5 / 52.7 | 0.67x |
 
-Prefill is ahead of llama.cpp on every weight type, float ones included
-(1.11-1.65x). Decode is parity or better on most types and trails on the
-K-quants (Q4_K 0.88x); it is memory-bandwidth-bound, where prefill is
-compute-bound, which is why the two respond to different things -- a register
-tile doubled float prefill and *cost* float decode until it was gated on
-batch size.
-
-Two notes on reading these numbers. Prefill was at 65% of llama.cpp until the
-real bottleneck turned up, and it was not the kernels: at *one* thread kLLM
-already beat llama.cpp, and the packed Q4_0 kernel runs near the
-`vpmaddubsw` port limit. Activation quantization was running on the calling
-thread while the workers idled — 71% of a 576x1536 matmul. And this machine
-usually has other work on it, so `kllm bench` reports the best run rather than
-the mean (interference can only ever slow a run down) and comparisons against
-llama.cpp are interleaved in the same window.
+kLLM has a small prompt-processing lead on the tested SmolLM2 formats;
+llama.cpp leads generation and both Qwen3-0.6B metrics. These are
+equivalent-size engine microbenchmarks, not identical-token chat trials. The
+full report includes the 30B run, exact commands, hashes, every sample, host
+load and limitations: [evals/credible-2026-11-17/](evals/credible-2026-11-17/).
 
 `kllm bench --profile` prints a per-phase breakdown.
 

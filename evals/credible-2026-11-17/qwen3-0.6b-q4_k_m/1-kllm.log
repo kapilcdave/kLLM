@@ -1,0 +1,10 @@
+model:      /home/kapil/ai/models/small/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf
+types:      Q4_K, Q6_K
+hardware:   Intel(R) Xeon(R) CPU E3-1505M v6 @ 3.00GHz | 4 threads | kernels avx2+fma+f16c
+command:    kllm bench /home/kapil/ai/models/small/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf -p 512 -n 128 -t 4 -r 3 --gpu-layers 0
+pp512:         228.4 tok/s best  (mean 221.6 ± 4.8)
+tg128:           38.1 tok/s best  (mean 37.3 ± 0.7), ~13.9 GiB/s of weights
+
+kllm: Qwen3-0.6B | 28 layers | ctx 641 | 4 threads | kernels avx2+fma+f16c
+kllm: plan: weights 373 MiB mapped, KV cache 70 MiB, scratch 41 MiB, execution CPU
+kllm: loaded in 0.47 s

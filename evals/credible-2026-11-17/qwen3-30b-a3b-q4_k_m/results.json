@@ -1,0 +1,225 @@
+{
+  "schema": 1,
+  "model": "/home/kapil/ai/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Q4_K_M.gguf",
+  "model_sha256": "9f1a24700a339b09c06009b729b5c809e0b64c213b8af5b711b3dbdfd0c5ba48",
+  "kllm_binary_sha256": "6f7b4e72040e20b6452e5f2036855eddd15e3c537c7fcde246188634878eb19a",
+  "llama_binary_sha256": "30e15304c1f663ce14ca522611f4364fbece639e514ace94a4b182aeedf5391d",
+  "kllm_commit": "29e7ed647f24194b6ca5fac5addcf4a42ec317b9",
+  "llama_version": "",
+  "host": {
+    "platform": "Linux-6.18.60-1-lts-x86_64-with-glibc2.44",
+    "cpu": "",
+    "logical_cpus": 8,
+    "pinned_cpus": "0-3",
+    "threads": 4,
+    "initial_state": {
+      "time": "2026-11-17T12:48:22-0800",
+      "load_1m": 2.56298828125,
+      "load_5m": 3.7001953125,
+      "load_15m": 3.28076171875,
+      "governor": "powersave",
+      "ac_online": "1"
+    }
+  },
+  "method": {
+    "workload": "pp128/tg64",
+    "process_rounds": 3,
+    "repetitions_per_process": 2,
+    "order": "alternating by round",
+    "gpu": "disabled for both engines",
+    "reported_statistic": "median of process-level means",
+    "limitation": "Run an auditable, interleaved kLLM/llama.cpp CPU microbenchmark.\n\nBoth engines process the standard llama-bench workload sizes (pp512/tg128),\nuse the same four physical cores, run three timed repetitions per process,\nand alternate process order over five rounds. Results report process-level\nmeans and the median/range across processes. The engines choose their own\ninternal batching and synthetic token stream, so this is an equivalent-size\nengine microbenchmark rather than an identical-token chat-latency test.\n"
+  },
+  "commands": {
+    "kllm": [
+      "taskset",
+      "-c",
+      "0-3",
+      "/home/kapil/kllm/evals/credible-2026-11-17/qwen3-30b-a3b-q4_k_m/kllm-snapshot",
+      "bench",
+      "/home/kapil/ai/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Q4_K_M.gguf",
+      "-p",
+      "128",
+      "-n",
+      "64",
+      "-t",
+      "4",
+      "-r",
+      "2",
+      "--gpu-layers",
+      "0"
+    ],
+    "llama.cpp": [
+      "taskset",
+      "-c",
+      "0-3",
+      "/home/kapil/ai/llama.cpp/cpu/llama-b12099/llama-bench",
+      "-m",
+      "/home/kapil/ai/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Q4_K_M.gguf",
+      "-p",
+      "128",
+      "-n",
+      "64",
+      "-t",
+      "4",
+      "-r",
+      "2",
+      "-ngl",
+      "0",
+      "-dev",
+      "none",
+      "-o",
+      "json",
+      "--repack",
+      "0"
+    ]
+  },
+  "samples": [
+    {
+      "engine": "kllm",
+      "round": 1,
+      "host_before": {
+        "time": "2026-11-17T12:48:22-0800",
+        "load_1m": 2.56298828125,
+        "load_5m": 3.7001953125,
+        "load_15m": 3.28076171875,
+        "governor": "powersave",
+        "ac_online": "1"
+      },
+      "wall_seconds": 82.633953145938,
+      "exit_code": 0,
+      "raw_log": "1-kllm.log",
+      "pp": 8.1,
+      "pp_within_process_sd": 0.6,
+      "tg": 3.3,
+      "tg_within_process_sd": 0.8
+    },
+    {
+      "engine": "llama.cpp",
+      "round": 1,
+      "host_before": {
+        "time": "2026-11-17T12:49:50-0800",
+        "load_1m": 5.0966796875,
+        "load_5m": 4.3046875,
+        "load_15m": 3.53662109375,
+        "governor": "powersave",
+        "ac_online": "1"
+      },
+      "wall_seconds": 77.44112661399413,
+      "exit_code": 0,
+      "raw_log": "1-llama.cpp.log",
+      "pp": 11.778925,
+      "pp_within_process_sd": 0.503626,
+      "tg": 5.848474,
+      "tg_within_process_sd": 0.55031
+    },
+    {
+      "engine": "llama.cpp",
+      "round": 2,
+      "host_before": {
+        "time": "2026-11-17T12:51:12-0800",
+        "load_1m": 7.49951171875,
+        "load_5m": 5.32763671875,
+        "load_15m": 3.970703125,
+        "governor": "powersave",
+        "ac_online": "1"
+      },
+      "wall_seconds": 72.79014361195732,
+      "exit_code": 0,
+      "raw_log": "2-llama.cpp.log",
+      "pp": 12.843586,
+      "pp_within_process_sd": 0.03919,
+      "tg": 6.253663,
+      "tg_within_process_sd": 0.61337
+    },
+    {
+      "engine": "kllm",
+      "round": 2,
+      "host_before": {
+        "time": "2026-11-17T12:52:30-0800",
+        "load_1m": 6.62841796875,
+        "load_5m": 5.58544921875,
+        "load_15m": 4.1767578125,
+        "governor": "powersave",
+        "ac_online": "1"
+      },
+      "wall_seconds": 55.69861070602201,
+      "exit_code": 0,
+      "raw_log": "2-kllm.log",
+      "pp": 11.6,
+      "pp_within_process_sd": 1.6,
+      "tg": 4.4,
+      "tg_within_process_sd": 1.0
+    },
+    {
+      "engine": "kllm",
+      "round": 3,
+      "host_before": {
+        "time": "2026-11-17T12:53:31-0800",
+        "load_1m": 6.2158203125,
+        "load_5m": 5.7109375,
+        "load_15m": 4.31201171875,
+        "governor": "powersave",
+        "ac_online": "1"
+      },
+      "wall_seconds": 53.95902093395125,
+      "exit_code": 0,
+      "raw_log": "3-kllm.log",
+      "pp": 11.8,
+      "pp_within_process_sd": 0.3,
+      "tg": 4.5,
+      "tg_within_process_sd": 0.3
+    },
+    {
+      "engine": "llama.cpp",
+      "round": 3,
+      "host_before": {
+        "time": "2026-11-17T12:54:30-0800",
+        "load_1m": 5.548828125,
+        "load_5m": 5.630859375,
+        "load_15m": 4.36767578125,
+        "governor": "powersave",
+        "ac_online": "1"
+      },
+      "wall_seconds": 75.38401307503227,
+      "exit_code": 0,
+      "raw_log": "3-llama.cpp.log",
+      "pp": 10.889667,
+      "pp_within_process_sd": 0.748823,
+      "tg": 6.364531,
+      "tg_within_process_sd": 0.768466
+    }
+  ],
+  "summary": {
+    "kllm": {
+      "successful_rounds": 3,
+      "pp": {
+        "median_process_mean": 11.6,
+        "mean_process_mean": 10.5,
+        "min_process_mean": 8.1,
+        "max_process_mean": 11.8
+      },
+      "tg": {
+        "median_process_mean": 4.4,
+        "mean_process_mean": 4.066666666666666,
+        "min_process_mean": 3.3,
+        "max_process_mean": 4.5
+      }
+    },
+    "llama.cpp": {
+      "successful_rounds": 3,
+      "pp": {
+        "median_process_mean": 11.778925,
+        "mean_process_mean": 11.837392666666666,
+        "min_process_mean": 10.889667,
+        "max_process_mean": 12.843586
+      },
+      "tg": {
+        "median_process_mean": 6.253663,
+        "mean_process_mean": 6.155556000000001,
+        "min_process_mean": 5.848474,
+        "max_process_mean": 6.364531
+      }
+    }
+  }
+}
