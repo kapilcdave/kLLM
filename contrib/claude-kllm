@@ -161,16 +161,24 @@ unset CLAUDE_CODE_MESSAGING_TOKEN CLAUDE_CODE_SESSION_ATTENDED CLAUDE_PID
 
 # `--exclude-dynamic-system-prompt-sections` moves the per-machine blocks
 # (cwd, env info, memory paths, git status) out of the system prompt and into
-# the first user message. Upstream offers it for cross-user prompt-cache reuse;
-# here it is what makes the server's prefix cache survive across sessions at
-# all. Without it those blocks differ every run, so the ~11k-token system
-# prompt mismatches from near its start and every new session pays the full
-# cold prefill -- thirteen minutes on this hardware. Moving them to the end of
-# the prompt leaves the expensive, identical prefix intact.
+# the first user message. That is the only way the server's prefix cache
+# survives across sessions -- otherwise those blocks differ every run, the
+# ~11k-token prompt mismatches from near its start, and each new session pays
+# a full cold prefill. With it, a fresh session measured 17 s instead of 739.
 #
-# Set KLLM_NO_STATIC_PROMPT=1 to drop the flag (it is ignored anyway if you
-# pass your own --system-prompt).
-if [[ -z ${KLLM_NO_STATIC_PROMPT:-} ]]; then
+# It is nevertheless OFF by default, because on a 2-bit model it costs more
+# than it buys. Moving those blocks into the first user message puts the real
+# instruction behind a wall of environment text, and the 35B at Q2_K follows
+# the wall: asked to "Reply with exactly: ..." it answered "What would you
+# like me to help you with?", and on the next session invented a task about a
+# "verify-branch script mentioned in the system reminder", then ran
+# ToolSearch, Read, find and `ls -la /tmp/` -- whose 14,621 tokens of output
+# it fed back into the context. Without the flag the same prompt is answered
+# correctly. A fast wrong answer is not worth a slow right one.
+#
+# KLLM_STATIC_PROMPT=1 turns it on, which is worth doing on a 4-bit model
+# where instruction-following holds up. Try it and read the replies.
+if [[ -n ${KLLM_STATIC_PROMPT:-} ]]; then
     exec claude --exclude-dynamic-system-prompt-sections "$@"
 fi
 exec claude "$@"

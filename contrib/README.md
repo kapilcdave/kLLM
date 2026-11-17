@@ -79,8 +79,9 @@ Measured on a 4-core laptop with 16 GiB of RAM, no usable GPU:
 
 ## The flag that decides whether this is usable daily
 
-`claude-kllm` passes `--exclude-dynamic-system-prompt-sections`, and on this
-setup that is not a micro-optimisation.
+`claude-kllm` supports `--exclude-dynamic-system-prompt-sections` behind
+`KLLM_STATIC_PROMPT=1`, and the reason it is not the default is worth reading
+before you turn it on.
 
 Claude Code's system prompt and tool definitions come to about **11,000
 tokens**, which is a ~13 minute cold prefill here. By default that prompt also
@@ -92,9 +93,19 @@ prompt was still prefilling past 600 s.
 
 The flag moves those blocks into the first user message instead. The expensive
 part of the prompt becomes byte-identical across sessions, the prefix cache
-hits, and only the genuinely new tail is read. Upstream offers it for
-cross-user prompt-cache reuse on the API; here it is the difference between
-"slow once" and "slow every time".
+hits, and only the genuinely new tail is read: a fresh session measured **17 s
+instead of 739**.
+
+**It is off by default anyway, because on a 2-bit model it costs correctness.**
+Putting those blocks in the first user message leaves the real instruction
+behind a wall of environment text, and the 35B at Q2_K follows the wall. Asked
+to "Reply with exactly: ..." it answered *"What would you like me to help you
+with?"*; on the next session it invented a task about a "verify-branch script
+mentioned in the system reminder" and ran `ToolSearch`, `Read`, `find` and
+`ls -la /tmp/`, feeding that command's 14,621 tokens of output back into its
+own context. Without the flag the same prompt is answered correctly. Turn it
+on with `KLLM_STATIC_PROMPT=1` on a 4-bit model, where instruction-following
+holds up -- and read the replies rather than just the timings.
 
 On a hybrid model the flag is necessary but not sufficient, because a *partial*
 prefix match is not cheap there. A dense model's KV cache rewinds for free, but
