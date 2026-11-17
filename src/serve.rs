@@ -428,7 +428,6 @@ impl Style {
         }
         out.push_str("<|im_end|>\n");
     }
-
 }
 
 impl Engine {
@@ -573,11 +572,31 @@ impl Engine {
 
         // Reuse whatever of the session still matches. One token must always
         // be forwarded, because sampling needs logits to sample from.
+        let held = self.cached.len();
         let shared = common_prefix(&self.cached, &tokens).min(tokens.len() - 1);
         self.session.truncate(shared);
         self.cached.truncate(shared);
         self.reused = shared;
         self.fed = tokens.len() - shared;
+
+        // A rewind means this request shares a prefix with the last one and
+        // then diverges -- which is exactly the boundary between the static
+        // part of a client's prompt and its per-session part, and that
+        // boundary is the same from one session to the next.
+        //
+        // On a recurrent model the rewind costs a replay of everything below
+        // it, and that replay is about to happen anyway inside the first
+        // forward. Forcing it now and keeping the state makes it the last
+        // time: the next session that diverges here resumes instead. Measured
+        // on an 11k-token prompt, a fresh session reported "8496 reused + 2386
+        // read" and still took 739 s, because the 8496 were replayed.
+        if shared > 0 && shared < held && self.session.checkpoint_pos() != Some(shared) {
+            if let Err(e) = self.session.materialize() {
+                self.reset();
+                return Err(Fail::Engine(e.to_string()));
+            }
+            self.session.checkpoint();
+        }
 
         // Announce the message before prefilling rather than after.
         //

@@ -438,7 +438,30 @@ struct SsmState {
     mixed: Vec<f32>,
 }
 
+/// The part of a recurrent layer's state that places it in the stream: the
+/// convolution ring and the delta-rule matrix.
+///
+/// `SsmState::mixed` is scratch for the step being computed and carries
+/// nothing forward, so it is deliberately not saved.
+#[derive(Clone)]
+struct SsmSnapshot {
+    conv: Vec<f32>,
+    matrix: Vec<f32>,
+}
+
 impl SsmState {
+    fn snapshot(&self) -> SsmSnapshot {
+        SsmSnapshot {
+            conv: self.conv.clone(),
+            matrix: self.matrix.clone(),
+        }
+    }
+
+    fn restore(&mut self, saved: &SsmSnapshot) {
+        self.conv.copy_from_slice(&saved.conv);
+        self.matrix.copy_from_slice(&saved.matrix);
+    }
+
     fn new(c: SsmConfig) -> Self {
         let width = 2 * c.group_count * c.state_size + c.inner_size;
         Self {
@@ -1250,6 +1273,10 @@ pub struct Session<'m> {
     all_logits: Vec<f32>,
     ssm_states: Vec<Option<SsmState>>,
     history: Vec<u32>,
+    /// Where a pending replay must restart from: a checkpoint's position, or
+    /// zero when the recurrence has to be rebuilt from nothing.
+    replay_from: usize,
+    checkpoint: Option<Checkpoint>,
     replay: bool,
     q_full: Vec<f32>,
     attn_gate: Vec<f32>,
@@ -1261,6 +1288,18 @@ pub struct Session<'m> {
     pub profiler: Profiler,
     #[cfg(feature = "cuda")]
     gpu: Option<gpu::GpuState>,
+}
+
+/// A recurrent state saved at a known position.
+///
+/// A dense model's KV cache rewinds for free -- the rows below the target are
+/// still valid -- but a recurrence has no per-position record, so rewinding it
+/// otherwise means replaying the stream from the beginning. Keeping one
+/// snapshot turns the rewind a chat client performs on every fresh session
+/// into a resume.
+struct Checkpoint {
+    pos: usize,
+    states: Vec<Option<SsmSnapshot>>,
 }
 
 impl<'m> Session<'m> {
@@ -1314,6 +1353,8 @@ impl<'m> Session<'m> {
                 })
                 .collect(),
             history: Vec::new(),
+            replay_from: 0,
+            checkpoint: None,
             replay: false,
             q_full: vec![0.0; if c.attn_gated { b * 2 * c.q_dim() } else { 0 }],
             attn_gate: vec![0.0; if c.attn_gated { b * c.q_dim() } else { 0 }],
@@ -1412,18 +1453,92 @@ impl<'m> Session<'m> {
     }
 
     /// Discard positions `>= pos` so generation can resume from `pos`.
-    /// Recurrent models rebuild a retained prefix on the next forward pass;
-    /// resetting to zero clears the convolution and DeltaNet state immediately.
+    ///
+    /// For a dense model this is just a move: the KV rows below `pos` are
+    /// still valid. A recurrent model has no per-position record of its state,
+    /// so the recurrence is rebuilt on the next forward pass -- from a
+    /// [`Session::checkpoint`] if one sits at or below `pos`, and otherwise
+    /// from the beginning of the stream.
     pub fn truncate(&mut self, pos: usize) {
         let next = self.pos.min(pos);
         if next < self.pos && self.model.config.ssm.is_some() {
-            self.history.truncate(next);
-            for state in self.ssm_states.iter_mut().flatten() {
-                state.reset();
+            // Positions at or after `next` are being discarded and may be
+            // replaced by different tokens, so a checkpoint among them no
+            // longer describes any state this session will have.
+            if self.checkpoint.as_ref().is_some_and(|c| c.pos > next) {
+                self.checkpoint = None;
             }
-            self.replay = next != 0;
+            // Taken and put back so the snapshot can be read while the live
+            // states are written.
+            self.replay_from = match self.checkpoint.take() {
+                Some(saved) => {
+                    for (state, snapshot) in self.ssm_states.iter_mut().zip(&saved.states) {
+                        if let (Some(state), Some(snapshot)) = (state.as_mut(), snapshot.as_ref()) {
+                            state.restore(snapshot);
+                        }
+                    }
+                    let from = saved.pos;
+                    self.checkpoint = Some(saved);
+                    from
+                }
+                None => {
+                    for state in self.ssm_states.iter_mut().flatten() {
+                        state.reset();
+                    }
+                    0
+                }
+            };
+            self.history.truncate(next);
+            self.replay = next != self.replay_from;
         }
         self.pos = next;
+    }
+
+    /// Save the recurrent state at the current position, so a later rewind to
+    /// it resumes rather than replaying the stream.
+    ///
+    /// Costs a copy of every recurrent layer's convolution ring and delta-rule
+    /// matrix -- about 66 MiB on a 40-block hybrid, against the minutes a
+    /// replay of a long prefix costs. Only one is kept: the useful position is
+    /// wherever a client's prompt stops being identical from one session to
+    /// the next, and that boundary is stable.
+    ///
+    /// Does nothing when a replay is still pending, since the live state is
+    /// not the state at this position yet; call [`Session::materialize`] first.
+    pub fn checkpoint(&mut self) {
+        if self.model.config.ssm.is_none() || self.replay {
+            return;
+        }
+        self.checkpoint = Some(Checkpoint {
+            pos: self.pos,
+            states: self
+                .ssm_states
+                .iter()
+                .map(|state| state.as_ref().map(SsmState::snapshot))
+                .collect(),
+        });
+    }
+
+    /// The position of the saved checkpoint, if there is one.
+    pub fn checkpoint_pos(&self) -> Option<usize> {
+        self.checkpoint.as_ref().map(|c| c.pos)
+    }
+
+    /// Carry out a pending replay without feeding new tokens, leaving the
+    /// recurrent state live at the current position.
+    pub fn materialize(&mut self) -> Result<(), ModelError> {
+        if !self.replay {
+            return Ok(());
+        }
+        let from = self.replay_from.min(self.history.len());
+        let prefix = self.history[from..].to_vec();
+        self.pos = from;
+        self.history.truncate(from);
+        self.replay = false;
+        if !prefix.is_empty() {
+            self.forward(&prefix, Logits::Last)?;
+        }
+        Ok(())
     }
 
     /// Feed `tokens`, returning logits for the last one (or for every token
@@ -1442,11 +1557,7 @@ impl<'m> Session<'m> {
             });
         }
         if self.replay {
-            let prefix = self.history.clone();
-            self.pos = 0;
-            self.history.clear();
-            self.replay = false;
-            self.forward(&prefix, Logits::Last)?;
+            self.materialize()?;
         }
         let chunk_count = tokens.len().div_ceil(self.max_batch);
         if want == Logits::All {
