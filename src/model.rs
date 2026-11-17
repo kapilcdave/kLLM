@@ -1012,7 +1012,7 @@ impl<'m> Session<'m> {
             moe_proj: vec![0.0; c.n_embd],
             moe_x: vec![0.0; if c.moe.is_some() { b * c.n_embd } else { 0 }],
             moe_y: vec![0.0; if c.moe.is_some() { b * c.n_embd } else { 0 }],
-            scores: vec![0.0; b * c.n_head * context],
+            scores: vec![0.0; crate::pool::global().threads() * score_rows_per_worker(c) * context],
             rope: vec![(0.0, 0.0); b * c.rope_dim / 2],
             logits: vec![0.0; b * c.n_vocab],
             all_logits: Vec::new(),
@@ -1063,15 +1063,20 @@ impl<'m> Session<'m> {
         let context = context.max(1) as u64;
         let b = max_batch.clamp(1, context as usize) as u64;
         let kv = 2 * 2 * c.n_layer as u64 * context * c.kv_dim() as u64;
-        let f32s = b
-            * (3 * c.n_embd as u64
-                + 2 * c.q_dim() as u64
-                + 2 * c.kv_dim() as u64
-                + 2 * c.n_ff as u64
-                + c.n_head as u64 * context
-                + c.rope_dim as u64
-                + c.n_vocab as u64);
-        (kv, f32s * 4)
+        let per_token = 3 * c.n_embd as u64
+            + 2 * c.q_dim() as u64
+            + 2 * c.kv_dim() as u64
+            + 2 * c.ffn_width() as u64
+            + c.rope_dim as u64
+            + c.n_vocab as u64;
+        // Attention's score rows are sized per worker, not per token: a long
+        // context would otherwise make this the dominant allocation.
+        let scores =
+            crate::pool::global().threads() as u64 * score_rows_per_worker(c) as u64 * context;
+        let routed = c
+            .moe
+            .map_or(0, |_| 2 * b * c.n_embd as u64 + c.n_embd as u64);
+        (kv, (b * per_token + scores + routed) * 4)
     }
 
     /// Discard positions `>= pos` so generation can resume from `pos`.
@@ -1253,7 +1258,8 @@ impl<'m> Session<'m> {
             let attn = OutPtr(self.attn.as_mut_ptr());
             let scores_base = OutPtr(self.scores.as_mut_ptr());
             let blocks = n.div_ceil(query_block);
-            crate::pool::global().for_each(blocks * c.n_head_kv, |task| {
+            let rows_per_worker = score_rows_per_worker(c);
+            crate::pool::global().for_each_on(blocks * c.n_head_kv, |worker, task| {
                 let (block, kv_head) = (task / c.n_head_kv, task % c.n_head_kv);
                 let i0 = block * query_block;
                 let i1 = (i0 + query_block).min(n);
@@ -1265,9 +1271,16 @@ impl<'m> Session<'m> {
                 let out = |i: usize, h: usize| unsafe {
                     std::slice::from_raw_parts_mut(attn.at(i * qd + h * hd), hd)
                 };
+                // Scores live in this worker's slot, not at an index
+                // derived from the token: only `threads` tasks run at once,
+                // so the buffer is sized for that rather than for the batch
+                // (see `score_rows_per_worker`). The row for a (token, head)
+                // is its position within this block.
                 let row = |i: usize, h: usize| unsafe {
+                    let local = (i - i0) * group + (h - kv_head * group);
+                    debug_assert!(local < rows_per_worker);
                     std::slice::from_raw_parts_mut(
-                        scores_base.at((i * c.n_head + h) * context),
+                        scores_base.at((worker * rows_per_worker + local) * context),
                         context,
                     )
                 };
@@ -1661,6 +1674,20 @@ impl OutPtr {
     }
 }
 
+/// Score rows one worker can have in flight: the widest query block times
+/// the query heads sharing a KV head.
+///
+/// Attention keeps a row of scores per (query token, head) while it
+/// softmaxes, and a row is as long as the context. Sizing that by the batch
+/// is what made a long context impossible -- 256 tokens by 32 heads by 128k
+/// positions is 4.3 GiB of scratch. Only `threads` tasks run at once, so a
+/// per-worker slot of this many rows is enough, which is a few hundred
+/// megabytes instead.
+fn score_rows_per_worker(config: &Config) -> usize {
+    let group = config.n_head / config.n_head_kv.max(1);
+    widest_query_block(config) * group
+}
+
 /// Query tokens per attention task.
 ///
 /// A block reads each KV-cache row once and shares it across every query in
@@ -1672,20 +1699,28 @@ impl OutPtr {
 /// So: the largest block whose queries and output accumulators fit in half of
 /// a 32 KiB L1, and never more than leaves about two tasks per thread.
 fn query_block(config: &Config, tokens: usize, threads: usize) -> usize {
+    let by_threads = (tokens * config.n_head_kv / (2 * threads.max(1))).max(1);
+    widest_query_block(config)
+        .min(by_threads)
+        .min(tokens.max(1))
+}
+
+/// The largest block `query_block` can ever return for this model, whatever
+/// the batch. `score_rows_per_worker` sizes attention's scratch from this,
+/// so the two must not disagree -- including under the override.
+fn widest_query_block(config: &Config) -> usize {
     if let Some(forced) = std::env::var("KLLM_QUERY_BLOCK")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
     {
-        return forced.min(tokens.max(1));
+        return forced;
     }
-    let group = config.n_head / config.n_head_kv;
+    let group = config.n_head / config.n_head_kv.max(1);
     // Each query in the block needs one query vector and one output
     // accumulator per query head in the group, both f32.
     let per_query = 2 * group * config.head_dim * 4;
-    let by_cache = (16 * 1024 / per_query.max(1)).max(1);
-    let by_threads = (tokens * config.n_head_kv / (2 * threads.max(1))).max(1);
-    by_cache.min(by_threads).min(tokens.max(1))
+    (16 * 1024 / per_query.max(1)).max(1)
 }
 
 /// Optional log of which experts each token routed to.
