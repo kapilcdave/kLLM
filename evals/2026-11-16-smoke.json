@@ -1,0 +1,22 @@
+[
+ {
+  "name": "SmolLM2-135M-Instruct-Q4_0.gguf",
+  "sha": "bcc3af2849ad",
+  "mib": 87.63607788085938,
+  "pp": 1244.5,
+  "tg": 214.1,
+  "pp_ref": 828.63,
+  "tg_ref": 217.39,
+  "ppl": 28.4413,
+  "ppl_ref": 28.4352,
+  "reference": "SmolLM2-135M-Instruct-f16.gguf",
+  "kl_mean": null,
+  "kl_median": null,
+  "kl_p99": null,
+  "top1": null,
+  "kl_mean_ref": 0.148069,
+  "kl_median_ref": 0.103696,
+  "kl_p99_ref": 0.899173,
+  "top1_ref": 81.078
+ }
+]

@@ -59,9 +59,7 @@ impl Value {
     /// A non-negative integer, rejecting fractions, NaN and overflow.
     pub fn as_usize(&self) -> Option<usize> {
         match self {
-            Self::Number(n) if n.is_finite() && *n >= 0.0 && n.fract() == 0.0 => {
-                Some(*n as usize)
-            }
+            Self::Number(n) if n.is_finite() && *n >= 0.0 && n.fract() == 0.0 => Some(*n as usize),
             _ => None,
         }
     }
@@ -205,10 +203,7 @@ impl<'a> Parser<'a> {
             self.at += 1;
             Ok(())
         } else {
-            Err(format!(
-                "expected {:?} at byte {}",
-                byte as char, self.at
-            ))
+            Err(format!("expected {:?} at byte {}", byte as char, self.at))
         }
     }
 

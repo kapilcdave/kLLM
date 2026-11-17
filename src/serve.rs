@@ -216,8 +216,11 @@ fn text_of(content: &Value) -> String {
                     // A local text model cannot see these. Saying so beats
                     // dropping them silently and leaving the model to answer
                     // a question about an image it was never shown.
-                    Some("image") => out.push_str("\n[an image was attached; this model cannot read images]"),
-                    Some("document") => out.push_str("\n[a document was attached; this model cannot read documents]"),
+                    Some("image") => {
+                        out.push_str("\n[an image was attached; this model cannot read images]")
+                    }
+                    Some("document") => out
+                        .push_str("\n[a document was attached; this model cannot read documents]"),
                     _ => {}
                 }
             }
@@ -246,17 +249,17 @@ fn render_tools(tools: &[Value], out: &mut String) {
             .field("input_schema")
             .cloned()
             .unwrap_or_else(|| object([("type", string("object"))]));
-        let signature = object([(
-            "type",
-            string("function"),
-        ), (
-            "function",
-            object([
-                ("name", string(name)),
-                ("description", string(description)),
-                ("parameters", parameters),
-            ]),
-        )]);
+        let signature = object([
+            ("type", string("function")),
+            (
+                "function",
+                object([
+                    ("name", string(name)),
+                    ("description", string(description)),
+                    ("parameters", parameters),
+                ]),
+            ),
+        ]);
         out.push('\n');
         out.push_str(&signature.to_json());
     }
@@ -353,7 +356,12 @@ impl Engine {
                 let call = object([
                     (
                         "name",
-                        string(block.get("name").and_then(Value::as_str).unwrap_or_default()),
+                        string(
+                            block
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        ),
                     ),
                     (
                         "arguments",
@@ -707,12 +715,11 @@ impl Buffered {
             Delta::Prompt(n) => self.input_tokens = n,
             Delta::Text(chunk) => match self.text {
                 Some(at) => {
-                    if let Value::Object(fields) = &mut self.blocks[at] {
-                        if let Some((_, Value::String(s))) =
+                    if let Value::Object(fields) = &mut self.blocks[at]
+                        && let Some((_, Value::String(s))) =
                             fields.iter_mut().find(|(k, _)| k == "text")
-                        {
-                            s.push_str(chunk);
-                        }
+                    {
+                        s.push_str(chunk);
                     }
                 }
                 None => {
@@ -895,10 +902,7 @@ impl Streamed<'_> {
                             "delta",
                             object([
                                 ("stop_reason", string(stop_reason)),
-                                (
-                                    "stop_sequence",
-                                    stop_sequence.map_or(Value::Null, string),
-                                ),
+                                ("stop_sequence", stop_sequence.map_or(Value::Null, string)),
                             ]),
                         ),
                         ("usage", object([("output_tokens", count(output_tokens))])),
@@ -1037,8 +1041,8 @@ fn read_chunked_body(reader: &mut BufReader<TcpStream>) -> io::Result<Vec<u8>> {
         }
         // A chunk size may carry extensions after a semicolon.
         let size = line.trim().split(';').next().unwrap_or("0");
-        let size = usize::from_str_radix(size, 16)
-            .map_err(|_| io::Error::other("bad chunk size"))?;
+        let size =
+            usize::from_str_radix(size, 16).map_err(|_| io::Error::other("bad chunk size"))?;
         if size == 0 {
             // Consume the trailer section.
             loop {
@@ -1104,7 +1108,9 @@ pub fn serve(engine: Engine, options: Options) -> Result<(), String> {
 fn handle_connection(stream: TcpStream, engine: &Mutex<Engine>, options: &Options) {
     // SSE deltas are small and latency is the whole point of streaming.
     let _ = stream.set_nodelay(true);
-    let Ok(clone) = stream.try_clone() else { return };
+    let Ok(clone) = stream.try_clone() else {
+        return;
+    };
     let mut reader = BufReader::new(clone);
     let mut out = stream;
     loop {
@@ -1217,7 +1223,9 @@ fn count_tokens(
             write_response(
                 out,
                 "200 OK",
-                object([("input_tokens", count(tokens))]).to_json().as_bytes(),
+                object([("input_tokens", count(tokens))])
+                    .to_json()
+                    .as_bytes(),
             )
         }
         Err(e) => {
@@ -1381,8 +1389,8 @@ mod tests {
     #[test]
     fn text_comes_from_either_content_shape() {
         assert_eq!(text_of(&string("hi")), "hi");
-        let blocks = Value::parse(r#"[{"type":"text","text":"a"},{"type":"text","text":"b"}]"#)
-            .unwrap();
+        let blocks =
+            Value::parse(r#"[{"type":"text","text":"a"},{"type":"text","text":"b"}]"#).unwrap();
         assert_eq!(text_of(&blocks), "a\nb");
     }
 
@@ -1411,8 +1419,14 @@ mod tests {
             output_tokens: 2,
         });
         let json = buffered.finish("msg_1", "local").to_json();
-        assert!(json.contains(r#""content":[{"type":"text","text":"Hello"}]"#), "{json}");
-        assert!(json.contains(r#""input_tokens":7,"output_tokens":2"#), "{json}");
+        assert!(
+            json.contains(r#""content":[{"type":"text","text":"Hello"}]"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""input_tokens":7,"output_tokens":2"#),
+            "{json}"
+        );
         assert!(json.contains(r#""stop_reason":"end_turn""#), "{json}");
     }
 
@@ -1433,7 +1447,12 @@ mod tests {
         });
         let json = buffered.finish("msg_1", "local").to_json();
         // Three blocks, and the tool input is an object rather than a string.
-        assert!(json.contains(r#"{"type":"tool_use","id":"toolu_x","name":"Read","input":{"path":"a"}}"#), "{json}");
+        assert!(
+            json.contains(
+                r#"{"type":"tool_use","id":"toolu_x","name":"Read","input":{"path":"a"}}"#
+            ),
+            "{json}"
+        );
         assert!(json.contains(r#"{"type":"text","text":"done"}"#), "{json}");
     }
 

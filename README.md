@@ -116,6 +116,7 @@ kllm inspect MODEL.gguf [--tensors]
 kllm plan-model MODEL.gguf --vram-gib N [--context N]
 kllm run MODEL.gguf --prompt TEXT [-n N] [--chat] [--system TEXT] [--temp T] [--no-think] ...
 kllm chat MODEL.gguf
+kllm serve MODEL.gguf [--host 127.0.0.1] [--port 8787] [--context N] [--api-key KEY]
 kllm perplexity MODEL.gguf --file TEXT [--context 512] [--chunks N]
 kllm compare REFERENCE.gguf TEST.gguf --file TEXT [--context 512] [--chunks N]
 kllm bench MODEL.gguf [-p 128] [-n 64] [--profile]
@@ -126,11 +127,16 @@ kllm devices
 last N blocks run on the GPU, and N at or above the block count also moves
 the output head, as with llama.cpp. `--gpu-layers auto` lets the planner
 place as many blocks as fit in the GPU's free memory. It is off by default.
-On the reference laptop the M1200 is clock-limited to 287 MHz on its 65 W
-charger, and the CPU is faster: SmolLM2-135M Q4_0 decodes at 215 tok/s on
-the CPU against 37 on the GPU, and Qwen3-0.6B Q4_K_M at 46 against 10.5. At the
-GPU's full 1150 MHz that balance should change. Re-measure with the 130 W
-charger before relying on it.
+On the reference laptop the M1200 is clock-limited to 287 MHz of its 1150,
+and the CPU is faster by a wide margin: SmolLM2-135M Q4_0 decodes at 215
+tok/s on the CPU against 37 on the GPU, and for Qwen3-0.6B Q4_K_M with all
+28 blocks and the head offloaded, prefill is 308 tok/s on the CPU against
+24.8 and decode 50.6 against 10.9. The clamp is not a battery-saving
+decision that going on mains undoes -- `nvidia-smi` reports `HW Slowdown:
+Active` with AC online and at idle, and the memory clock still runs at its
+full 2505 MHz, so the card is instruction-starved rather than
+bandwidth-starved. At the GPU's full clock that balance should change.
+Re-measure if a charger the machine accepts at more than 65 W ever turns up.
 
 `run` prints its memory plan before allocating anything and refuses a context
 that does not fit in available RAM. `plan-model` works for any GGUF, including
@@ -212,6 +218,62 @@ budget is spent before it has said anything. Its own chat template suppresses
 reasoning by pre-filling an empty `<think></think>`, and that is what the flag
 does. Instruct builds that do not reason (Qwen3's `-2507-Instruct`, for one)
 need nothing.
+
+## Serving the Anthropic Messages API
+
+`kllm serve` exposes the local model over the API Claude Code speaks, so a
+coding client can drive it with no proxy in between:
+
+```sh
+kllm serve Qwen3-30B-A3B-Q4_K_M.gguf --context 16384
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ANTHROPIC_AUTH_TOKEN=local claude
+```
+
+`POST /v1/messages` streams over SSE or returns a single JSON message, and
+`/v1/messages/count_tokens`, `/v1/models` and `/health` are there too. The
+wire format is Anthropic's; underneath it is the same ChatML the model was
+trained on. `--api-key` requires an `x-api-key` (or bearer) match; without it
+the server trusts whoever can reach the port, so keep the default host.
+
+**Tool calls work through the model's own format.** Qwen3 was trained to emit
+`<tool_call>{"name": ..., "arguments": ...}</tool_call>`, so Anthropic `tools`
+are rendered into the system prompt exactly as its chat template does, and
+`<tool_call>` output is translated back into `tool_use` content blocks --
+streaming included. `tool_result` blocks come back the other way as Qwen's
+`<tool_response>` turns.
+
+Reasoning is **off by default here**, the opposite of `run` and `chat`: a
+client sends a `max_tokens` budget and expects an answer within it, and a
+reasoning model will spend the entire budget deliberating instead. Asked to
+call a tool with 80 tokens to spend, Qwen3-0.6B used all 80 inside `<think>`
+and never emitted the call; suppressed, it answered with the `tool_use` block
+in 21. `--think` puts reasoning back, as visible text rather than as
+Anthropic `thinking` blocks.
+
+**Prefix reuse is the only reason this is usable.** A client resends the whole
+conversation on every turn, so the server keeps one session alive and rewinds
+it to the longest prefix the new request still shares. Measured on the 30B
+with a 3.5k-token system prompt:
+
+| | prompt tokens | reused | time |
+|---|---|---|---|
+| first request | 3576 | 1 | 291 s |
+| second turn | 3594 | 3577 | 4.7 s |
+
+Every response logs `prompt N reused + M read`. Watch it: a client that
+perturbs its own prefix between turns -- a changing system prompt, or two
+conversations interleaved on one server -- turns every turn back into a full
+prefill, and the only symptom is that things got slow.
+
+Which is the honest limit here. **Decode is comfortable at 10.2 tok/s warm but
+prefill on a demand-paged MoE runs at 12-18 tok/s**, because a prefill batch
+routes to all 128 experts in every layer and so reads the whole 16.7 GiB
+expert set, while a single decoded token reads only the 8 it routed to. The
+first request of a session therefore costs minutes and every one after it is
+seconds. Widening the batch does not fix it (16 / 64 / 256 measured at 10-14 /
+13-15 / 17-18 tok/s: wider is better, but it saturates), and narrowing it does
+not either -- 16 tokens still touch most of a layer's experts. A model whose
+experts fit in RAM would not have the problem.
 
 ## Correctness
 

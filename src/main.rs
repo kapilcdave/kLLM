@@ -44,7 +44,7 @@ usage:
   kllm chat MODEL.gguf [--system TEXT] [-n 512] [--context N] [--no-think]
            [--temp T] [--top-k K] [--top-p P] [--min-p P] [--threads N] [--ram-gib N]
   kllm serve MODEL.gguf [--host 127.0.0.1] [--port 8787] [--context N] [--batch N]
-           [--api-key KEY] [--max-tokens N] [--no-think] [--quiet]
+           [--api-key KEY] [--max-tokens N] [--think] [--quiet]
            [--temp T] [--top-k K] [--top-p P] [--min-p P] [--threads N] [--ram-gib N]
   kllm perplexity MODEL.gguf --file TEXT [--context 512] [--chunks N] [--threads N] [--gpu-layers N|auto]
   kllm compare REFERENCE.gguf TEST.gguf --file TEXT [--context 512] [--chunks N] [--threads N]
@@ -910,7 +910,11 @@ fn cmd_serve(args: &Args) -> Result<(), String> {
     // The session borrows the model, and the server owns both until the
     // process exits; leaking is the honest way to say that.
     let model: &'static Model = Box::leak(Box::new(model));
-    let engine = Engine::new(model, context, batch, !args.has("--no-think"))?;
+    // Reasoning is off unless asked for, the opposite of `run` and `chat`.
+    // A client sends a `max_tokens` budget and expects an answer inside it;
+    // a reasoning model spends the whole budget deliberating and the tool
+    // call never arrives. `--think` puts it back, as visible text.
+    let engine = Engine::new(model, context, batch, args.has("--think"))?;
     let options = Options {
         host: args.value(&["--host"])?.unwrap_or("127.0.0.1").to_string(),
         port: args.or(&["--port"], 8787u16)?,
