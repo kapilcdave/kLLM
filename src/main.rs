@@ -10,7 +10,8 @@ use kllm::kernels;
 use kllm::model::{Config, Logits, Model, Session};
 use kllm::planner::{ModelPlanInput, PlanInput, bytes_from_gib, gib, plan, plan_model};
 use kllm::sampler::{Sampler, SamplerConfig};
-use kllm::tokenizer::{Tokenizer, format_chat_with};
+use kllm::serve::{Engine, Options, serve};
+use kllm::tokenizer::{Tokenizer, Utf8Stream, format_chat_with};
 
 const DEFAULT_WORKSPACE_GIB: f64 = 0.25;
 const DEFAULT_SAFETY_GIB: f64 = 0.25;
@@ -41,6 +42,9 @@ usage:
            [--gpu-layers N|auto]
            [--ram-gib N|auto|all]
   kllm chat MODEL.gguf [--system TEXT] [-n 512] [--context N] [--no-think]
+           [--temp T] [--top-k K] [--top-p P] [--min-p P] [--threads N] [--ram-gib N]
+  kllm serve MODEL.gguf [--host 127.0.0.1] [--port 8787] [--context N] [--batch N]
+           [--api-key KEY] [--max-tokens N] [--no-think] [--quiet]
            [--temp T] [--top-k K] [--top-p P] [--min-p P] [--threads N] [--ram-gib N]
   kllm perplexity MODEL.gguf --file TEXT [--context 512] [--chunks N] [--threads N] [--gpu-layers N|auto]
   kllm compare REFERENCE.gguf TEST.gguf --file TEXT [--context 512] [--chunks N] [--threads N]
@@ -106,6 +110,7 @@ fn run(args: &Args) -> Result<(), String> {
         Some("plan-model") => cmd_plan_model(args),
         Some("run") => cmd_run(args),
         Some("chat") => cmd_chat(args),
+        Some("serve") => cmd_serve(args),
         Some("perplexity") => cmd_perplexity(args),
         Some("compare") => cmd_compare(args),
         Some("bench") => cmd_bench(args),
@@ -650,24 +655,6 @@ fn ram_budget(args: &Args, session_bytes: u64) -> Result<Option<u64>, String> {
 }
 
 /// Emit only complete UTF-8 sequences; tokens can split a character.
-struct Utf8Stream {
-    pending: Vec<u8>,
-}
-
-impl Utf8Stream {
-    fn push(&mut self, bytes: &[u8]) -> String {
-        self.pending.extend_from_slice(bytes);
-        let valid = match std::str::from_utf8(&self.pending) {
-            Ok(_) => self.pending.len(),
-            Err(e) if e.error_len().is_none() => e.valid_up_to(),
-            Err(_) => self.pending.len(), // genuinely invalid: flush lossily
-        };
-        let text = String::from_utf8_lossy(&self.pending[..valid]).into_owned();
-        self.pending.drain(..valid);
-        text
-    }
-}
-
 fn cmd_run(args: &Args) -> Result<(), String> {
     let path = args.positional(1, "GGUF path")?;
     let threads = init_threads(args)?;
@@ -723,9 +710,7 @@ fn cmd_run(args: &Args) -> Result<(), String> {
         .new_session(context, batch)
         .map_err(|e| e.to_string())?;
     let mut stdout = io::stdout().lock();
-    let mut stream = Utf8Stream {
-        pending: Vec::new(),
-    };
+    let mut stream = Utf8Stream::default();
     if !args.has("--chat") {
         let _ = write!(stdout, "{}", tokenizer.decode(&tokens, false));
         let _ = stdout.flush();
@@ -868,9 +853,7 @@ fn cmd_chat(args: &Args) -> Result<(), String> {
             .to_vec();
         let prompt_time = start.elapsed();
         let gen_start = Instant::now();
-        let mut stream = Utf8Stream {
-            pending: Vec::new(),
-        };
+        let mut stream = Utf8Stream::default();
         let mut generated = 0;
         while generated < n_predict && session.position() < context {
             let next = sampler.sample(&logits, &history);
@@ -905,6 +888,46 @@ fn cmd_chat(args: &Args) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Serves the Anthropic Messages API, so Claude Code (or anything else that
+/// speaks it) can drive the local model.
+fn cmd_serve(args: &Args) -> Result<(), String> {
+    let path = args.positional(1, "GGUF path")?;
+    let threads = init_threads(args)?;
+    let info = inspect_file(path).map_err(|e| e.to_string())?;
+    let config = Config::from_gguf(&info).map_err(|e| e.to_string())?;
+    // A coding client's system prompt and tool definitions alone run to
+    // thousands of tokens, so the default context is much wider than `chat`'s
+    // -- but still bounded, because the KV cache competes for the page cache
+    // a demand-paged model is living out of.
+    let context: usize = args.or(&["--context", "-c"], config.train_context.min(16384))?;
+    // Unlike interactive chat, a served request is usually a whole
+    // conversation on a cold cache, and a wide batch is what makes prefill
+    // (and a routed model's expert reads) worthwhile.
+    let batch: usize = args.or(&["--batch", "-b"], 256)?;
+    let model = load_with_plan(args, gpu_request(args)?, path, context, batch, threads)?;
+    // The session borrows the model, and the server owns both until the
+    // process exits; leaking is the honest way to say that.
+    let model: &'static Model = Box::leak(Box::new(model));
+    let engine = Engine::new(model, context, batch, !args.has("--no-think"))?;
+    let options = Options {
+        host: args.value(&["--host"])?.unwrap_or("127.0.0.1").to_string(),
+        port: args.or(&["--port"], 8787u16)?,
+        api_key: args.value(&["--api-key"])?.map(str::to_string),
+        default_max_tokens: args.or(&["--max-tokens"], 2048)?,
+        sampler: SamplerConfig {
+            temperature: args.or(&["--temp"], 0.8)?,
+            top_k: args.or(&["--top-k"], 40)?,
+            top_p: args.or(&["--top-p"], 0.95)?,
+            min_p: args.or(&["--min-p"], 0.05)?,
+            repeat_penalty: args.or(&["--repeat-penalty"], 1.0)?,
+            repeat_last_n: args.or(&["--repeat-last-n"], 64)?,
+            seed: args.or(&["--seed", "-s"], 0x6b4c_4c4d)?,
+        },
+        verbose: !args.has("--quiet"),
+    };
+    serve(engine, options)
 }
 
 fn cmd_perplexity(args: &Args) -> Result<(), String> {

@@ -732,6 +732,36 @@ pub fn format_chat_with(
     Some(out)
 }
 
+/// Reassembles token bytes into printable text.
+///
+/// A BPE token is a byte string, not a character: emoji and CJK routinely
+/// span two or three tokens, so decoding each one on its own would print
+/// replacement characters mid-word. This holds back a trailing partial
+/// sequence until the bytes that complete it arrive.
+#[derive(Default)]
+pub struct Utf8Stream {
+    pending: Vec<u8>,
+}
+
+impl Utf8Stream {
+    /// Adds `bytes` and returns whatever is now complete.
+    ///
+    /// Call with an empty slice at the end of generation to flush: a stream
+    /// that stopped mid-sequence has no more bytes coming, so the remainder
+    /// is emitted lossily rather than swallowed.
+    pub fn push(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let valid = match std::str::from_utf8(&self.pending) {
+            Ok(_) => self.pending.len(),
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => self.pending.len(), // genuinely invalid: flush lossily
+        };
+        let text = String::from_utf8_lossy(&self.pending[..valid]).into_owned();
+        self.pending.drain(..valid);
+        text
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
