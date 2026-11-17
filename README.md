@@ -21,7 +21,7 @@ cargo build --release
 | Architectures | `llama` (Llama 1–3, Mistral, SmolLM, TinyLlama), `qwen2`, `qwen3`, `qwen3moe`. A 30B mixture of experts runs on a 16 GiB machine at 6x llama.cpp: see [docs/MOE.md](docs/MOE.md) |
 | Weight types | Validated end to end against llama.cpp on real models, by perplexity *and* KL divergence: F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q4_K, Q5_K, Q6_K. F32 is kernel-tested only |
 | Tokenizers | GPT-2 byte-level BPE (gpt2, smollm, llama3, qwen2 pre-tokenizers) and SentencePiece; special tokens; byte-exact with llama.cpp on the fixtures |
-| Execution | CPU: batched prefill, f16 KV cache, AVX2/FMA/F16C kernels with a portable scalar fallback |
+| Execution | CPU: batched prefill, f16 KV cache, AVX2/FMA/F16C kernels, an AArch64 NEON Q4_0 kernel, and a portable scalar fallback |
 | Sampling | Greedy, temperature, top-k, top-p, min-p, repetition penalty, seeded |
 | Planning | Per-layer VRAM/RAM placement from real tensor sizes and KV costs |
 | CUDA | Whole transformer blocks and the output head run on the GPU with `--gpu-layers N|auto` (M6): kernels for all 12 weight types, coalesced struct-of-arrays matvecs for Q4_0/Q8_0/Q4_K/Q6_K, KV cache in VRAM. Loaded as PTX through the driver API, so no CUDA toolkit is needed. Perplexity matches llama.cpp on the GPU as closely as on the CPU (`tests/gpu.rs`) |
@@ -228,6 +228,7 @@ they are the right first stop before optimizing anything:
 | Example | Answers |
 |---|---|
 | `kernel_bench` | matvec GB/s per weight type — is a shape bandwidth-bound? |
+| `bench_q4_0` | scalar or NEON Q4_0 matvec latency on AArch64 |
 | `gemm_bench` | batched matmul GOP/s |
 | `tile_bench` | splits a matmul into kernel / row-streaming / full path, and times `prepare` separately |
 | `attn_bench` | attention primitives in GMAC/s, per head width |
