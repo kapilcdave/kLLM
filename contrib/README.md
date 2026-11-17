@@ -96,6 +96,16 @@ hits, and only the genuinely new tail is read. Upstream offers it for
 cross-user prompt-cache reuse on the API; here it is the difference between
 "slow once" and "slow every time".
 
+On a hybrid model the flag is necessary but not sufficient, because a *partial*
+prefix match is not cheap there. A dense model's KV cache rewinds for free, but
+a recurrence keeps no per-position record, so rewinding to the divergence point
+used to replay everything below it: a fresh session reported `8496 reused +
+2386 read` and still took 739 s. The server now saves the recurrent state at
+that divergence point and resumes from it, which made the same request
+40x faster in a controlled run (`682 reused + 10 read`: 44.4 s to 1.1 s). The
+cost is one ~66 MiB snapshot, and the *second* session after a restart still
+pays the replay once -- that is when the snapshot gets taken.
+
 Two consequences worth keeping in mind:
 
 - **The 13 minutes is per server lifetime, not per session** -- so leave the

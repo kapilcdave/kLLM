@@ -270,6 +270,17 @@ perturbs its own prefix between turns -- a changing system prompt, or two
 conversations interleaved on one server -- turns every turn back into a full
 prefill, and the only symptom is that things got slow.
 
+On a **recurrent** model, `N reused` is not by itself proof that the reuse was
+cheap. A KV cache rewinds for free, but a recurrence keeps no per-position
+record of its state, so rewinding to a divergence point means replaying
+everything below it -- a fresh session reported `8496 reused + 2386 read` and
+still took 739 s. The server therefore saves the recurrent state at the
+divergence point (`Session::checkpoint`, about 66 MiB on a 40-block hybrid) and
+resumes from it next time, replaying only what sits between. In a controlled
+run the same `682 reused + 10 read` went from 44.4 s to **1.1 s**. The second
+request after a restart still pays one replay; that is when the snapshot is
+taken.
+
 Which is the honest limit here. **Decode is comfortable at 10.2 tok/s warm but
 prefill on a demand-paged MoE runs at 12-18 tok/s**, because a prefill batch
 routes to all 128 experts in every layer and so reads the whole 16.7 GiB
