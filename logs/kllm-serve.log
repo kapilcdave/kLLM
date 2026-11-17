@@ -1,0 +1,25 @@
+kllm: Huihui Qwen3.5 35B A3B Claude 4.6 Opus Abliterated | 40 layers | ctx 32768 | 4 threads | kernels avx2+fma+f16c
+kllm: plan: weights 12330 MiB mapped, KV cache 2560 MiB, scratch 354 MiB, execution CPU
+kllm: 8 of 256 experts per token (3% of 11120 MiB of expert weights), demand-paged
+kllm: loaded in 0.08 s
+kllm: serving Huihui Qwen3.5 35B A3B Claude 4.6 Opus Abliterated on http://127.0.0.1:8787
+kllm: Anthropic Messages API at POST /v1/messages (streaming and not)
+kllm: point Claude Code at it with:
+kllm:   ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ANTHROPIC_AUTH_TOKEN=local claude
+kllm: Huihui Qwen3.5 35B A3B Claude 4.6 Opus Abliterated | 40 layers | ctx 32768 | 4 threads | kernels avx2+fma+f16c
+kllm: plan: weights 12330 MiB mapped, KV cache 2560 MiB, scratch 354 MiB, execution CPU
+kllm: 8 of 256 experts per token (3% of 11120 MiB of expert weights), demand-paged
+kllm: loaded in 0.07 s
+kllm: serving Huihui Qwen3.5 35B A3B Claude 4.6 Opus Abliterated on http://127.0.0.1:8787
+kllm: Anthropic Messages API at POST /v1/messages (streaming and not)
+kllm: point Claude Code at it with:
+kllm:   ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ANTHROPIC_AUTH_TOKEN=local claude
+kllm: message ok in 3.09 s | prompt 0 reused + 17 read | 18 of 32768 context
+kllm: Huihui Qwen3.5 35B A3B Claude 4.6 Opus Abliterated | 40 layers | ctx 32768 | 4 threads | kernels avx2+fma+f16c
+kllm: plan: weights 12330 MiB mapped, KV cache 2560 MiB, scratch 354 MiB, execution CPU
+kllm: 8 of 256 experts per token (3% of 11120 MiB of expert weights), demand-paged
+kllm: loaded in 0.06 s
+kllm: serving Huihui Qwen3.5 35B A3B Claude 4.6 Opus Abliterated on http://127.0.0.1:8787
+kllm: Anthropic Messages API at POST /v1/messages (streaming and not)
+kllm: point Claude Code at it with:
+kllm:   ANTHROPIC_BASE_URL=http://127.0.0.1:8787 ANTHROPIC_AUTH_TOKEN=local claude

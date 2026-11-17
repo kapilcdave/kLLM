@@ -1,0 +1,202 @@
+{
+  "model": "/home/kapil/ai/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Q4_K_M.gguf",
+  "model_sha256": "9f1a24700a339b09c06009b729b5c809e0b64c213b8af5b711b3dbdfd0c5ba48",
+  "binary_sha256": "a8ef174c8ae9d338954494253ce825cc40098c624cfdb3c7cff66368ce8ab189",
+  "kllm_binary_sha256": "a8ef174c8ae9d338954494253ce825cc40098c624cfdb3c7cff66368ce8ab189",
+  "date": "2026-11-16",
+  "hardware": "Dell Precision 5520 / Xeon E3-1505M v6 / 16 GiB / CPU, 4 threads",
+  "workload": "pp128 / tg64, one repetition per process; alternating engine order",
+  "notes": "Interleave CPU pp128/tg64 benchmarks; retain commands, raw logs and medians.\n\npython scripts/dell_bench.py --model /path/model.gguf --out evals/dell-4b\nEach engine uses its own synthetic prompt/warmup: equivalent workload sizes,\nnot identical token streams. kLLM tg includes its prefilled prompt; llama-bench\nruns standalone tg. These are microbenchmarks, not matched chat latency.\n",
+  "samples": [
+    {
+      "engine": "kllm",
+      "round": 1,
+      "command": [
+        "/home/kapil/kllm/evals/dell-30b/kllm-snapshot",
+        "bench",
+        "/home/kapil/ai/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Q4_K_M.gguf",
+        "-p",
+        "128",
+        "-n",
+        "64",
+        "-t",
+        "4",
+        "-r",
+        "1",
+        "--gpu-layers",
+        "0"
+      ],
+      "exit_code": 0,
+      "pp": 7.5,
+      "tg": 4.1,
+      "wall_seconds": 39.84712216700427,
+      "raw_log": "1-kllm.log"
+    },
+    {
+      "engine": "llama.cpp",
+      "round": 1,
+      "command": [
+        "/home/kapil/ai/llama.cpp/cpu/llama-b12099/llama-bench",
+        "-m",
+        "/home/kapil/ai/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Q4_K_M.gguf",
+        "-p",
+        "128",
+        "-n",
+        "64",
+        "-t",
+        "4",
+        "-r",
+        "1",
+        "-ngl",
+        "0",
+        "-o",
+        "json",
+        "--repack",
+        "0"
+      ],
+      "exit_code": 0,
+      "pp": 10.872083,
+      "tg": 5.978156,
+      "wall_seconds": 55.07768023398239,
+      "raw_log": "1-llama.cpp.log"
+    },
+    {
+      "engine": "llama.cpp",
+      "round": 2,
+      "command": [
+        "/home/kapil/ai/llama.cpp/cpu/llama-b12099/llama-bench",
+        "-m",
+        "/home/kapil/ai/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Q4_K_M.gguf",
+        "-p",
+        "128",
+        "-n",
+        "64",
+        "-t",
+        "4",
+        "-r",
+        "1",
+        "-ngl",
+        "0",
+        "-o",
+        "json",
+        "--repack",
+        "0"
+      ],
+      "exit_code": 0,
+      "pp": 10.721271,
+      "tg": 5.551869,
+      "wall_seconds": 52.39304853905924,
+      "raw_log": "2-llama.cpp.log"
+    },
+    {
+      "engine": "kllm",
+      "round": 2,
+      "command": [
+        "/home/kapil/kllm/evals/dell-30b/kllm-snapshot",
+        "bench",
+        "/home/kapil/ai/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Q4_K_M.gguf",
+        "-p",
+        "128",
+        "-n",
+        "64",
+        "-t",
+        "4",
+        "-r",
+        "1",
+        "--gpu-layers",
+        "0"
+      ],
+      "exit_code": 0,
+      "pp": 13.1,
+      "tg": 4.8,
+      "wall_seconds": 26.09199402492959,
+      "raw_log": "2-kllm.log"
+    },
+    {
+      "engine": "kllm",
+      "round": 3,
+      "command": [
+        "/home/kapil/kllm/evals/dell-30b/kllm-snapshot",
+        "bench",
+        "/home/kapil/ai/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Q4_K_M.gguf",
+        "-p",
+        "128",
+        "-n",
+        "64",
+        "-t",
+        "4",
+        "-r",
+        "1",
+        "--gpu-layers",
+        "0"
+      ],
+      "exit_code": 0,
+      "pp": 12.4,
+      "tg": 6.0,
+      "wall_seconds": 24.372148110996932,
+      "raw_log": "3-kllm.log"
+    },
+    {
+      "engine": "llama.cpp",
+      "round": 3,
+      "command": [
+        "/home/kapil/ai/llama.cpp/cpu/llama-b12099/llama-bench",
+        "-m",
+        "/home/kapil/ai/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Q4_K_M.gguf",
+        "-p",
+        "128",
+        "-n",
+        "64",
+        "-t",
+        "4",
+        "-r",
+        "1",
+        "-ngl",
+        "0",
+        "-o",
+        "json",
+        "--repack",
+        "0"
+      ],
+      "exit_code": 0,
+      "pp": 12.059342,
+      "tg": 6.934071,
+      "wall_seconds": 50.24178082100116,
+      "raw_log": "3-llama.cpp.log"
+    }
+  ],
+  "summary": {
+    "kllm": {
+      "pp": {
+        "median": 12.4,
+        "min": 7.5,
+        "max": 13.1
+      },
+      "tg": {
+        "median": 4.8,
+        "min": 4.1,
+        "max": 6.0
+      },
+      "successful_rounds": 3
+    },
+    "llama.cpp": {
+      "pp": {
+        "median": 10.872083,
+        "min": 10.721271,
+        "max": 12.059342
+      },
+      "tg": {
+        "median": 5.978156,
+        "min": 5.551869,
+        "max": 6.934071
+      },
+      "successful_rounds": 3
+    }
+  },
+  "vllm": {
+    "status": "not_benchmarked",
+    "cuda": "M1200 compute capability 5.0 below supported minimum",
+    "cpu": "AVX2 available but GGUF unsupported on x86 CPU per upstream quantization matrix",
+    "source": "https://docs.vllm.ai/en/latest/getting_started/installation/cpu/"
+  }
+}

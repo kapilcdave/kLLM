@@ -1,0 +1,15 @@
+kllm: Smollm2 135M 8k Lc100K Mix1 Ep2 | 30 layers | ctx 512 | 4 threads | kernels avx2+fma+f16c
+kllm: plan: weights 257 MiB mapped, KV cache 11 MiB, scratch 109 MiB, execution CPU
+kllm: loaded in 0.01 s
+kllm: Smollm2 135M 8k Lc100K Mix1 Ep2 | 30 layers | ctx 512 | 4 threads | kernels avx2+fma+f16c
+kllm: plan: weights 86 MiB mapped, KV cache 11 MiB, scratch 109 MiB, execution CPU
+kllm: loaded in 0.10 s
+kllm: 3758 tokens, 4 chunks of 512; reference models/SmolLM2-135M-Instruct-f16.gguf (F16), test models/SmolLM2-135M-Instruct-Q4_0.gguf (Q4_0/Q4_1/Q8_0)
+[1]0.14675 [2]0.13546 [3]0.14131 [4]0.14650 
+reference:      models/SmolLM2-135M-Instruct-f16.gguf
+test:           models/SmolLM2-135M-Instruct-Q4_0.gguf
+tokens scored:  1020 (4 chunks of 512) in 12.2 s
+mean KL:        0.146502 +/- 0.005900 nats
+KL median/p99:  0.101716 / 0.865963  (max 3.329699)
+top-1 agree:    81.08%   top-5 agree: 98.14%
+PPL:            reference 17.5773 -> test 20.0375  (+14.00%)

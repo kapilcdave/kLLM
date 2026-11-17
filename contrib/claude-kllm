@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# Run Claude Code against the local model served by `kllm serve`.
+#
+# Everything model-related lives in ~/.config/kllm/serve.env; this script only
+# makes sure the server is up and points Claude Code at it.
+#
+#   claude-kllm                 launch Claude Code on the local model
+#   claude-kllm --kllm-status   what is loaded, and is it warm
+#   claude-kllm --kllm-warm     send one throwaway request to warm the cache
+#   claude-kllm --kllm-restart  restart the server (after editing serve.env)
+#   claude-kllm --kllm-log      follow the server log
+#
+# Any other arguments are passed straight through to `claude`.
+
+set -euo pipefail
+
+CONFIG="${KLLM_CONFIG:-$HOME/.config/kllm/serve.env}"
+UNIT=kllm-serve.service
+LOG="$HOME/kllm/logs/kllm-serve.log"
+
+if [[ ! -f $CONFIG ]]; then
+    echo "claude-kllm: no config at $CONFIG" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+set -a; source "$CONFIG"; set +a
+
+PORT="${KLLM_PORT:-8787}"
+BASE="http://127.0.0.1:$PORT"
+NAME="${KLLM_NAME:-local}"
+
+note() { printf 'claude-kllm: %s\n' "$*" >&2; }
+
+healthy() { curl -sf --max-time 3 "$BASE/health" >/dev/null 2>&1; }
+
+# Bring the server up if it is not already answering. Started through systemd
+# rather than from this shell: a plain background process gets reaped when the
+# box comes under memory pressure, and this one holds a 12 GiB mapping.
+ensure_up() {
+    if healthy; then return 0; fi
+    if ! systemctl --user cat "$UNIT" >/dev/null 2>&1; then
+        note "the $UNIT unit is not installed; run: systemctl --user enable --now $UNIT"
+        exit 1
+    fi
+    note "starting $UNIT ..."
+    systemctl --user start "$UNIT"
+    # Loading mmaps the model; answering /health means the listener is up.
+    for _ in $(seq 1 120); do
+        healthy && break
+        sleep 1
+    done
+    if ! healthy; then
+        note "server did not come up; last log lines:"
+        tail -n 20 "$LOG" >&2 2>/dev/null || true
+        exit 1
+    fi
+}
+
+# One short request, timed. Also the honest way to see whether the page cache
+# is warm: the first call after a restart reads experts from NVMe.
+warm() {
+    local started tokens
+    started=$(date +%s.%N)
+    tokens=$(curl -sf --max-time 1800 "$BASE/v1/messages" \
+        -H 'content-type: application/json' \
+        -H "x-api-key: ${KLLM_TOKEN:-}" \
+        -d '{"model":"'"$NAME"'","max_tokens":24,"temperature":0,
+             "messages":[{"role":"user","content":"Reply with exactly: ready"}]}' \
+        | sed -n 's/.*"output_tokens":\([0-9]*\).*/\1/p') || {
+        note "warm-up request failed"; return 1; }
+    # awk rather than bc: bc is not installed on every box this runs on.
+    awk -v t0="$started" -v t1="$(date +%s.%N)" -v n="${tokens:-0}" 'BEGIN {
+        d = t1 - t0
+        printf "claude-kllm: %d tokens in %.1fs (%.1f tok/s)\n", n, d, (d > 0 ? n / d : 0)
+    }' >&2
+}
+
+case "${1:-}" in
+    --kllm-status)
+        systemctl --user is-active "$UNIT" >/dev/null 2>&1 \
+            && note "unit: active" || note "unit: not running"
+        note "model: $(basename "${KLLM_MODEL:-?}")"
+        note "name:  $NAME"
+        note "ctx:   ${KLLM_CONTEXT:-?} tokens on $BASE"
+        if healthy; then
+            note "health: ok"
+            warm || true
+            note "recent requests:"
+            grep -a 'kllm: \(message\|stream\)' "$LOG" 2>/dev/null | tail -n 5 >&2 || true
+        else
+            note "health: not answering"
+        fi
+        exit 0
+        ;;
+    --kllm-warm)   ensure_up; warm; exit 0 ;;
+    --kllm-restart)
+        systemctl --user restart "$UNIT"
+        note "restarted; waiting for health ..."
+        for _ in $(seq 1 120); do healthy && break; sleep 1; done
+        healthy && note "up on $BASE" || { note "did not come up"; exit 1; }
+        exit 0
+        ;;
+    --kllm-log)    exec tail -n 40 -f "$LOG" ;;
+    --kllm-help|-h)
+        sed -n '2,13p' "$0" | sed 's/^# \?//'
+        exit 0
+        ;;
+esac
+
+ensure_up
+
+# Claude Code talks to the local server instead of api.anthropic.com. The
+# server ignores the requested model name and answers with whatever it loaded,
+# but Claude Code wants a name for both its main and its background model --
+# and they must be the same name here, because there is only one model.
+export ANTHROPIC_BASE_URL="$BASE"
+export ANTHROPIC_AUTH_TOKEN="${KLLM_TOKEN:-local}"
+export ANTHROPIC_MODEL="$NAME"
+export ANTHROPIC_SMALL_FAST_MODEL="$NAME"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$NAME"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$NAME"
+export CLAUDE_CODE_ALLOW_OTHER_MODELS=1
+
+# Claude Code has no built-in entry for this model id, and its fallback guess
+# is a 1M-token window -- so it would never compact and would eventually send
+# a prompt the server has to reject. Tell it the truth: the window is whatever
+# the server was started with.
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${KLLM_CONTEXT:-32768}"
+
+# A cold 16k-token system prompt prefills at 12-18 tok/s, so the very first
+# request of a session can take many minutes. The default client timeout would
+# abandon it long before the model finishes.
+export API_TIMEOUT_MS="${KLLM_TIMEOUT_MS:-3600000}"
+# At ~8 tok/s a 4k-token answer is eight minutes. Cap it lower than the cloud
+# default so a runaway generation is interruptible.
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${KLLM_MAX_OUTPUT:-2048}"
+# Nothing here should phone home: the whole point is that it runs locally.
+export DISABLE_TELEMETRY=1
+# Anything in the environment that would route requests somewhere other than
+# the local server has to go, or this silently talks to a cloud provider while
+# looking like it is local. An API key takes precedence over the auth token;
+# the Bedrock and Vertex switches bypass ANTHROPIC_BASE_URL entirely.
+unset ANTHROPIC_API_KEY ANTHROPIC_API_HOST ANTHROPIC_CUSTOM_HEADERS
+unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
+unset CLAUDE_CODE_SKIP_BEDROCK_AUTH CLAUDE_CODE_SKIP_VERTEX_AUTH
+unset ANTHROPIC_VERTEX_PROJECT_ID ANTHROPIC_BEDROCK_BASE_URL
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$NAME"
+
+# Launched from inside another Claude Code session these would leak through and
+# confuse the child about whose session it is.
+unset CLAUDE_CODE_SESSION_ID CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_MESSAGING_SOCKET
+unset CLAUDE_CODE_MESSAGING_TOKEN CLAUDE_CODE_SESSION_ATTENDED CLAUDE_PID
+
+exec claude "$@"

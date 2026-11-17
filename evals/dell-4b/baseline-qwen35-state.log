@@ -1,0 +1,21 @@
+   Compiling kllm v0.1.0 (/home/kapil/kllm)
+    Finished `test` profile [optimized + debuginfo] target(s) in 7.76s
+     Running tests/qwen35.rs (target/debug/build/kllm/537bfb936780e858/out/qwen35-537bfb936780e858)
+
+running 1 test
+
+thread 'recurrent_sessions_reset_rewind_and_decode' (611784) panicked at tests/qwen35.rs:31:5:
+assertion `left == right` failed
+  left: 60606464
+ right: 66897920
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test recurrent_sessions_reset_rewind_and_decode ... FAILED
+
+failures:
+
+failures:
+    recurrent_sessions_reset_rewind_and_decode
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 6.68s
+
+error: test failed, to rerun pass `--test qwen35`

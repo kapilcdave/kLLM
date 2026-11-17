@@ -1,0 +1,11 @@
+model:      /home/kapil/ai/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Q4_K_M.gguf
+types:      F32, Q4_K, Q6_K
+hardware:   Intel(R) Xeon(R) CPU E3-1505M v6 @ 3.00GHz | 4 threads | kernels avx2+fma+f16c
+command:    kllm bench /home/kapil/ai/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Q4_K_M.gguf -p 128 -n 64 -t 4 -r 1 --gpu-layers 0
+pp128:          12.4 tok/s best  (mean 12.4 ± 0.0)
+tg64:            6.0 tok/s best  (mean 6.0 ± 0.0), ~10.8 GiB/s of weights
+
+kllm: Qwen3-30B-A3B | 48 layers | ctx 193 | 4 threads | kernels avx2+fma+f16c
+kllm: plan: weights 17691 MiB mapped, KV cache 18 MiB, scratch 132 MiB, execution CPU
+kllm: 8 of 128 experts per token (6% of 16740 MiB of expert weights), demand-paged
+kllm: loaded in 0.05 s

@@ -307,6 +307,18 @@ impl Engine {
             match role {
                 "user" => self.render_user(content, &mut out),
                 "assistant" => self.render_assistant(content, &mut out),
+                // Not in Anthropic's documented schema -- system belongs in
+                // the top-level field -- but Claude Code sends one, and ChatML
+                // has a system turn, so render it where it was placed rather
+                // than rejecting the request.
+                "system" => {
+                    let text = text_of(content);
+                    if !text.is_empty() {
+                        out.push_str("<|im_start|>system\n");
+                        out.push_str(&text);
+                        out.push_str("<|im_end|>\n");
+                    }
+                }
                 other => return Err(format!("unsupported message role {other:?}")),
             }
         }
@@ -1132,6 +1144,11 @@ fn route(
     engine: &Mutex<Engine>,
     options: &Options,
 ) -> io::Result<()> {
+    // Liveness is exempt from auth. A supervisor or a start-up wait loop has
+    // no business holding the key, and the answer reveals nothing.
+    if request.method == "GET" && request.path == "/health" {
+        return write_response(out, "200 OK", br#"{"status":"ok"}"#);
+    }
     if let Some(expected) = &options.api_key {
         let presented = request.header("x-api-key").map(str::to_string).or_else(|| {
             request
@@ -1171,7 +1188,6 @@ fn route(
                 .as_bytes(),
             )
         }
-        ("GET", "/health") => write_response(out, "200 OK", br#"{"status":"ok"}"#),
         // Preflight, in case the user points a browser tool at this.
         ("OPTIONS", _) => write_response(out, "204 No Content", b""),
         _ => write_error(

@@ -1,0 +1,24 @@
+[Unit]
+Description=kllm serve -- local model behind the Anthropic Messages API, for Claude Code
+Documentation=https://github.com/kapilcdave/kLLM
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Slice=kllm.slice
+WorkingDirectory=/home/kapil/kllm
+EnvironmentFile=/home/kapil/.config/kllm/serve.env
+# `sh -c` so the env file's values expand; ExecStart does not expand $VARS in
+# the middle of a word on its own.
+ExecStart=/bin/sh -c 'exec /home/kapil/kllm/target/release/kllm serve "$KLLM_MODEL" \
+    --host 127.0.0.1 --port "$KLLM_PORT" --context "$KLLM_CONTEXT" \
+    --batch "$KLLM_BATCH" --api-key "$KLLM_TOKEN" $KLLM_EXTRA'
+Restart=on-failure
+RestartSec=5
+# Loading mmaps a 12 GiB file and touches the metadata; be generous.
+TimeoutStartSec=300
+StandardOutput=append:/home/kapil/kllm/logs/kllm-serve.log
+StandardError=append:/home/kapil/kllm/logs/kllm-serve.log
+
+[Install]
+WantedBy=default.target
