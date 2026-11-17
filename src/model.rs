@@ -181,7 +181,35 @@ impl Config {
 
     /// KV-cache bytes per token of context with f16 storage.
     pub fn kv_bytes_per_token(&self) -> u64 {
-        2 * self.n_layer as u64 * self.kv_dim() as u64 * 2
+        2 * self.kv_layers() as u64 * self.kv_dim() as u64 * 2
+    }
+
+    /// Layers that keep a KV cache.
+    ///
+    /// Every layer, unless the architecture is a hybrid: Qwen3.5 mixes one
+    /// attention block into every `full_attention_interval`, and the linear
+    /// attention blocks hold a fixed-size recurrent state instead of a cache
+    /// that grows with the context. That is the whole reason a long context
+    /// is affordable there -- 20 KiB a token against 96 for a dense Qwen3 of
+    /// the same depth.
+    pub fn kv_layers(&self) -> usize {
+        match self.ssm {
+            Some(ssm) if ssm.interval > 0 && ssm.interval <= self.n_layer => {
+                self.n_layer / ssm.interval
+            }
+            _ => self.n_layer,
+        }
+    }
+
+    /// Which KV slot layer `index` uses, if it keeps a cache at all. The
+    /// attention block is the last of each interval.
+    pub fn kv_slot(&self, index: usize) -> Option<usize> {
+        match self.ssm {
+            Some(ssm) if ssm.interval > 0 && ssm.interval <= self.n_layer => (index + 1)
+                .is_multiple_of(ssm.interval)
+                .then(|| index / ssm.interval),
+            _ => Some(index),
+        }
     }
 
     pub fn from_gguf(info: &GgufInfo) -> Result<Self, ModelError> {
@@ -1241,7 +1269,12 @@ impl<'m> Session<'m> {
         let context = context.max(1);
         let b = max_batch.clamp(1, context);
         // Offloaded blocks keep their KV cache in VRAM.
-        let cache = model.cpu_layers() * context * c.kv_dim();
+        // Only the layers that keep a cache get a slot (see
+        // `Config::kv_layers`), which for a hybrid is one in four.
+        let cached_layers = (0..model.cpu_layers())
+            .filter(|i| c.kv_slot(*i).is_some())
+            .count();
+        let cache = cached_layers * context * c.kv_dim();
         #[cfg(feature = "cuda")]
         let gpu = model
             .gpu
@@ -1268,7 +1301,7 @@ impl<'m> Session<'m> {
             moe_proj: vec![0.0; c.n_embd],
             moe_x: vec![0.0; if c.moe.is_some() { b * c.n_embd } else { 0 }],
             moe_y: vec![0.0; if c.moe.is_some() { b * c.n_embd } else { 0 }],
-            scores: vec![0.0; b * c.n_head * context],
+            scores: vec![0.0; crate::pool::global().threads() * score_rows_per_worker(c) * context],
             rope: vec![(0.0, 0.0); b * c.rope_dim / 2],
             logits: vec![0.0; b * c.n_vocab],
             all_logits: Vec::new(),
@@ -1353,8 +1386,7 @@ impl<'m> Session<'m> {
             * (3 * c.n_embd as u64
                 + 2 * c.q_dim() as u64
                 + 2 * c.kv_dim() as u64
-                + 2 * c.n_ff as u64
-                + c.n_head as u64 * context
+                + 2 * c.ffn_width() as u64
                 + c.rope_dim as u64
                 + c.n_vocab as u64);
         let gated = if c.attn_gated {
@@ -1362,12 +1394,15 @@ impl<'m> Session<'m> {
         } else {
             0
         };
+        // Attention's score rows are sized per worker, not per token.
+        let scores =
+            crate::pool::global().threads() as u64 * score_rows_per_worker(c) as u64 * context;
         let ssm = c.ssm.map_or(0, |sc| {
             let layers = c.n_layer - c.n_layer / sc.interval;
             layers as u64 * sc.state_floats() as u64
                 + b * (sc.conv_width() + 2 * sc.inner_size + 2 * sc.time_step_rank) as u64
         });
-        (kv, (f32s + gated + ssm) * 4)
+        (kv, (f32s + scores + gated + ssm) * 4)
     }
 
     /// Discard positions `>= pos` so generation can resume from `pos`.
@@ -1558,6 +1593,9 @@ impl<'m> Session<'m> {
                 let Mixer::Attention(weights) = &layer.mixer else {
                     unreachable!()
                 };
+                // A hybrid gives a cache slot only to its attention blocks,
+                // so the slot is not the layer index.
+                let kv_slot = c.kv_slot(li).expect("an attention block has a KV slot");
                 be.matmul_many(
                     &mut [
                         Job {
@@ -1612,7 +1650,7 @@ impl<'m> Session<'m> {
                         .for_each(|h| rope(h, table, c.rope_style));
                     k.chunks_exact_mut(hd)
                         .for_each(|h| rope(h, table, c.rope_style));
-                    let at = li * layer_stride + (start + i) * kvd;
+                    let at = kv_slot * layer_stride + (start + i) * kvd;
                     kernels::store_f16(k, &mut self.k_cache[at..at + kvd]);
                     kernels::store_f16(v, &mut self.v_cache[at..at + kvd]);
                 }
@@ -1627,14 +1665,15 @@ impl<'m> Session<'m> {
                 // cache n_head times per token, which is the dominant cost of
                 // prefill attention. The arithmetic per (token, head) is
                 // unchanged, so results are bit-identical either way.
-                let k_layer = &self.k_cache[li * layer_stride..(li + 1) * layer_stride];
-                let v_layer = &self.v_cache[li * layer_stride..(li + 1) * layer_stride];
+                let k_layer = &self.k_cache[kv_slot * layer_stride..(kv_slot + 1) * layer_stride];
+                let v_layer = &self.v_cache[kv_slot * layer_stride..(kv_slot + 1) * layer_stride];
                 let q_all = &self.q[..n * qd];
                 let context = self.context;
                 let attn = OutPtr(self.attn.as_mut_ptr());
                 let scores_base = OutPtr(self.scores.as_mut_ptr());
                 let blocks = n.div_ceil(query_block);
-                crate::pool::global().for_each(blocks * c.n_head_kv, |task| {
+                let rows_per_worker = score_rows_per_worker(c);
+                crate::pool::global().for_each_on(blocks * c.n_head_kv, |worker, task| {
                     let (block, kv_head) = (task / c.n_head_kv, task % c.n_head_kv);
                     let i0 = block * query_block;
                     let i1 = (i0 + query_block).min(n);
@@ -1646,9 +1685,15 @@ impl<'m> Session<'m> {
                     let out = |i: usize, h: usize| unsafe {
                         std::slice::from_raw_parts_mut(attn.at(i * qd + h * hd), hd)
                     };
+                    // Scores live in this worker's slot, not at an index
+                    // derived from the token: only `threads` tasks run at
+                    // once, so the buffer is sized for that rather than for
+                    // the batch (see `score_rows_per_worker`).
                     let row = |i: usize, h: usize| unsafe {
+                        let local = (i - i0) * group + (h - kv_head * group);
+                        debug_assert!(local < rows_per_worker);
                         std::slice::from_raw_parts_mut(
-                            scores_base.at((i * c.n_head + h) * context),
+                            scores_base.at((worker * rows_per_worker + local) * context),
                             context,
                         )
                     };
@@ -2048,6 +2093,36 @@ impl OutPtr {
     }
 }
 
+/// Score rows one worker can have in flight: the widest query block times
+/// the query heads sharing a KV head.
+///
+/// Attention keeps a row of scores per (query token, head) while it
+/// softmaxes, and a row is as long as the context. Sizing that by the batch
+/// is what made a long context impossible -- 256 tokens by 32 heads by 128k
+/// positions is 4.3 GiB of scratch before a weight is read. Only `threads`
+/// tasks run at once, so a per-worker slot is enough.
+fn score_rows_per_worker(config: &Config) -> usize {
+    let group = config.n_head / config.n_head_kv.max(1);
+    widest_query_block(config) * group
+}
+
+/// The largest block `query_block` can ever return for this model, whatever
+/// the batch. `score_rows_per_worker` sizes attention's scratch from this,
+/// so the two must not disagree -- including under the override, where a
+/// larger block would write past the end of a worker's slot.
+fn widest_query_block(config: &Config) -> usize {
+    if let Some(forced) = std::env::var("KLLM_QUERY_BLOCK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+    {
+        return forced;
+    }
+    let group = config.n_head / config.n_head_kv.max(1);
+    let per_query = 2 * group * config.head_dim * 4;
+    (16 * 1024 / per_query.max(1)).max(1)
+}
+
 /// Query tokens per attention task.
 ///
 /// A block reads each KV-cache row once and shares it across every query in
@@ -2059,20 +2134,10 @@ impl OutPtr {
 /// So: the largest block whose queries and output accumulators fit in half of
 /// a 32 KiB L1, and never more than leaves about two tasks per thread.
 fn query_block(config: &Config, tokens: usize, threads: usize) -> usize {
-    if let Some(forced) = std::env::var("KLLM_QUERY_BLOCK")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-    {
-        return forced.min(tokens.max(1));
-    }
-    let group = config.n_head / config.n_head_kv;
-    // Each query in the block needs one query vector and one output
-    // accumulator per query head in the group, both f32.
-    let per_query = 2 * group * config.head_dim * 4;
-    let by_cache = (16 * 1024 / per_query.max(1)).max(1);
     let by_threads = (tokens * config.n_head_kv / (2 * threads.max(1))).max(1);
-    by_cache.min(by_threads).min(tokens.max(1))
+    widest_query_block(config)
+        .min(by_threads)
+        .min(tokens.max(1))
 }
 
 /// Optional log of which experts each token routed to.
