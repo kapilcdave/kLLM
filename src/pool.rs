@@ -109,19 +109,31 @@ impl Pool {
 
     /// Run `count` tasks, claimed dynamically by every thread.
     pub fn for_each(&self, count: usize, task: impl Fn(usize) + Sync) {
+        self.for_each_on(count, |_, i| task(i));
+    }
+
+    /// As [`Self::for_each`], but the task also learns which worker is
+    /// running it, in `0..threads()`.
+    ///
+    /// That is what lets a task take a slice of scratch without the
+    /// scratch being sized for every task: only `threads()` of them run at
+    /// once, so a per-worker slot is enough. Attention's score rows are
+    /// sized that way, which is the difference between a few hundred
+    /// megabytes and a few gigabytes at a long context.
+    pub fn for_each_on(&self, count: usize, task: impl Fn(usize, usize) + Sync) {
         match count {
             0 => {}
-            1 => task(0),
-            _ if self.workers.is_empty() => (0..count).for_each(task),
+            1 => task(0, 0),
+            _ if self.workers.is_empty() => (0..count).for_each(|i| task(0, i)),
             _ => {
                 let next = AtomicUsize::new(0);
-                self.run(&|_| {
+                self.run(&|worker| {
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= count {
                             break;
                         }
-                        task(i);
+                        task(worker, i);
                     }
                 });
             }
