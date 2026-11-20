@@ -12,14 +12,21 @@ remains separate work.
 cargo build --release
 ./target/release/kllm run ~/ai/models/Qwen3.5-4B-Q4_K_M.gguf \
   --chat --no-think --prompt "What is the capital of France?" \
-  --temp 0 -n 64 --context 512 --threads 4
+  --temp 0 -n 64 --context 4096 --threads 4 --gpu-only
 ./target/release/kllm chat ~/ai/models/Qwen3.5-9B-Q4_K_M.gguf \
   --no-think --context 2048 --threads 4
 ```
 
-Use CPU execution for these hybrid blocks. GPU layer offload rejects gated
-attention and DeltaNet explicitly; output-head-only offload remains possible.
-Image inputs and multimodal positions are outside this text-only path.
+CUDA offload covers both hybrid mixer types: gated softmax attention and
+DeltaNet. Batched projections run first, then each token advances the
+device-resident convolution ring and recurrent matrix in order. Automatic
+placement accounts for those fixed recurrent matrices and allocates KV cache
+only for the one-in-four softmax-attention blocks. Image inputs and multimodal
+positions are outside this text-only path.
+
+GPU rewind currently clears recurrent device state and replays from position
+zero. CPU sessions can resume from a saved recurrent checkpoint; an equivalent
+device-to-device checkpoint buffer is future optimization work.
 
 ## Tensor layout
 
@@ -160,9 +167,14 @@ exact reset/rewind results with the same batching, finite logits and memory
 accounting. Without a local model, the small two-step numerical recurrence
 fixture still runs in `cargo test --lib`.
 
+`tests/gpu.rs::qwen35_hybrid_all_on_gpu` offloads all blocks and the head,
+checks CPU/GPU prediction agreement, finite logits, and exact device-state
+reset. It skips when CUDA or the model is unavailable.
+
 ## Remaining work
 
-The existing routed FFN loader recognizes `qwen35moe`, but the local
-`Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf` still requires IQ2_XXS weight support.
-Its expert tensors cannot currently load. Dense-model validation does not
-establish correctness for that MoE file.
+The existing routed FFN loader recognizes `qwen35moe`, but GPU routed-FFN
+execution and expert staging are not implemented yet. The local
+`Qwen3.5-35B-A3B-UD-IQ2_XXS.gguf` additionally requires IQ2_XXS weight
+support, so its expert tensors cannot currently load. Dense-model validation
+does not establish correctness for that MoE file.

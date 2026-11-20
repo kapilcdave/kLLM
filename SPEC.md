@@ -7,10 +7,18 @@ older NVIDIA GPUs, no tensor cores, small VRAM pools, and substantially more
 system RAM than VRAM. Its initial reference machine is a Dell Precision 5520
 with a 4 GiB NVIDIA Quadro M1200.
 
-kLLM does not promise that an arbitrarily large dense model will run quickly in
-4 GiB. It makes the capacity/speed trade-off explicit and predictable by
-quantizing weights, placing only selected layers on the GPU, and budgeting every
-large allocation before inference starts.
+kLLM is a GPU inference engine for machines whose system RAM is much larger
+than their VRAM. System RAM is the backing store for model weights; the GPU is
+the execution device. Quantization, persistent VRAM residency, and staged
+RAM-to-VRAM transfers are means to that end, not a CPU-only capacity feature.
+
+The reference performance goal is 10--15 generated tokens/second for a useful
+quantized model on the 4 GiB reference GPU. A model that fits after
+quantization should remain resident in VRAM. A larger MoE model should keep
+shared and hot weights resident and stage only the experts selected for the
+current token. Dense weights that exceed VRAM must not be described as fast
+merely because they can be streamed: PCIe traffic imposes a hard throughput
+limit that the benchmark must report.
 
 ## 2. User experience
 
@@ -35,8 +43,10 @@ return a useful error containing the estimated shortfall and safe settings.
 - GGUF parsing and memory-mapped weight access.
 - Decoder-only Llama-family models.
 - Common GGUF integer quantizations, beginning with Q4_0.
-- CPU execution plus optional CUDA execution on legacy NVIDIA hardware.
-- Whole-layer CPU/GPU placement.
+- CUDA execution on legacy NVIDIA hardware, with CPU execution as the
+  correctness reference and fallback.
+- Whole-layer CPU/GPU placement, followed by sub-layer expert placement for
+  MoE models.
 - Single-user, batch-size-one token generation.
 - Bounded KV cache and streaming text output.
 - Reproducible benchmarks reporting prompt and generation tokens/second.
@@ -91,6 +101,14 @@ return a useful error containing the estimated shortfall and safe settings.
 - Start with quantized matrix-vector kernels because batch-one decoding is the
   principal workload.
 - Keep transfers explicit and measurable.
+- Use automatic safe GPU placement by default; retain an explicit CPU-only
+  mode for testing and unsupported architectures.
+- Support the low-bit formats used by target models with fused GPU-side
+  dequantization. Supporting a file format only on the CPU does not satisfy
+  this requirement.
+- For MoE layers, route first, then fetch/cache selected expert slices in a
+  bounded VRAM arena. Do not upload every expert or expand packed weights into
+  a full-precision VRAM copy.
 
 ## 5. Architecture
 
@@ -124,6 +142,13 @@ Correctness and bounded memory come before throughput. Every benchmark records:
 No performance claim is accepted without a reproducible command and comparison
 against a current `llama.cpp` build on the same machine.
 
+The primary acceptance result is generation throughput with GPU execution,
+not model load success or aggregate RAM capacity. Every GPU benchmark also
+records device clocks, bytes transferred over PCIe per generated token,
+resident weight bytes, staged weight bytes, and cache hit rate where an expert
+cache is used. Results from a thermally or power-throttled GPU are diagnostic,
+not the acceptance result.
+
 ## 7. Milestones
 
 1. **Planner:** standalone Rust CLI, deterministic memory plans, unit tests.
@@ -132,8 +157,13 @@ against a current `llama.cpp` build on the same machine.
 4. **Quantization:** Q4_0 CPU kernels with correctness fixtures.
 5. **Legacy CUDA:** device probe, allocation guard, Q4_0 matrix-vector kernel.
 6. **Hybrid execution:** planned layer offload and overlapped transfers.
-7. **Usable runtime:** tokenizer, sampling, streaming CLI, benchmark harness.
-8. **Server:** optional OpenAI-compatible local HTTP endpoint.
+7. **GPU coverage:** DeltaNet/gated attention, then routed MoE with a bounded
+   expert cache and overlapped RAM-to-VRAM staging.
+8. **Low-bit GPU path:** target 2-bit formats with fused dequantization;
+   consider 1-bit only for models designed or trained for it and only after
+   an accuracy gate.
+9. **Usable runtime:** tokenizer, sampling, streaming CLI, benchmark harness.
+10. **Server:** optional OpenAI-compatible local HTTP endpoint.
 
 ## 8. Acceptance criteria for milestone 1
 

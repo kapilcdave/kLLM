@@ -9,7 +9,12 @@
 
 mod common;
 
-use kllm::{cuda::default_gpu, eval::perplexity, model::Model, tokenizer::Tokenizer};
+use kllm::{
+    cuda::default_gpu,
+    eval::perplexity,
+    model::{Logits, Model},
+    tokenizer::Tokenizer,
+};
 
 fn ppl(model: &Model, n_ctx: usize, chunks: usize) -> f64 {
     let text = std::fs::read_to_string(
@@ -116,4 +121,52 @@ fn f16_gpu_and_cpu_logits_agree() {
             .fold(0.0, f32::max);
         assert!(max < 2e-2, "CPU and GPU logits differ by {max}");
     }
+}
+
+/// Qwen3.5 exercises both GPU mixer paths: gated softmax attention and the
+/// recurrent gated DeltaNet blocks. It also checks that reset clears the
+/// device-resident convolution rings and recurrent matrices.
+#[test]
+fn qwen35_hybrid_all_on_gpu() {
+    let Some(path) = std::env::var_os("KLLM_QWEN35_MODEL")
+        .map(std::path::PathBuf::from)
+        .or_else(|| common::model("Qwen3.5-4B-Q4_K_M.gguf"))
+    else {
+        return;
+    };
+    let Ok(gpu) = default_gpu() else { return };
+    let cpu = Model::load(&path).unwrap();
+    let tokenizer = Tokenizer::from_gguf(cpu.info()).unwrap();
+    let tokens = tokenizer.encode("The capital of France is", true, false);
+    let mut device = Model::load(&path).unwrap();
+    device.offload(gpu, device.config.n_layer, true).unwrap();
+
+    let mut cpu_session = cpu.new_session(64, 4).unwrap();
+    let expected = cpu_session.forward(&tokens, Logits::All).unwrap().to_vec();
+    let mut gpu_session = device.new_session(64, 4).unwrap();
+    let got = gpu_session.forward(&tokens, Logits::All).unwrap().to_vec();
+    assert!(got.iter().all(|x| x.is_finite()));
+
+    let vocab = device.config.n_vocab;
+    let argmax = |row: &[f32]| {
+        row.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0
+    };
+    let agreed = expected
+        .chunks_exact(vocab)
+        .zip(got.chunks_exact(vocab))
+        .filter(|(a, b)| argmax(a) == argmax(b))
+        .count();
+    assert!(
+        agreed * 2 >= tokens.len(),
+        "CPU/GPU argmax agreed on only {agreed}/{} positions",
+        tokens.len()
+    );
+
+    gpu_session.truncate(0);
+    let reset = gpu_session.forward(&tokens, Logits::All).unwrap();
+    assert_eq!(got, reset, "GPU reset must clear every recurrent state");
 }

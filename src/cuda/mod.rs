@@ -170,6 +170,11 @@ struct Kernels {
     add_bias: CuFunction,
     add_inplace: CuFunction,
     swiglu: CuFunction,
+    split_q_gate: CuFunction,
+    sigmoid_mul: CuFunction,
+    conv_silu: CuFunction,
+    l2_norm_heads: CuFunction,
+    deltanet_step: CuFunction,
     rope: CuFunction,
     kv_store: CuFunction,
     attention: CuFunction,
@@ -314,6 +319,11 @@ impl Gpu {
                 add_bias: get("add_bias")?,
                 add_inplace: get("add_inplace")?,
                 swiglu: get("swiglu")?,
+                split_q_gate: get("split_q_gate")?,
+                sigmoid_mul: get("sigmoid_mul")?,
+                conv_silu: get("conv_silu")?,
+                l2_norm_heads: get("l2_norm_heads")?,
+                deltanet_step: get("deltanet_step")?,
                 rope: get("rope")?,
                 kv_store: get("kv_store")?,
                 attention: get("attention")?,
@@ -612,6 +622,118 @@ impl Gpu {
             (Self::blocks(total, 256), 1),
             256,
             &[Arg::Ptr(gate), Arg::Ptr(up), Arg::I32(total as i32)],
+        )
+    }
+
+    pub fn split_q_gate(
+        &self,
+        full: DevicePtr,
+        q: DevicePtr,
+        gate: DevicePtr,
+        head_dim: usize,
+        total: usize,
+    ) -> Result<(), CudaError> {
+        self.launch(
+            self.kernels.split_q_gate,
+            (Self::blocks(total, 256), 1),
+            256,
+            &[
+                Arg::Ptr(full),
+                Arg::Ptr(q),
+                Arg::Ptr(gate),
+                Arg::I32(head_dim as i32),
+                Arg::I32(total as i32),
+            ],
+        )
+    }
+
+    pub fn sigmoid_mul(
+        &self,
+        x: DevicePtr,
+        gate: DevicePtr,
+        total: usize,
+    ) -> Result<(), CudaError> {
+        self.launch(
+            self.kernels.sigmoid_mul,
+            (Self::blocks(total, 256), 1),
+            256,
+            &[Arg::Ptr(x), Arg::Ptr(gate), Arg::I32(total as i32)],
+        )
+    }
+
+    pub fn conv_silu(
+        &self,
+        x: DevicePtr,
+        history: DevicePtr,
+        weights: DevicePtr,
+        width: usize,
+        taps: usize,
+    ) -> Result<(), CudaError> {
+        self.launch(
+            self.kernels.conv_silu,
+            (Self::blocks(width, 256), 1),
+            256,
+            &[
+                Arg::Ptr(x),
+                Arg::Ptr(history),
+                Arg::Ptr(weights),
+                Arg::I32(width as i32),
+                Arg::I32(taps as i32),
+            ],
+        )
+    }
+
+    pub fn l2_norm_heads(
+        &self,
+        x: DevicePtr,
+        heads: usize,
+        head_dim: usize,
+        eps: f32,
+    ) -> Result<(), CudaError> {
+        self.launch(
+            self.kernels.l2_norm_heads,
+            (heads as u32, 1),
+            128,
+            &[Arg::Ptr(x), Arg::I32(head_dim as i32), Arg::F32(eps)],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_step(
+        &self,
+        mixed: DevicePtr,
+        z: DevicePtr,
+        alpha: DevicePtr,
+        beta: DevicePtr,
+        a: DevicePtr,
+        dt_bias: DevicePtr,
+        norm: DevicePtr,
+        state: DevicePtr,
+        out: DevicePtr,
+        groups: usize,
+        rank: usize,
+        head_dim: usize,
+        eps: f32,
+    ) -> Result<(), CudaError> {
+        self.launch(
+            self.kernels.deltanet_step,
+            (rank as u32, 1),
+            256,
+            &[
+                Arg::Ptr(mixed),
+                Arg::Ptr(z),
+                Arg::Ptr(alpha),
+                Arg::Ptr(beta),
+                Arg::Ptr(a),
+                Arg::Ptr(dt_bias),
+                Arg::Ptr(norm),
+                Arg::Ptr(state),
+                Arg::Ptr(out),
+                Arg::I32(groups as i32),
+                Arg::I32(rank as i32),
+                Arg::I32(head_dim as i32),
+                Arg::F32(eps),
+            ],
         )
     }
 

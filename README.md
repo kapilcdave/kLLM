@@ -111,7 +111,7 @@ Building without the GPU backend: `cargo build --release --no-default-features`.
 | **Sampling** | Greedy, temperature, top-k, top-p, min-p, repetition penalty, seeded |
 | **Planning** | Per-layer VRAM/RAM placement from real tensor sizes and KV costs |
 | **CUDA** | Kernels for all weight types, coalesced struct-of-arrays matvecs for Q4_0/Q8_0/Q4_K/Q6_K, KV cache in VRAM. Perplexity matches llama.cpp on the GPU as closely as on the CPU (`tests/gpu.rs`) |
-| **Qwen3.5** | `qwen35` dense 4B/9B Q4_K_M runs on CPU with gated attention and DeltaNet; 4B perplexity is within 0.27% of llama.cpp. The 35B-A3B IQ2_XXS file still needs that weight type. See [docs/QWEN35.md](docs/QWEN35.md) |
+| **Qwen3.5** | `qwen35` dense 4B/9B Q4_K_M supports CPU and CUDA gated attention/DeltaNet; the GPU keeps recurrent state resident and allocates KV only for attention blocks. CPU 4B perplexity is within 0.27% of llama.cpp. The 35B-A3B still needs routed GPU execution and IQ2_XXS. See [docs/QWEN35.md](docs/QWEN35.md) |
 
 ## Commands
 
@@ -127,10 +127,16 @@ kllm bench MODEL.gguf [-p 128] [-n 64] [--profile]
 kllm devices
 ```
 
-`run`, `perplexity` and `bench` take `--gpu-layers N` (or `-ngl N`): the
+`run`, `perplexity` and `bench` use automatic GPU placement by default and
+take `--gpu-layers N` (or `-ngl N`): the
 last N blocks run on the GPU, and N at or above the block count also moves
 the output head, as with llama.cpp. `--gpu-layers auto` lets the planner
-place as many blocks as fit in the GPU's free memory. It is off by default.
+place as many blocks as fit in the GPU's free memory. `--gpu-layers 0`
+explicitly selects CPU-only execution. The implicit default is best-effort:
+it falls back to CPU when CUDA is unavailable or the model needs a GPU kernel
+kLLM does not have yet; an explicit `--gpu-layers auto` is strict and reports
+that condition as an error. `--gpu-only` is stricter still: every transformer
+block and the output head must fit and execute on CUDA, or loading fails.
 On the reference laptop the M1200 is clock-limited to 287 MHz of its 1150,
 and the CPU is faster by a wide margin: SmolLM2-135M Q4_0 decodes at 215
 tok/s on the CPU against 37 on the GPU, and for Qwen3-0.6B Q4_K_M with all

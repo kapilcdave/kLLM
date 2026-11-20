@@ -1067,6 +1067,45 @@ impl Model {
         }
         self.config.n_layer
     }
+
+    /// Device bytes a CUDA session will allocate for an offloaded suffix.
+    /// Kept available in CPU-only builds so `plan-model` remains useful on a
+    /// machine that is planning for, rather than currently hosting, a GPU.
+    pub fn gpu_session_bytes(
+        c: &Config,
+        gpu_layers: usize,
+        head: bool,
+        context: usize,
+        batch: usize,
+    ) -> u64 {
+        let context = context.max(1);
+        let batch = batch.clamp(1, context);
+        let gpu_layers = gpu_layers.min(c.n_layer);
+        let first = c.n_layer - gpu_layers;
+        let kv_layers = (first..c.n_layer)
+            .filter(|&i| c.kv_slot(i).is_some())
+            .count();
+        let ssm_layers = gpu_layers - kv_layers;
+        let kv = 2 * kv_layers * context * c.kv_dim() * 2;
+        let mut f32s = batch
+            * (3 * c.n_embd
+                + 2 * c.q_dim()
+                + 2 * c.kv_dim()
+                + 2 * c.ffn_width()
+                + c.n_head * context
+                + c.rope_dim
+                + if head { c.n_vocab } else { 0 });
+        if c.attn_gated {
+            f32s += batch * 3 * c.q_dim();
+        }
+        if let Some(sc) = c.ssm {
+            f32s += batch * (sc.conv_width() + 2 * sc.inner_size + 2 * sc.time_step_rank)
+                + ssm_layers
+                    * (sc.conv_width() * (sc.conv_kernel - 1)
+                        + sc.time_step_rank * sc.state_size * sc.state_size);
+        }
+        (kv + f32s * 4) as u64
+    }
 }
 
 struct Loader<'f> {
@@ -1462,6 +1501,10 @@ impl<'m> Session<'m> {
     pub fn truncate(&mut self, pos: usize) {
         let next = self.pos.min(pos);
         if next < self.pos && self.model.config.ssm.is_some() {
+            #[cfg(feature = "cuda")]
+            let gpu_ssm = self.gpu.as_ref().is_some_and(gpu::GpuState::has_ssm);
+            #[cfg(not(feature = "cuda"))]
+            let gpu_ssm = false;
             // Positions at or after `next` are being discarded and may be
             // replaced by different tokens, so a checkpoint among them no
             // longer describes any state this session will have.
@@ -1470,7 +1513,7 @@ impl<'m> Session<'m> {
             }
             // Taken and put back so the snapshot can be read while the live
             // states are written.
-            self.replay_from = match self.checkpoint.take() {
+            self.replay_from = match (!gpu_ssm).then(|| self.checkpoint.take()).flatten() {
                 Some(saved) => {
                     for (state, snapshot) in self.ssm_states.iter_mut().zip(&saved.states) {
                         if let (Some(state), Some(snapshot)) = (state.as_mut(), snapshot.as_ref()) {
@@ -1485,6 +1528,11 @@ impl<'m> Session<'m> {
                     for state in self.ssm_states.iter_mut().flatten() {
                         state.reset();
                     }
+                    #[cfg(feature = "cuda")]
+                    if let Some(gpu) = &mut self.gpu {
+                        gpu.reset_ssm_on_next_forward();
+                    }
+                    self.checkpoint = None;
                     0
                 }
             };
@@ -1507,6 +1555,13 @@ impl<'m> Session<'m> {
     /// not the state at this position yet; call [`Session::materialize`] first.
     pub fn checkpoint(&mut self) {
         if self.model.config.ssm.is_none() || self.replay {
+            return;
+        }
+        #[cfg(feature = "cuda")]
+        if self.gpu.as_ref().is_some_and(gpu::GpuState::has_ssm) {
+            // GPU recurrent state intentionally stays device-resident. Until
+            // device-to-device checkpoint buffers are added, rewind safely
+            // replays from zero instead of saving stale CPU-side mirrors.
             return;
         }
         self.checkpoint = Some(Checkpoint {

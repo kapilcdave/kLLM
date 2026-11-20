@@ -34,22 +34,22 @@ fn main() -> ExitCode {
 const USAGE: &str = "\
 usage:
   kllm inspect MODEL.gguf [--tensors]
-  kllm plan-model MODEL.gguf --vram-gib N [--context N] [--workspace-gib N] [--safety-gib N]
+  kllm plan-model MODEL.gguf --vram-gib N [--context N] [--batch N] [--workspace-gib N] [--safety-gib N]
   kllm plan --model-gib N --layers N --vram-gib N --context N --kv-bytes-per-token N
   kllm run MODEL.gguf --prompt TEXT [-n N] [--chat] [--system TEXT] [--context N]
            [--temp T] [--top-k K] [--top-p P] [--min-p P] [--repeat-penalty R]
            [--seed S] [--threads N] [--batch N] [--ignore-eos] [--no-think]
-           [--gpu-layers N|auto]
+           [--gpu-layers N|auto] [--gpu-only]
            [--ram-gib N|auto|all]
   kllm chat MODEL.gguf [--system TEXT] [-n 512] [--context N] [--no-think]
            [--temp T] [--top-k K] [--top-p P] [--min-p P] [--threads N] [--ram-gib N]
   kllm serve MODEL.gguf [--host 127.0.0.1] [--port 8787] [--context N] [--batch N]
            [--api-key KEY] [--max-tokens N] [--think] [--quiet]
            [--temp T] [--top-k K] [--top-p P] [--min-p P] [--threads N] [--ram-gib N]
-  kllm perplexity MODEL.gguf --file TEXT [--context 512] [--chunks N] [--threads N] [--gpu-layers N|auto]
+  kllm perplexity MODEL.gguf --file TEXT [--context 512] [--chunks N] [--threads N] [--gpu-layers N|auto] [--gpu-only]
   kllm compare REFERENCE.gguf TEST.gguf --file TEXT [--context 512] [--chunks N] [--threads N]
   kllm devices
-  kllm bench MODEL.gguf [-p 128] [-n 64] [--threads N] [--repeat 3] [--profile] [--gpu-layers N|auto]";
+  kllm bench MODEL.gguf [-p 128] [-n 64] [--threads N] [--repeat 3] [--profile] [--gpu-layers N|auto] [--gpu-only]";
 
 struct Args(Vec<String>);
 
@@ -361,12 +361,22 @@ fn cmd_plan_model(args: &Args) -> Result<(), String> {
     let info = inspect_file(path).map_err(|e| e.to_string())?;
     let (_, _, train_context) = plan_shape(&info)?;
     let context: u64 = args.or(&["--context", "-c"], train_context.min(4096))?;
-    let input = model_plan_input(
+    let mut input = model_plan_input(
         &info,
         args,
         context,
         bytes_from_gib(args.required("--vram-gib")?)?,
     )?;
+    // For runnable models, never let the generic workspace default understate
+    // the buffers the CUDA session will actually allocate. This matters for
+    // Qwen3.5: its fixed recurrent matrices are small relative to weights but
+    // large enough to decide whether the final layer fits in 4 GiB.
+    if let Ok(config) = Config::from_gguf(&info) {
+        let batch: usize = args.or(&["--batch", "-b"], 1)?;
+        let full = Model::gpu_session_bytes(&config, config.n_layer, true, context as usize, batch);
+        let kv = config.kv_bytes_per_token() * context;
+        input.workspace_bytes = input.workspace_bytes.max(full.saturating_sub(kv));
+    }
     let p = plan_model(&input).map_err(|e| e.to_string())?;
     let layers = input.layer_bytes.len();
     out!(
@@ -477,11 +487,24 @@ enum GpuRequest {
     Off,
     Layers(usize),
     Auto,
+    /// Require every transformer block and the output head to execute on the
+    /// GPU. Unlike best-effort auto, no CPU fallback or partial offload.
+    Only,
+    /// The default: use all VRAM the planner can safely fill, but keep the
+    /// CPU backend usable on machines without a CUDA driver and for model
+    /// architectures whose GPU kernels have not landed yet.
+    BestEffortAuto,
 }
 
 fn gpu_request(args: &Args) -> Result<GpuRequest, String> {
+    if args.has("--gpu-only") {
+        if args.value(&["--gpu-layers", "-ngl"])?.is_some() {
+            return Err("--gpu-only conflicts with --gpu-layers".into());
+        }
+        return Ok(GpuRequest::Only);
+    }
     Ok(match args.value(&["--gpu-layers", "-ngl"])? {
-        None => GpuRequest::Off,
+        None => GpuRequest::BestEffortAuto,
         Some("auto") => GpuRequest::Auto,
         Some(v) => match v.parse::<usize>() {
             Ok(0) => GpuRequest::Off,
@@ -493,6 +516,49 @@ fn gpu_request(args: &Args) -> Result<GpuRequest, String> {
             }
         },
     })
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{Args, GpuRequest, gpu_request};
+
+    #[test]
+    fn gpu_placement_is_best_effort_auto_by_default() {
+        let args = Args(vec!["bench".into(), "model.gguf".into()]);
+        assert_eq!(gpu_request(&args).unwrap(), GpuRequest::BestEffortAuto);
+    }
+
+    #[test]
+    fn gpu_placement_can_be_disabled_explicitly() {
+        let args = Args(vec![
+            "bench".into(),
+            "model.gguf".into(),
+            "--gpu-layers".into(),
+            "0".into(),
+        ]);
+        assert_eq!(gpu_request(&args).unwrap(), GpuRequest::Off);
+    }
+
+    #[test]
+    fn explicit_auto_remains_strict() {
+        let args = Args(vec![
+            "bench".into(),
+            "model.gguf".into(),
+            "--gpu-layers".into(),
+            "auto".into(),
+        ]);
+        assert_eq!(gpu_request(&args).unwrap(), GpuRequest::Auto);
+    }
+
+    #[test]
+    fn gpu_only_is_distinct_from_partial_auto_placement() {
+        let args = Args(vec![
+            "bench".into(),
+            "model.gguf".into(),
+            "--gpu-only".into(),
+        ]);
+        assert_eq!(gpu_request(&args).unwrap(), GpuRequest::Only);
+    }
 }
 
 fn load_with_plan(
@@ -576,7 +642,13 @@ fn load_with_plan(
     let mut model = Model::load_with(path, kllm::model::LoadOptions { ram_budget: budget })
         .map_err(|e| e.to_string())?;
     if gpu != GpuRequest::Off {
-        offload(args, gpu, &info, &mut model, context, batch)?;
+        if let Err(error) = offload(args, gpu, &info, &mut model, context, batch) {
+            if gpu == GpuRequest::BestEffortAuto {
+                eprintln!("kllm: GPU auto-placement unavailable ({error}); using CPU");
+            } else {
+                return Err(error);
+            }
+        }
     }
     eprintln!("kllm: loaded in {:.2} s", start.elapsed().as_secs_f64());
     Ok(model)
@@ -610,12 +682,33 @@ fn offload(
     let (layers, head) = match gpu {
         GpuRequest::Off => return Ok(()),
         GpuRequest::Layers(n) => (n.min(c.n_layer), n >= c.n_layer),
-        GpuRequest::Auto => {
+        GpuRequest::Auto | GpuRequest::BestEffortAuto | GpuRequest::Only => {
             // The planner reserves KV per GPU block itself; the workspace is
-            // the session's scratch with the head's logits buffer included.
+            // the session's scratch, recurrent state for every possible GPU
+            // block, and the head's logits buffer. Reserving all recurrent
+            // state is slightly conservative for a partial hybrid offload,
+            // but prevents the planner from filling VRAM with weights and
+            // discovering the per-layer DeltaNet matrices only afterwards.
             let mut input = model_plan_input(info, args, context as u64, free)?;
-            input.workspace_bytes = Model::gpu_session_bytes(c, 0, true, context, batch);
+            let full_session = Model::gpu_session_bytes(c, c.n_layer, true, context, batch);
+            let full_kv = c.kv_bytes_per_token() * context as u64;
+            input.workspace_bytes = full_session.saturating_sub(full_kv);
             let plan = plan_model(&input).map_err(|e| e.to_string())?;
+            if gpu == GpuRequest::Only
+                && (plan.gpu_layers as usize != c.n_layer || !plan.head_on_gpu)
+            {
+                return Err(format!(
+                    "--gpu-only cannot fit this model at context {context}: planner fits {} of {} blocks{} in {:.0} MiB free VRAM; lower --context or use a smaller quantization",
+                    plan.gpu_layers,
+                    c.n_layer,
+                    if plan.head_on_gpu {
+                        " + head"
+                    } else {
+                        " without the output head"
+                    },
+                    free as f64 / MIB,
+                ));
+            }
             (plan.gpu_layers as usize, plan.head_on_gpu)
         }
     };

@@ -333,6 +333,93 @@ extern "C" __global__ void swiglu(float* gate, const float* up, int total) {
     }
 }
 
+// Qwen3.5 attention emits [q_head, gate_head] pairs. Split those pairs into
+// ordinary packed heads without a host round trip.
+extern "C" __global__ void split_q_gate(const float* full, float* q, float* gate,
+                                         int head_dim, int total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    int group = i / head_dim, j = i % head_dim;
+    size_t src = (size_t)group * 2 * head_dim + j;
+    q[i] = full[src];
+    gate[i] = full[src + head_dim];
+}
+
+// x *= sigmoid(gate), used after gated softmax attention.
+extern "C" __global__ void sigmoid_mul(float* x, const float* gate, int total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) x[i] *= 1.0f / (1.0f + expf(-gate[i]));
+}
+
+// One sequential causal depthwise-convolution step. `x` is the current QKV
+// projection and becomes the convolved SiLU result. History is channel-major.
+extern "C" __global__ void conv_silu(float* x, float* history, const float* weights,
+                                      int width, int taps) {
+    int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= width) return;
+    float current = x[ch];
+    const float* w = weights + (size_t)ch * taps;
+    float* h = history + (size_t)ch * (taps - 1);
+    float value = current * w[taps - 1];
+    for (int j = 0; j < taps - 1; j++) value += h[j] * w[j];
+    for (int j = 0; j < taps - 2; j++) h[j] = h[j + 1];
+    if (taps > 1) h[taps - 2] = current;
+    x[ch] = value / (1.0f + expf(-value));
+}
+
+// L2-normalize Q and K heads for gated DeltaNet. Unlike RMSNorm this divides
+// by sqrt(sum(x^2) + eps), with no 1/n term and no learned weight.
+extern "C" __global__ void l2_norm_heads(float* x, int head_dim, float eps) {
+    __shared__ float scratch[32];
+    float* row = x + (size_t)blockIdx.x * head_dim;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) ss += row[i] * row[i];
+    float inv = rsqrtf(block_sum(ss, scratch) + eps);
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) row[i] *= inv;
+}
+
+// One gated DeltaNet recurrence step. A block owns one value head; thread j
+// owns state row j, so the decay, delta update, q projection, RMSNorm and SiLU
+// output gate happen without atomics or intermediate host state.
+extern "C" __global__ void deltanet_step(const float* mixed, const float* z,
+                                          const float* alpha, const float* beta,
+                                          const float* a, const float* dt_bias,
+                                          const float* norm, float* state, float* out,
+                                          int groups, int rank, int head_dim, float eps) {
+    __shared__ float scratch[32];
+    int h = blockIdx.x, j = threadIdx.x;
+    if (h >= rank) return;
+    int kh = h % groups;
+    const float* q = mixed + (size_t)kh * head_dim;
+    const float* k = mixed + (size_t)(groups + kh) * head_dim;
+    const float* v = mixed + (size_t)(2 * groups + h) * head_dim;
+    float aa = alpha[h] + dt_bias[h];
+    float softplus = fmaxf(aa, 0.0f) + log1pf(expf(-fabsf(aa)));
+    float decay = expf(a[h] * softplus);
+    float b = 1.0f / (1.0f + expf(-beta[h]));
+    float value = 0.0f;
+    if (j < head_dim) {
+        float* row = state + ((size_t)h * head_dim + j) * head_dim;
+        float predicted = 0.0f;
+        for (int t = 0; t < head_dim; t++) {
+            row[t] *= decay;
+            predicted += row[t] * k[t];
+        }
+        float delta = b * (v[j] - predicted);
+        for (int t = 0; t < head_dim; t++) {
+            row[t] += k[t] * delta;
+            value += row[t] * q[t];
+        }
+        value *= rsqrtf((float)head_dim);
+    }
+    float inv = rsqrtf(block_sum(value * value, scratch) / head_dim + eps);
+    if (j < head_dim) {
+        float gate = z[(size_t)h * head_dim + j];
+        out[(size_t)h * head_dim + j] =
+            value * inv * norm[j] * gate / (1.0f + expf(-gate));
+    }
+}
+
 // Rotary embedding in place. `x` is [batch][heads][head_dim]; `table` holds
 // (cos, sin) for [batch][rope_dim / 2], computed on the host exactly as the
 // CPU backend does. grid = batch * heads, block = rope_dim / 2.
